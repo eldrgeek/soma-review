@@ -1,0 +1,582 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SOMA Rep Review</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg:        #0f1117;
+    --surface:   #1a1d27;
+    --surface2:  #22263a;
+    --border:    #2e3350;
+    --accent:    #6d8ef7;
+    --accent2:   #a78bfa;
+    --done:      #34d399;
+    --staged:    #fbbf24;
+    --text:      #e2e8f0;
+    --muted:     #94a3b8;
+    --link:      #93c5fd;
+    --red:       #f87171;
+    --font-mono: 'SF Mono', 'Fira Code', monospace;
+    --font-sans: -apple-system, BlinkMacSystemFont, 'Inter', sans-serif;
+  }
+
+  body {
+    font-family: var(--font-sans);
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.6;
+    min-height: 100vh;
+  }
+
+  #gate {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+    gap: 1rem;
+    color: var(--muted);
+    font-size: 0.9rem;
+    letter-spacing: 0.05em;
+  }
+  #gate .lock { font-size: 2rem; }
+
+  #app { display: none; max-width: 860px; margin: 0 auto; padding: 2rem 1.5rem 4rem; }
+
+  header {
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 1.5rem;
+    margin-bottom: 2.5rem;
+  }
+  header .eyebrow {
+    font-size: 0.72rem;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin-bottom: 0.5rem;
+    font-weight: 600;
+  }
+  header h1 {
+    font-size: 1.6rem;
+    font-weight: 700;
+    color: var(--text);
+    letter-spacing: -0.02em;
+  }
+  header .subtitle {
+    margin-top: 0.4rem;
+    color: var(--muted);
+    font-size: 0.9rem;
+  }
+  .rep-intro {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--accent);
+    border-radius: 8px;
+    padding: 1.25rem 1.5rem;
+    margin-bottom: 2.5rem;
+    font-size: 0.92rem;
+    color: var(--text);
+    line-height: 1.7;
+  }
+  .rep-intro .rep-sig {
+    margin-top: 0.75rem;
+    font-size: 0.78rem;
+    color: var(--muted);
+    letter-spacing: 0.04em;
+  }
+
+  .section-label {
+    font-size: 0.72rem;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    font-weight: 700;
+    margin-bottom: 1rem;
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+  }
+  .section-label.done  { color: var(--done); }
+  .section-label.prog  { color: var(--staged); }
+  .section-label::after {
+    content: '';
+    flex: 1;
+    height: 1px;
+    background: var(--border);
+  }
+
+  .cards { display: flex; flex-direction: column; gap: 1.25rem; margin-bottom: 2.5rem; }
+
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    overflow: hidden;
+    transition: border-color 0.15s;
+  }
+  .card:hover { border-color: #3e4570; }
+
+  .card-head {
+    display: flex;
+    align-items: flex-start;
+    gap: 1rem;
+    padding: 1.1rem 1.25rem 0.9rem;
+    cursor: pointer;
+    user-select: none;
+  }
+  .card-num {
+    flex-shrink: 0;
+    width: 1.6rem;
+    height: 1.6rem;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 50%;
+    font-size: 0.7rem;
+    font-weight: 700;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--muted);
+    margin-top: 0.1rem;
+  }
+  .card-meta { flex: 1; }
+  .card-title {
+    font-size: 0.97rem;
+    font-weight: 600;
+    color: var(--text);
+    letter-spacing: -0.01em;
+  }
+  .card-tags { display: flex; gap: 0.4rem; margin-top: 0.35rem; flex-wrap: wrap; }
+  .tag {
+    font-size: 0.66rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    font-weight: 700;
+    padding: 0.15rem 0.5rem;
+    border-radius: 999px;
+    border: 1px solid;
+  }
+  .tag.done    { color: var(--done);   border-color: var(--done);   background: rgba(52,211,153,0.08); }
+  .tag.staged  { color: var(--staged); border-color: var(--staged); background: rgba(251,191,36,0.08); }
+  .tag.local   { color: var(--muted);  border-color: var(--border); }
+
+  .card-toggle {
+    flex-shrink: 0;
+    color: var(--muted);
+    font-size: 0.8rem;
+    margin-top: 0.2rem;
+    transition: transform 0.2s;
+  }
+  .card.open .card-toggle { transform: rotate(90deg); }
+
+  .card-body {
+    display: none;
+    padding: 0 1.25rem 1.25rem;
+    border-top: 1px solid var(--border);
+    margin-top: 0;
+  }
+  .card.open .card-body { display: block; }
+
+  .rep-narration {
+    font-size: 0.88rem;
+    color: var(--text);
+    line-height: 1.75;
+    padding: 1rem 0 0.75rem;
+  }
+  .rep-narration .rep-label {
+    font-size: 0.68rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--accent);
+    font-weight: 700;
+    margin-bottom: 0.4rem;
+  }
+
+  .preview-links { display: flex; gap: 0.6rem; flex-wrap: wrap; margin: 0.75rem 0 0.5rem; }
+  .preview-link {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    font-size: 0.8rem;
+    color: var(--link);
+    text-decoration: none;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    padding: 0.3rem 0.75rem;
+    border-radius: 6px;
+    transition: border-color 0.15s;
+  }
+  .preview-link:hover { border-color: var(--accent); }
+  .preview-link svg { width: 11px; height: 11px; }
+
+  .cli-block {
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    background: #0a0c14;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.6rem 0.9rem;
+    color: #a5f3fc;
+    margin: 0.75rem 0;
+    overflow-x: auto;
+    white-space: pre;
+  }
+
+  .feedback-section { margin-top: 1rem; border-top: 1px solid var(--border); padding-top: 1rem; }
+  .feedback-label {
+    font-size: 0.72rem;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    color: var(--muted);
+    font-weight: 600;
+    margin-bottom: 0.5rem;
+  }
+  .feedback-area {
+    width: 100%;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    font-size: 0.87rem;
+    font-family: var(--font-sans);
+    padding: 0.6rem 0.8rem;
+    resize: vertical;
+    min-height: 72px;
+    outline: none;
+    transition: border-color 0.15s;
+  }
+  .feedback-area:focus { border-color: var(--accent); }
+  .feedback-area::placeholder { color: var(--muted); }
+  .feedback-row {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    margin-top: 0.5rem;
+  }
+  .submit-btn {
+    background: var(--accent);
+    color: #0f1117;
+    border: none;
+    border-radius: 6px;
+    font-size: 0.82rem;
+    font-weight: 700;
+    padding: 0.45rem 1.1rem;
+    cursor: pointer;
+    letter-spacing: 0.02em;
+    transition: opacity 0.15s, transform 0.1s;
+  }
+  .submit-btn:hover { opacity: 0.9; }
+  .submit-btn:active { transform: scale(0.97); }
+  .submit-btn:disabled { opacity: 0.5; cursor: default; }
+  .submit-status {
+    font-size: 0.78rem;
+    color: var(--muted);
+  }
+  .submit-status.ok  { color: var(--done); }
+  .submit-status.err { color: var(--red); }
+
+  footer {
+    border-top: 1px solid var(--border);
+    padding-top: 1.5rem;
+    font-size: 0.78rem;
+    color: var(--muted);
+    text-align: center;
+    line-height: 1.6;
+  }
+  footer code { font-family: var(--font-mono); font-size: 0.9em; }
+</style>
+</head>
+<body>
+
+<div id="gate">
+  <div class="lock">&#x1F512;</div>
+  <div>Owner access required.</div>
+  <div style="font-size:0.75rem">Append <code style="font-family:monospace">?key=...</code> to this URL.</div>
+</div>
+
+<div id="app">
+
+  <header>
+    <div class="eyebrow">SOMA — Rep Review</div>
+    <h1>What Shipped: June 9–10, 2026</h1>
+    <div class="subtitle">Walk through every recent change, give feedback inline. Rep captures everything to Pulse Core.</div>
+  </header>
+
+  <div class="rep-intro">
+    Good session. Here is a full accounting of what changed in the past 48 hours across Legends, Izzy, Playcraft, and the SOMA platform layer.
+    I have grouped items as completed and deployed versus staged or branch-only. For each stop I have a brief read on what changed and why it matters.
+    Open any card, read the narration, click the preview link, and leave feedback directly in the box. Everything you write goes to the transcript store so we can triage it later.
+    <div class="rep-sig">— Rep, SOMA Chief of Staff persona &nbsp;|&nbsp; Text mode (voice paused)</div>
+  </div>
+
+  <!-- COMPLETED SECTION -->
+  <div class="section-label done">Completed &amp; Live</div>
+  <div class="cards" id="cards-done"></div>
+
+  <!-- IN PROGRESS SECTION -->
+  <div class="section-label prog">In Progress / Branch-Only</div>
+  <div class="cards" id="cards-staged"></div>
+
+  <footer>
+    Feedback stored at <code>vpsmikewolf.duckdns.org/transcripts/rep/review-feedback</code> &nbsp;|&nbsp;
+    Owner gate: stopgap URL key &mdash; <code>soma-owner.js</code> dependency pending &nbsp;|&nbsp;
+    Extension nav: Yeshie is capable (cross-domain tab control + teach-tooltip), needs manifest extension for Rep domains &mdash; deferred for next sprint.
+  </footer>
+
+</div><!-- #app -->
+
+<script>
+/* ── Gate ─────────────────────────────────────────────────────────────────── */
+const GATE_KEY = 'rep-r3v13w-soma-2026';
+(function checkGate() {
+  const k = new URLSearchParams(location.search).get('key');
+  if (k === GATE_KEY) {
+    document.getElementById('gate').style.display = 'none';
+    document.getElementById('app').style.display  = 'block';
+  }
+})();
+
+/* ── Tour data ────────────────────────────────────────────────────────────── */
+const STOPS_DONE = [
+  {
+    id: 'playcraft-staging',
+    title: 'Playcraft Staging — Ariadne Guide + Dramaturge',
+    tags: [{ label: 'Completed', cls: 'done' }, { label: 'Live', cls: 'done' }],
+    narration: `The Playcraft staging site is up and verified. This is the first live proof of the manifest architecture: two surfaces on one Netlify deploy. The landing page carries the Ariadne public guide (a floating action button) — any visitor can ask it questions about the platform. The /assistant.html page is the full subscriber dramaturge experience with session history, a persistent working document, and proposal blocks.
+
+The consult-and-relay handoff is working: when a subscriber asks a how-to question, the guide answers silently in the background and the dramaturge relays the result with attribution. Intent classification is regex-based for now. No ElevenLabs in this version — browser TTS only.
+
+This is the template for the Bill, Izzy, and Vera surface rollouts. Nothing is live for end users yet; the URL is unlisted.`,
+    links: [{ label: 'Staging site', url: 'https://soma-playwriting-staging.netlify.app' }, { label: '/assistant.html', url: 'https://soma-playwriting-staging.netlify.app/assistant.html' }],
+  },
+  {
+    id: 'legends-bill-feedback',
+    title: 'Legends — Bill Feedback Membrane + Domain Scope Guard',
+    tags: [{ label: 'Completed', cls: 'done' }, { label: 'Live', cls: 'done' }],
+    narration: `Two-layer feedback system deployed to Legends. Layer one: bug reports and feature requests go through Bill (the AI membrane) to a structured admin panel backed by Supabase. Layer two: a domain scope guard on Bill's LLM-level context deflects off-domain questions and adds a client-side pre-filter.
+
+Allowed zones are Legends membership, website navigation, and SOMA itself. The scope guard responds gracefully when someone tries to use Bill as a general assistant — it redirects rather than ignores. The Supabase bill_feedback table is the remaining setup step for full end-to-end verify; the function and guard are deployed and returning green responses now.`,
+    links: [{ label: 'Legends site', url: 'https://legends-membership.netlify.app' }],
+  },
+  {
+    id: 'legends-features',
+    title: 'Legends — Ask Bill Tap-to-Speak, Player Benefits, Member Submission',
+    tags: [{ label: 'Completed', cls: 'done' }, { label: 'Live', cls: 'done' }],
+    narration: `Three Legends product improvements shipped. Tap-to-Speak is now wired into Ask Bill: a button activates voice input so members can speak their question directly rather than typing. The player-benefits page was updated with corrected content and resource links that are now visible to authenticated members (a visibility bug was fixed). The member submission form had a validation error that blocked certain entries — that is resolved.
+
+These are the kind of friction points that drive member churn before anyone reports them. Confirming each one is working end-to-end matters.`,
+    links: [{ label: 'Legends site', url: 'https://legends-membership.netlify.app' }],
+  },
+  {
+    id: 'izzy-scout',
+    title: 'Izzy — Scout Guide Widget + Pre-generated Tour Audio',
+    tags: [{ label: 'Completed', cls: 'done' }, { label: 'Live', cls: 'done' }],
+    narration: `Scout, the floating help guide FAB on Izzy's page, is live. It runs on the soma-guide engine with a 10-step walkthrough covering all major UI surfaces. All target selectors were verified against the actual DOM before shipping.
+
+The pre-generated audio approach eliminates ElevenLabs quota risk for the tour: 15 static MP3 files (2.2 MB total) are committed to /audio/tour/ and served by Netlify. The engine tries the static file first on each step using an identical hash function to the Legends pattern, and falls back to live TTS only if the file is missing. Tour narration is now quota-proof.`,
+    links: [{ label: 'Izzy site', url: 'https://izzy-assistant.netlify.app' }],
+  },
+  {
+    id: 'izzy-voice-fallback',
+    title: 'Izzy — Voice Fallback (Browser TTS When EL Unavailable)',
+    tags: [{ label: 'Completed', cls: 'done' }, { label: 'Live', cls: 'done' }],
+    narration: `When ElevenLabs is unavailable (401, 429, or any 5xx), Izzy now transitions cleanly to browser speechSynthesis. A session flag (elFailing) triggers the handoff. On first fallback the user sees a brief in-app notice — persisted in localStorage so it only appears once per session.
+
+The experience degrades gracefully rather than going silent. EL recovery is automatic: when a successful response comes back, the primary voice resumes without any user action. This was verified with EL quota exhausted in testing.`,
+    links: [{ label: 'Izzy site', url: 'https://izzy-assistant.netlify.app' }],
+  },
+  {
+    id: 'soma-transcripts',
+    title: 'soma-transcripts v1 — Session Supervisor + Durable Transcript Store',
+    tags: [{ label: 'Completed', cls: 'done' }, { label: 'Live', cls: 'done' }],
+    narration: `The transcript store is deployed and verified (port 4250, PM2 fork mode). This closes Gap B-2 from the Fable 5 audit — SOMA now has durable, namespaced conversation records that survive across sessions.
+
+Schema v1 adds four attribution fields to every message: capability_id, auth_scope, source_provenance, relay_source. Namespace scoping provides tenant isolation at the write level. Izzy and soma-infer are wired: every successful chat response now fires a write-through to the store. One concurrent-write race was observed in the eval harness (expected given the single-process lock model) and is acceptable.`,
+    links: [{ label: 'Health check', url: 'https://vpsmikewolf.duckdns.org/transcripts/health' }],
+  },
+  {
+    id: 'pulse-mem-bm25',
+    title: 'Pulse Core — BM25 Query (pulse-mem ask)',
+    tags: [{ label: 'Completed', cls: 'done' }, { label: 'Local CLI', cls: 'local' }],
+    narration: `pulse-mem now has a searchable query interface. The ask subcommand runs Okapi BM25 (k1=1.5, b=0.6) over the 135-record Pulse Core store in under 10 milliseconds. Compound tokens are preserved and sub-parts are indexed, so a query for "transcripts schema" correctly surfaces records about the schema v1 design.
+
+The --synthesize flag pipes the top results to Claude with a structured prompt that returns a 120-word paragraph with citations. This is the first time SOMA's own memory is queryable from the command line without shipping the data to an external index.`,
+    cli: 'pulse-mem ask "what did we decide about transcript namespacing?"\npulse-mem ask "Fable 5 gaps" --synthesize',
+  },
+  {
+    id: 'soma-eval',
+    title: 'SOMA Eval Harness F0.0 — 15-test CI for Live Services',
+    tags: [{ label: 'Completed', cls: 'done' }, { label: 'Local CLI', cls: 'local' }],
+    narration: `A non-destructive eval harness with 15 tests across 5 suites is running. Suites: health (3), infer-ask (1), infer-chat-izzy (2), knowledge-query (3), transcripts (6). On the first full run after transcripts was deployed: 14/15 pass. The one failure is a concurrent-write 409 race with a window that is genuinely too small to hit reliably in automated testing.
+
+Zero npm dependencies — run.mjs and config.mjs only. Timestamped JSON reports go to ~/Projects/SOMA/audits/. The harness is ready for nightly cron scheduling on Haiku tier.`,
+    cli: 'cd ~/Projects/SOMA/tools/soma-eval && node run.mjs',
+  },
+  {
+    id: 'pulse-backup',
+    title: 'Pulse Core Daily Backup — Git + launchd Snapshots',
+    tags: [{ label: 'Completed', cls: 'done' }, { label: 'Local infra', cls: 'local' }],
+    narration: `Pulse Core now has a two-layer backup. The events.jsonl file is tracked and pushed to github.com/eldrgeek/pulse-core after each write session. A launchd job runs daily at 03:00 local time, creates a timestamped snapshot archive at ~/Vault/Archive/pulse-core-backups/, and prunes to the 30 most recent copies. First manual run verified clean on June 9.`,
+    cli: '# runs daily at 03:00 via launchd\n~/Vault/Archive/pulse-core-backups/pulse-core-20260609T230605.jsonl',
+  },
+  {
+    id: 'chat-import',
+    title: 'Chat Export Auto-Importer — Drop Folder to Obsidian Vault',
+    tags: [{ label: 'Completed', cls: 'done' }, { label: 'Local infra', cls: 'local' }],
+    narration: `Conversation history from ChatGPT, Claude, Grok, and Gemini now flows automatically into the Obsidian vault. The importer watches ~/Downloads/chat-exports/ (WatchPaths trigger + 6-hourly launchd job), detects ZIP format by content, and writes to ~/Vault/Archive/chat-imports/{App}/{YYYY}/{MM}/. Deduplication is manifest-based on UUID — reimporting the same export is a no-op. Two new conversations and two dedup hits were confirmed on the first manual run.`,
+    cli: '~/.local/bin/chat-import.py  # also runs via launchd',
+  },
+];
+
+const STOPS_STAGED = [
+  {
+    id: 'soma-assistant-lib',
+    title: 'soma-assistant Component Library — Phase 0 Scaffold',
+    tags: [{ label: 'Branch only', cls: 'staged' }],
+    narration: `The soma-assistant library scaffold is committed on the feat/soma-assistant-lib branch of soma-platform. 23 files: package.json, JSON schemas, manifests for Bill/Izzy/Playcraft, and spine modules (inference, voice, session-supervisor, transcripts, identity-stub). The merge contract is defined: a subscriber can override persona fields and bundle modalities, but cannot override tenantPolicy, guide config, or capabilities.
+
+Nothing live is affected. Phase 1.1–1.4 (transcript schema integration in soma-infer, intent classifier, delegate seam, auth isolation) must land before any assistants are repointed to this library.`,
+  },
+  {
+    id: 'fable-plan',
+    title: 'SOMA × Fable 5 Plan — 5 Gaps, 5 Extensions, Roadmap',
+    tags: [{ label: 'In progress', cls: 'staged' }],
+    narration: `Fable 5 completed a structured architecture review. Five critical gaps identified: (1) auth/isolation is a BLOCKER — no multi-tenant isolation between subscribers yet; (2) no durable transcripts was a BLOCKER — now resolved by soma-transcripts v1; (3) VPS root password is in a committed .env file and must be rotated; (4) the eval pipeline was auto-greening without real verification — now addressed by the eval harness; (5) no economics layer exists yet.
+
+Five proposed extensions: fleet-queryable Pulse Core (BM25 shipped), feedback-to-dispatch pipeline, manifest-as-sales material, dual-portal CI, voice-session continuity. F0 items are complete. F1 = all manifests. Auth isolation and economics are the open blockers for any external-user launch.`,
+    links: [{ label: 'GDoc spec', url: 'https://docs.google.com/document/d/1SZD6JjfT2wrmOQX-_TCCqEjprfN3FFkMUjcP8LhdihQ/edit' }],
+  },
+];
+
+/* ── Render ───────────────────────────────────────────────────────────────── */
+function renderCards(stops, containerId) {
+  const wrap = document.getElementById(containerId);
+  stops.forEach((stop, idx) => {
+    const card = document.createElement('div');
+    card.className = 'card';
+    card.id = 'card-' + stop.id;
+
+    const tagsHtml = (stop.tags || []).map(t =>
+      `<span class="tag ${t.cls}">${t.label}</span>`
+    ).join('');
+
+    const linksHtml = stop.links ? stop.links.map(l =>
+      `<a class="preview-link" href="${l.url}" target="_blank" rel="noopener">
+        <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5">
+          <path d="M5 2H2a1 1 0 0 0-1 1v7a1 1 0 0 0 1 1h7a1 1 0 0 0 1-1V7"/>
+          <path d="M8 1h3v3M11 1 6 6" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        ${l.label}
+      </a>`
+    ).join('') : '';
+
+    const cliHtml = stop.cli
+      ? `<div class="cli-block">${escHtml(stop.cli)}</div>` : '';
+
+    card.innerHTML = `
+      <div class="card-head">
+        <div class="card-num">${idx + 1}</div>
+        <div class="card-meta">
+          <div class="card-title">${stop.title}</div>
+          <div class="card-tags">${tagsHtml}</div>
+        </div>
+        <div class="card-toggle">&#9658;</div>
+      </div>
+      <div class="card-body">
+        <div class="rep-narration">
+          <div class="rep-label">Rep</div>
+          ${stop.narration.trim().split('\n\n').map(p => `<p style="margin-bottom:0.6rem">${p}</p>`).join('')}
+        </div>
+        ${linksHtml ? `<div class="preview-links">${linksHtml}</div>` : ''}
+        ${cliHtml}
+        <div class="feedback-section">
+          <div class="feedback-label">Your feedback</div>
+          <textarea class="feedback-area" id="fb-${stop.id}"
+            placeholder="Looks good / needs work / questions... (leave blank to skip)"></textarea>
+          <div class="feedback-row">
+            <button class="submit-btn" data-stop="${stop.id}">Send feedback</button>
+            <span class="submit-status" id="status-${stop.id}"></span>
+          </div>
+        </div>
+      </div>`;
+
+    card.querySelector('.card-head').addEventListener('click', () => {
+      card.classList.toggle('open');
+    });
+
+    card.querySelector('.submit-btn').addEventListener('click', (e) => {
+      submitFeedback(stop.id, stop.title, e.currentTarget);
+    });
+
+    wrap.appendChild(card);
+  });
+}
+
+function escHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+/* ── Feedback submission → soma-transcripts ───────────────────────────────── */
+const TRANSCRIPTS_BASE = 'https://vpsmikewolf.duckdns.org/transcripts';
+const NS = 'rep/review-feedback';
+
+async function submitFeedback(stopId, stopTitle, btn) {
+  const area   = document.getElementById('fb-' + stopId);
+  const status = document.getElementById('status-' + stopId);
+  const text   = (area.value || '').trim();
+
+  if (!text) {
+    status.className = 'submit-status';
+    status.textContent = 'Nothing to send — type feedback first.';
+    return;
+  }
+
+  btn.disabled = true;
+  status.className = 'submit-status';
+  status.textContent = 'Sending...';
+
+  const sessionId = `review-${stopId}-${Date.now()}`;
+  const payload = {
+    namespace: NS,
+    session_id: sessionId,
+    messages: [{
+      role: 'user',
+      content: `[STOP: ${stopId}]\n[TITLE: ${stopTitle}]\n[DATE: ${new Date().toISOString()}]\n\n${text}`,
+      capability_id: 'rep-review',
+      auth_scope: null,
+      source_provenance: 'rep-review-surface',
+      relay_source: null,
+    }],
+  };
+
+  try {
+    const r = await fetch(`${TRANSCRIPTS_BASE}/${NS}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Namespace': NS },
+      body: JSON.stringify(payload),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (r.ok) {
+      status.className = 'submit-status ok';
+      status.textContent = 'Saved. ' + (data.transcript_id ? data.transcript_id.slice(0,8) + '...' : '');
+      area.value = '';
+      btn.textContent = 'Sent';
+    } else {
+      throw new Error(data.error || `HTTP ${r.status}`);
+    }
+  } catch (err) {
+    status.className = 'submit-status err';
+    status.textContent = 'Error: ' + err.message;
+    btn.disabled = false;
+  }
+}
+
+/* ── Init ─────────────────────────────────────────────────────────────────── */
+renderCards(STOPS_DONE,   'cards-done');
+renderCards(STOPS_STAGED, 'cards-staged');
+</script>
+</body>
+</html>

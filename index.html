@@ -278,6 +278,23 @@
   .submit-status.ok  { color: var(--done); }
   .submit-status.err { color: var(--red); }
 
+  .feedback-status-badge {
+    display: inline-block;
+    font-size: 0.65rem;
+    font-weight: 700;
+    letter-spacing: 0.07em;
+    text-transform: uppercase;
+    padding: 0.1rem 0.45rem;
+    border-radius: 999px;
+    border: 1px solid currentColor;
+    margin-left: 0.5rem;
+    vertical-align: middle;
+  }
+  .feedback-status-badge[data-status="received"]    { color: var(--muted);  border-color: var(--muted);  background: rgba(148,163,184,0.08); }
+  .feedback-status-badge[data-status="triaged"]     { color: var(--accent); border-color: var(--accent); background: rgba(109,142,247,0.08); }
+  .feedback-status-badge[data-status="in-progress"] { color: var(--staged); border-color: var(--staged); background: rgba(251,191,36,0.08); }
+  .feedback-status-badge[data-status="done"]        { color: var(--done);   border-color: var(--done);   background: rgba(52,211,153,0.08); }
+
   footer {
     border-top: 1px solid var(--border);
     padding-top: 1.5rem;
@@ -481,7 +498,7 @@ function renderCards(stops, containerId) {
         <div class="card-num">${idx + 1}</div>
         <div class="card-meta">
           <div class="card-title">${stop.title}</div>
-          <div class="card-tags">${tagsHtml}</div>
+          <div class="card-tags">${tagsHtml}<div class="feedback-status-badge" id="fbstatus-${stop.id}" style="display:none"></div></div>
         </div>
         <div class="card-toggle">&#9658;</div>
       </div>
@@ -519,9 +536,37 @@ function escHtml(s) {
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
-/* ── Feedback submission → soma-transcripts ───────────────────────────────── */
-const TRANSCRIPTS_BASE = 'https://vpsmikewolf.duckdns.org/transcripts';
-const NS = 'rep/review-feedback';
+/* ── Feedback submission → soma-infer /feedback/intake ───────────────────── */
+const INFER_BASE = 'https://vpsmikewolf.duckdns.org/infer';
+const REVIEW_KEY = 'review-intake-soma-2026';
+
+function setFeedbackBadge(stopId, status) {
+  const badge = document.getElementById('fbstatus-' + stopId);
+  if (!badge) return;
+  if (!status) { badge.style.display = 'none'; return; }
+  const labels = { received: 'received', triaged: 'triaged', 'in-progress': 'in progress', done: 'done' };
+  badge.textContent = labels[status] || status;
+  badge.setAttribute('data-status', status);
+  badge.style.display = 'inline-block';
+}
+
+async function refreshFeedbackStatus(stopId) {
+  const stored = localStorage.getItem('soma-feedback-' + stopId);
+  if (!stored) return;
+  let entry;
+  try { entry = JSON.parse(stored); } catch (_) { return; }
+  if (!entry.feedback_id) return;
+  try {
+    const r = await fetch(`${INFER_BASE}/feedback/item/${entry.feedback_id}`);
+    if (!r.ok) return;
+    const data = await r.json();
+    if (data.status) {
+      entry.status = data.status;
+      localStorage.setItem('soma-feedback-' + stopId, JSON.stringify(entry));
+      setFeedbackBadge(stopId, data.status);
+    }
+  } catch (_) { /* non-fatal */ }
+}
 
 async function submitFeedback(stopId, stopTitle, btn) {
   const area   = document.getElementById('fb-' + stopId);
@@ -538,32 +583,27 @@ async function submitFeedback(stopId, stopTitle, btn) {
   status.className = 'submit-status';
   status.textContent = 'Sending...';
 
-  const sessionId = `review-${stopId}-${Date.now()}`;
-  const payload = {
-    namespace: NS,
-    session_id: sessionId,
-    messages: [{
-      role: 'user',
-      content: `[STOP: ${stopId}]\n[TITLE: ${stopTitle}]\n[DATE: ${new Date().toISOString()}]\n\n${text}`,
-      capability_id: 'rep-review',
-      auth_scope: null,
-      source_provenance: 'rep-review-surface',
-      relay_source: null,
-    }],
-  };
-
   try {
-    const r = await fetch(`${TRANSCRIPTS_BASE}/${NS}`, {
+    const r = await fetch(`${INFER_BASE}/feedback/intake`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Namespace': NS },
-      body: JSON.stringify(payload),
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        stop_id:    stopId,
+        title:      stopTitle,
+        message:    text,
+        property:   'soma-review',
+        review_key: REVIEW_KEY,
+      }),
     });
     const data = await r.json().catch(() => ({}));
-    if (r.ok) {
+    if (r.ok && data.feedback_id) {
+      const entry = { feedback_id: data.feedback_id, status: data.status, submitted_at: new Date().toISOString() };
+      localStorage.setItem('soma-feedback-' + stopId, JSON.stringify(entry));
       status.className = 'submit-status ok';
-      status.textContent = 'Saved. ' + (data.transcript_id ? data.transcript_id.slice(0,8) + '...' : '');
+      status.textContent = 'Sent · ' + data.status;
       area.value = '';
       btn.textContent = 'Sent';
+      refreshFeedbackStatus(stopId);
     } else {
       throw new Error(data.error || `HTTP ${r.status}`);
     }
@@ -577,6 +617,9 @@ async function submitFeedback(stopId, stopTitle, btn) {
 /* ── Init ─────────────────────────────────────────────────────────────────── */
 renderCards(STOPS_DONE,   'cards-done');
 renderCards(STOPS_STAGED, 'cards-staged');
+
+/* Refresh status badges for any previously-submitted stops */
+[...STOPS_DONE, ...STOPS_STAGED].forEach(stop => refreshFeedbackStatus(stop.id));
 </script>
 </body>
 </html>

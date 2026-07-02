@@ -29,6 +29,10 @@ _INLINE_LINK_RE = re.compile(r'\[([^\]]*)\]\(([^)]+)\)')
 _INLINE_CODE_RE = re.compile(r'`([^`]+)`')
 _BOLD_RE = re.compile(r'\*\*([^*]+)\*\*')
 _ITALIC_RE = re.compile(r'(?<!\*)\*([^*]+)\*(?!\*)')
+# Bare autolinks: a raw http(s) URL not already inside [label](...) markdown-link syntax.
+# Stops at whitespace or a small set of trailing punctuation/markup chars so it doesn't
+# swallow a following '**', ')', or sentence punctuation.
+_BARE_URL_RE = re.compile(r'(https?://[^\s<>\[\]()]+?)(?=[.,;:!?]?(?:\*\*)?(?:\s|$))')
 
 
 def render_inline(text, link_resolver=None):
@@ -38,31 +42,66 @@ def render_inline(text, link_resolver=None):
     # Protect inline code spans first so we don't mangle markup inside them.
     placeholders = []
 
-    def stash_code(m):
-        placeholders.append(f'<code>{_esc(m.group(1))}</code>')
+    def stash(html_out):
+        placeholders.append(html_out)
         return f'\x00{len(placeholders) - 1}\x00'
 
+    def stash_code(m):
+        return stash(f'<code>{_esc(m.group(1))}</code>')
+
     text = _INLINE_CODE_RE.sub(stash_code, text)
+
+    def _resolve(href):
+        """Normalize link_resolver's return to (href_out, css_class, extra_attrs).
+        link_resolver may return a 2-tuple (href, is_internal_bool) — legacy/simple
+        callers — or a 3-tuple (href, kind_str, title_or_None) for finer control
+        (see server.py::LinkKind). Falls back to plain external link if no resolver."""
+        if link_resolver is None:
+            return href, 'external-link', ' target="_blank" rel="noopener"'
+        result = link_resolver(href)
+        if len(result) == 2:
+            href_out, internal = result
+            cls = 'internal-link' if internal else 'external-link'
+            extra = '' if internal else ' target="_blank" rel="noopener"'
+            return href_out, cls, extra
+        href_out, kind, title = result
+        extra = ' target="_blank" rel="noopener"' if kind == 'external-link' else ''
+        if title:
+            extra += f' title="{_esc(title)}"'
+        return href_out, kind, extra
 
     def link_sub(m):
         label, href = m.group(1), m.group(2)
         label_html = _esc(label)
-        if link_resolver:
-            href_out, internal = link_resolver(href)
-        else:
-            href_out, internal = href, False
-        cls = ' class="internal-link"' if internal else ' class="external-link" target="_blank" rel="noopener"'
-        return f'<a href="{_esc(href_out)}"{cls}>{label_html}</a>'
+        href_out, cls, extra = _resolve(href)
+        return stash(f'<a href="{_esc(href_out)}" class="{cls}"{extra}>{label_html}</a>')
 
-    text = _esc(text)
-    # _esc already ran; but we escaped before substituting links so re-do link matching
-    # on the escaped text is wrong because []( ) survive escaping fine (no special html chars).
+    # Stash markdown-form links [label](href) BEFORE bare-URL autolinking, so a URL
+    # used as the href of a real markdown link is never double-linked.
     text = _INLINE_LINK_RE.sub(link_sub, text)
+
+    def bare_url_sub(m):
+        href = m.group(1)
+        href_out, cls, extra = _resolve(href)
+        return stash(f'<a href="{_esc(href_out)}" class="{cls}"{extra}>{_esc(href)}</a>')
+
+    text = _BARE_URL_RE.sub(bare_url_sub, text)
+
+    # Escape whatever plain text remains (placeholders are \x00N\x00 — no HTML-special
+    # chars, so escaping is a no-op on them and safe to run after stashing).
+    text = _esc(text)
     text = _BOLD_RE.sub(r'<strong>\1</strong>', text)
     text = _ITALIC_RE.sub(r'<em>\1</em>', text)
 
-    for i, ph in enumerate(placeholders):
-        text = text.replace(f'\x00{i}\x00', ph)
+    # Placeholders can nest (a link's stashed HTML can itself contain a code-span
+    # placeholder token, e.g. `[`file.md`](file.md)`), so a single forward pass isn't
+    # enough — a placeholder substituted late may re-introduce an earlier token into
+    # `text`. Re-scan until no more \x00N\x00 tokens remain (bounded by placeholder count).
+    for _ in range(len(placeholders) + 1):
+        if '\x00' not in text:
+            break
+        for i, ph in enumerate(placeholders):
+            text = text.replace(f'\x00{i}\x00', ph)
     return text
 
 

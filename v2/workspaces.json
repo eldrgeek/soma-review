@@ -1,0 +1,67 @@
+{
+  "estate": {
+    "label": "Estate",
+    "roots": [
+      ["estate", "_estate"],
+      ["business-ops", "business-ops"],
+      ["soma", "SOMA"]
+    ],
+    "nightly": true,
+    "nav": [
+      ["Morning Review", "estate/MORNING-REVIEW-2026-07-02.md"],
+      ["Productivity Opportunities", "estate/PRODUCTIVITY-OPPORTUNITIES-2026-07-02.md"],
+      ["Business Plan", "business-ops/BUSINESS-PLAN-2026-07.md"],
+      ["Doc-Proofing Plan", "estate/DOC-PROOFING-PLAN-2026-07-01.md"],
+      ["Overnight Manifest", "estate/OVERNIGHT-2026-07-01.md"],
+      ["SOMA App Standard", "soma/SOMA-APP-STANDARD.md"],
+      ["Vision Interview", "estate/audit-2026-07/VISION-INTERVIEW-2026-07-01.md"]
+    ],
+    "home": "estate/MORNING-REVIEW-2026-07-02.md",
+    "feedback_dir": "_estate/review-feedback"
+  },
+  "playmaker": {
+    "label": "Playmaker",
+    "roots": [
+      ["playmaker", "playmaker"]
+    ],
+    "nightly": true,
+    "nightly_filter": "playmaker\\|capture\\|character-memory\\|landing\\|izzy",
+    "nav": [
+      ["AGENTS", "playmaker/AGENTS.md"],
+      ["CLAUDE", "playmaker/CLAUDE.md"],
+      ["DESIGN", "playmaker/DESIGN.md"]
+    ],
+    "home": "playmaker/CLAUDE.md",
+    "feedback_dir": "_estate/review-feedback/playmaker"
+  },
+  "platform": {
+    "label": "Platform",
+    "roots": [
+      ["soma", "SOMA"],
+      ["shared", "_shared"]
+    ],
+    "nightly": false,
+    "nav": [
+      ["SOMA App Standard", "soma/SOMA-APP-STANDARD.md"],
+      ["SOMA State", "soma/SOMA-STATE.md"]
+    ],
+    "home": "soma/SOMA-STATE.md",
+    "feedback_dir": "_estate/review-feedback/platform"
+  },
+  "legends": {
+    "label": "Legends",
+    "roots": [
+      ["legends", "legends-membership-site"]
+    ],
+    "nightly": true,
+    "nightly_filter": "legends",
+    "nav": [
+      ["AGENTS", "legends/AGENTS.md"],
+      ["CLAUDE", "legends/CLAUDE.md"],
+      ["Choreography", "legends/CHOREOGRAPHY.md"],
+      ["Breadcrumbs", "legends/BREADCRUMBS.md"]
+    ],
+    "home": "legends/CLAUDE.md",
+    "feedback_dir": "_estate/review-feedback/legends"
+  }
+}

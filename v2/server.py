@@ -24,51 +24,67 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mdblocks import parse_markdown, render_inline  # noqa: E402
 
 PROJECTS_ROOT = os.path.expanduser('~/Projects')
-FEEDBACK_DIR = os.path.join(PROJECTS_ROOT, '_estate', 'review-feedback')
 DISPATCH_PROMPT_TEMPLATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dispatch-prompt-template.md')
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static')
-
-os.makedirs(FEEDBACK_DIR, exist_ok=True)
-
-# --- Whitelisted roots -------------------------------------------------
-# Each entry: (route_prefix, absolute_fs_root)
-WHITELIST_ROOTS = [
-    ('estate', os.path.join(PROJECTS_ROOT, '_estate')),
-    ('business-ops', os.path.join(PROJECTS_ROOT, 'business-ops')),
-    ('soma', os.path.join(PROJECTS_ROOT, 'SOMA')),
-]
+WORKSPACES_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'workspaces.json')
 
 # Nightly worktree reports get their own synthetic route: nightly/<worktree-name>
 NIGHTLY_PREFIX = 'nightly'
 
+DEFAULT_WORKSPACE = 'estate'
 
-def discover_nightly_reports():
-    """Return {slug: absolute_path} for .nightly-*/NIGHTLY-REPORT.md worktrees."""
+
+def load_workspaces():
+    """Load workspaces.json fresh on every call (cheap, small file) so edits don't
+    need a server restart. Each workspace config:
+      roots: [[route_prefix, path_relative_to_PROJECTS_ROOT], ...]
+      nav: [[label, route_path], ...]
+      home: route_path (default page for this workspace)
+      feedback_dir: path relative to PROJECTS_ROOT for this workspace's sidecar JSONLs
+      nightly: bool - whether to auto-discover .nightly-* worktrees into this workspace
+      nightly_filter: optional regex - only include nightly slugs matching this pattern
+    """
+    with open(WORKSPACES_CONFIG, 'r', encoding='utf-8') as f:
+        raw = json.load(f)
+    out = {}
+    for slug, cfg in raw.items():
+        out[slug] = {
+            'label': cfg.get('label', slug),
+            'roots': [(p, os.path.join(PROJECTS_ROOT, rel)) for p, rel in cfg.get('roots', [])],
+            'nav': [(label, route) for label, route in cfg.get('nav', [])],
+            'home': cfg.get('home'),
+            'feedback_dir': os.path.join(PROJECTS_ROOT, cfg.get('feedback_dir', '_estate/review-feedback')),
+            'nightly': cfg.get('nightly', False),
+            'nightly_filter': cfg.get('nightly_filter'),
+        }
+    return out
+
+
+def get_workspace(slug):
+    workspaces = load_workspaces()
+    if slug not in workspaces:
+        raise NotFoundError(f'workspace:{slug}')
+    ws = workspaces[slug]
+    os.makedirs(ws['feedback_dir'], exist_ok=True)
+    return ws
+
+
+def discover_nightly_reports(name_filter=None):
+    """Return {slug: absolute_path} for .nightly-*/NIGHTLY-REPORT.md worktrees.
+    If name_filter (regex string) is given, only include slugs matching it."""
     out = {}
     if not os.path.isdir(PROJECTS_ROOT):
         return out
+    pattern = re.compile(name_filter, re.IGNORECASE) if name_filter else None
     for name in os.listdir(PROJECTS_ROOT):
         if name.startswith('.nightly-'):
             candidate = os.path.join(PROJECTS_ROOT, name, 'NIGHTLY-REPORT.md')
             if os.path.isfile(candidate):
                 slug = name[len('.nightly-'):]
+                if pattern and not pattern.search(slug):
+                    continue
                 out[slug] = candidate
     return out
-
-
-# Nav sidebar entries: (label, page_path_within_app)
-# page_path is the route path used by resolve_page(), e.g. "estate/MORNING-REVIEW-2026-07-02.md"
-NAV_ENTRIES = [
-    ('Morning Review', 'estate/MORNING-REVIEW-2026-07-02.md'),
-    ('Productivity Opportunities', 'estate/PRODUCTIVITY-OPPORTUNITIES-2026-07-02.md'),
-    ('Business Plan', 'business-ops/BUSINESS-PLAN-2026-07.md'),
-    ('Doc-Proofing Plan', 'estate/DOC-PROOFING-PLAN-2026-07-01.md'),
-    ('Overnight Manifest', 'estate/OVERNIGHT-2026-07-01.md'),
-    ('SOMA App Standard', 'soma/SOMA-APP-STANDARD.md'),
-    ('Vision Interview', 'estate/audit-2026-07/VISION-INTERVIEW-2026-07-01.md'),
-]
-
-HOME_PAGE = 'estate/MORNING-REVIEW-2026-07-02.md'
 
 
 # --- Path resolution / security -----------------------------------------
@@ -77,28 +93,29 @@ class NotFoundError(Exception):
     pass
 
 
-def resolve_page(route_path):
+def resolve_page(route_path, workspace=DEFAULT_WORKSPACE):
     """route_path like 'estate/foo/bar.md' or 'nightly/izzy'. Returns absolute fs path.
     Raises NotFoundError if outside whitelist or missing.
     """
+    ws = get_workspace(workspace)
     route_path = route_path.strip('/')
     if not route_path:
-        route_path = HOME_PAGE
+        route_path = ws['home']
 
     parts = route_path.split('/', 1)
     if len(parts) != 2:
         raise NotFoundError(route_path)
     prefix, rest = parts
 
-    if prefix == NIGHTLY_PREFIX:
-        reports = discover_nightly_reports()
+    if prefix == NIGHTLY_PREFIX and ws['nightly']:
+        reports = discover_nightly_reports(ws.get('nightly_filter'))
         slug = rest
         if slug not in reports:
             raise NotFoundError(route_path)
         return reports[slug]
 
     root = None
-    for p, r in WHITELIST_ROOTS:
+    for p, r in ws['roots']:
         if p == prefix:
             root = r
             break
@@ -117,15 +134,51 @@ def resolve_page(route_path):
     return candidate
 
 
-def fs_path_to_route(fs_path):
-    """Best-effort reverse mapping for link rewriting within the same root."""
+def fs_path_to_route(fs_path, workspace=DEFAULT_WORKSPACE):
+    """Best-effort reverse mapping for link rewriting within the same root.
+    Works for ANY file under a whitelisted root, not just .md — callers decide
+    whether the target is renderable (.md -> /page/) or raw-servable (/raw/)."""
+    ws = get_workspace(workspace)
     fs_path = os.path.normpath(fs_path)
-    for p, r in WHITELIST_ROOTS:
+    for p, r in ws['roots']:
         r = os.path.normpath(r)
         if fs_path.startswith(r + os.sep):
             rel = os.path.relpath(fs_path, r)
             return f'{p}/{rel}'
     return None
+
+
+def resolve_raw(route_path, workspace=DEFAULT_WORKSPACE):
+    """Like resolve_page but for non-.md files under a whitelisted root (read-only
+    static serve, e.g. LEDGER.csv). Raises NotFoundError if outside whitelist or missing."""
+    ws = get_workspace(workspace)
+    route_path = route_path.strip('/')
+    parts = route_path.split('/', 1)
+    if len(parts) != 2:
+        raise NotFoundError(route_path)
+    prefix, rest = parts
+    root = None
+    for p, r in ws['roots']:
+        if p == prefix:
+            root = r
+            break
+    if root is None:
+        raise NotFoundError(route_path)
+    rest = unquote(rest)
+    candidate = os.path.normpath(os.path.join(root, rest))
+    if not candidate.startswith(os.path.normpath(root) + os.sep) and candidate != os.path.normpath(root):
+        raise NotFoundError(route_path)
+    if not os.path.isfile(candidate):
+        raise NotFoundError(route_path)
+    return candidate
+
+
+_RAW_MIME = {
+    '.csv': 'text/csv', '.txt': 'text/plain', '.json': 'application/json',
+    '.pdf': 'application/pdf', '.png': 'image/png', '.jpg': 'image/jpeg',
+    '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.svg': 'image/svg+xml',
+    '.log': 'text/plain', '.yaml': 'text/plain', '.yml': 'text/plain',
+}
 
 
 def page_slug(route_path):
@@ -134,30 +187,79 @@ def page_slug(route_path):
 
 
 # --- Link rewriting -------------------------------------------------------
+#
+# render_inline() calls link_resolver(href) -> (href_out, kind) where kind is one of:
+#   'internal'    -> in-app /page/ route, works, rendered with .internal-link
+#   'external'    -> normal http(s)/mailto link, target=_blank, .external-link
+#   'raw'         -> whitelisted non-.md file, served read-only via /raw/, .internal-link
+#   'unavailable' -> looks local but isn't resolvable/servable, .unavailable-link,
+#                    href='#unavailable', title attr explains why
+#
+# mdblocks.render_inline still treats any non-'external' kind as "internal" for its
+# own class selection, so make_link_resolver returns (href_out, is_internal_bool) to
+# match that contract, PLUS stashes the kind/title via a closure-local dict keyed by
+# the outgoing href so render_block_html/CSS can special-case 'unavailable' — see
+# LinkResolution below. Simpler: just fold kind straight into the returned class by
+# having link_resolver return a 3rd element consumed only when present.
 
-def make_link_resolver(current_fs_path, current_route):
+class LinkKind:
+    INTERNAL = 'internal-link'
+    EXTERNAL = 'external-link'
+    UNAVAILABLE = 'unavailable-link'
+
+
+def workspace_url_prefix(workspace):
+    """'' for the default workspace (bare /page/..., backward compatible with the
+    one sidecar file that predates workspaces), '/w/<slug>' otherwise."""
+    return '' if workspace == DEFAULT_WORKSPACE else f'/w/{workspace}'
+
+
+def make_link_resolver(current_fs_path, current_route, workspace=DEFAULT_WORKSPACE):
     current_dir = os.path.dirname(current_fs_path)
+    url_prefix = workspace_url_prefix(workspace)
 
     def resolver(href):
-        if href.startswith(('http://', 'https://', 'mailto:', '#')):
-            return href, False
-        # strip a leading backtick-wrapped or trailing anchor fragment
+        raw_href = href
+        if href.startswith(('http://', 'https://', 'mailto:')):
+            return href, LinkKind.EXTERNAL, None
+        if href.startswith('#'):
+            # in-page anchor fragment on the current doc — always safe, no file resolution.
+            return href, LinkKind.INTERNAL, None
+
         frag = ''
         if '#' in href:
             href, frag = href.split('#', 1)
             frag = '#' + frag
+
         if not href:
-            return current_route and f'/page/{current_route}{frag}' or frag, True
+            # bare '#anchor' link (handled above) or empty — treat as same-page anchor.
+            target = current_route and f'{url_prefix}/page/{current_route}{frag}' or frag
+            return target, LinkKind.INTERNAL, None
+
         target_fs = os.path.normpath(os.path.join(current_dir, href))
-        if os.path.isfile(target_fs) and target_fs.endswith('.md'):
-            route = fs_path_to_route(target_fs)
+
+        if target_fs.endswith('.md'):
+            if os.path.isfile(target_fs):
+                route = fs_path_to_route(target_fs, workspace)
+                if route:
+                    return f'{url_prefix}/page/{route}{frag}', LinkKind.INTERNAL, None
+                # exists on disk but outside every whitelisted root
+                return '#unavailable', LinkKind.UNAVAILABLE, f'Outside review whitelist: {raw_href}'
+            return '#unavailable', LinkKind.UNAVAILABLE, f'File not found: {raw_href}'
+
+        # Non-.md local path: serve read-only via /raw/ if it exists under a
+        # whitelisted root; otherwise mark unavailable (never silently dead-link).
+        if os.path.isfile(target_fs):
+            route = fs_path_to_route(target_fs, workspace)
             if route:
-                return f'/page/{route}{frag}', True
-        # Not resolvable / not whitelisted / not markdown -> leave as inert text-ish link
-        # but still make it non-navigating-away by disabling href if it looks local.
-        if href.endswith('.md'):
-            return '#unresolved', True
-        return href, False
+                return f'{url_prefix}/raw/{route}', LinkKind.INTERNAL, None
+            return '#unavailable', LinkKind.UNAVAILABLE, f'Outside review whitelist: {raw_href}'
+        if not href.startswith(('/', '..')) and '://' not in href:
+            # looks like a relative local path but the file doesn't exist
+            return '#unavailable', LinkKind.UNAVAILABLE, f'File not found: {raw_href}'
+        # anything else (absolute fs paths, unrecognized schemes) — treat as external-ish,
+        # don't try to resolve, don't claim it's internal.
+        return href, LinkKind.EXTERNAL, None
 
     return resolver
 
@@ -167,12 +269,13 @@ def make_link_resolver(current_fs_path, current_route):
 _lock = threading.Lock()
 
 
-def sidecar_path(route_path):
-    return os.path.join(FEEDBACK_DIR, page_slug(route_path) + '.jsonl')
+def sidecar_path(route_path, workspace=DEFAULT_WORKSPACE):
+    ws = get_workspace(workspace)
+    return os.path.join(ws['feedback_dir'], page_slug(route_path) + '.jsonl')
 
 
-def read_comments(route_path):
-    path = sidecar_path(route_path)
+def read_comments(route_path, workspace=DEFAULT_WORKSPACE):
+    path = sidecar_path(route_path, workspace)
     if not os.path.isfile(path):
         return []
     out = []
@@ -188,8 +291,8 @@ def read_comments(route_path):
     return out
 
 
-def write_all_comments(route_path, comments):
-    path = sidecar_path(route_path)
+def write_all_comments(route_path, comments, workspace=DEFAULT_WORKSPACE):
+    path = sidecar_path(route_path, workspace)
     tmp = path + '.tmp'
     with open(tmp, 'w', encoding='utf-8') as f:
         for c in comments:
@@ -197,23 +300,23 @@ def write_all_comments(route_path, comments):
     os.replace(tmp, path)
 
 
-def append_comment(route_path, comment):
+def append_comment(route_path, comment, workspace=DEFAULT_WORKSPACE):
     with _lock:
-        path = sidecar_path(route_path)
+        path = sidecar_path(route_path, workspace)
         with open(path, 'a', encoding='utf-8') as f:
             f.write(json.dumps(comment, ensure_ascii=False) + '\n')
 
 
-def update_comment(route_path, comment_id, patch):
+def update_comment(route_path, comment_id, patch, workspace=DEFAULT_WORKSPACE):
     with _lock:
-        comments = read_comments(route_path)
+        comments = read_comments(route_path, workspace)
         found = False
         for c in comments:
             if c.get('id') == comment_id:
                 c.update(patch)
                 found = True
         if found:
-            write_all_comments(route_path, comments)
+            write_all_comments(route_path, comments, workspace)
         return found
 
 
@@ -225,10 +328,17 @@ PAGE_CSS = """
 body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 0;
        display: flex; min-height: 100vh; background: #0f1216; color: #e6e6e6; }
 a { color: #7db8ff; }
+a.unavailable-link { color: #6a7280; text-decoration: line-through; cursor: not-allowed; }
+a.external-link::after { content: " \2197"; font-size: 11px; opacity: .6; }
 .sidebar { width: 260px; flex-shrink: 0; background: #14181f; padding: 20px 16px;
            border-right: 1px solid #262b33; position: sticky; top: 0; height: 100vh; overflow-y: auto; }
 .sidebar h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: #8a93a3; margin: 18px 0 8px; }
 .sidebar h2:first-child { margin-top: 0; }
+.workspace-switcher { display: flex; flex-wrap: wrap; gap: 4px; margin: 14px 0 4px; }
+.workspace-switcher a { padding: 3px 8px; border-radius: 12px; font-size: 11px; text-decoration: none;
+                          background: #1c2230; color: #8a93a3; border: 1px solid #262b33; }
+.workspace-switcher a.active { background: #22344a; color: #9cc7ff; border-color: #2a5adf; }
+.workspace-switcher a:hover { color: #cbd3e0; }
 .sidebar a { display: block; padding: 6px 8px; border-radius: 6px; text-decoration: none; font-size: 14px; color: #cbd3e0; }
 .sidebar a:hover { background: #1e2430; }
 .sidebar a.active { background: #22344a; color: #9cc7ff; }
@@ -280,10 +390,38 @@ hr { border: none; border-top: 1px solid #2b3140; margin: 24px 0; }
          padding: 10px 16px; border-radius: 8px; font-size: 13px; color: #cbd3e0; opacity: 0; transition: opacity .2s; }
 .toast.show { opacity: 1; }
 .notfound { padding: 60px; text-align: center; }
+
+/* --- edit-as-comment --- */
+.block-body.edit-hint { cursor: text; }
+.block-body.edit-hint:hover { outline: 1px dashed #33394a; outline-offset: 3px; border-radius: 4px; }
+.block-edit-textarea { width: 100%; min-height: 48px; background: #10151d; color: #e6e6e6;
+                        border: 1px solid #4f8cff; border-radius: 6px; padding: 8px; font-family: inherit;
+                        font-size: 14px; line-height: 1.5; resize: vertical; }
+.edit-hint-label { display: none; font-size: 11px; color: #6a7280; margin-top: 2px; }
+.block-wrap.edit-eligible:hover .edit-hint-label { display: block; }
+.diff-view { font-size: 13px; font-family: ui-monospace, Menlo, monospace; white-space: pre-wrap;
+             line-height: 1.5; word-break: break-word; }
+.diff-del { background: #4a1f24; color: #f0a3ab; text-decoration: line-through; padding: 0 2px; border-radius: 2px; }
+.diff-ins { background: #1f4a2a; color: #9cf0ac; padding: 0 2px; border-radius: 2px; }
+.comment-item.is-edit { border-left: 3px solid #a89cf0; }
+.comment-item .comment-actions { float: right; display: flex; gap: 6px; }
+.comment-item .comment-actions button { background: none; border: none; color: #8a93a3; cursor: pointer;
+                                          font-size: 12px; padding: 0 3px; }
+.comment-item .comment-actions button:hover { color: #e6e6e6; }
+.comment-item.deleted { opacity: .45; }
+.comment-item .edit-inline-textarea { width: 100%; min-height: 44px; background: #0f1216; color: #e6e6e6;
+                                        border: 1px solid #2b3140; border-radius: 6px; padding: 6px;
+                                        font-family: inherit; font-size: 13px; margin-top: 4px; }
+.mic-btn { background: #1c2634; border: 1px solid #2b3140; border-radius: 6px; padding: 6px 10px;
+           font-size: 14px; cursor: pointer; margin-top: 6px; margin-right: 6px; }
+.mic-btn:hover { background: #24314a; }
+.mic-btn.recording { background: #4a1f24; border-color: #f0a3ab; animation: pulse 1s infinite; }
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .5; } }
 """
 
 PAGE_JS = r"""
 const ROUTE = window.__ROUTE__;
+const API_BASE = window.__API_BASE__ || '';
 
 function toast(msg) {
   const t = document.getElementById('toast');
@@ -296,17 +434,114 @@ function badgeClass(status) {
   return 'badge badge-' + (status || 'queued');
 }
 
+function b64ToUtf8(b64) {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return new TextDecoder('utf-8').decode(bytes);
+}
+
+function escapeHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+// Minimal word-level diff (LCS-based) for rendering suggested-edit comments inline.
+// Good enough for short-to-medium block text; not meant to compete with a real diff lib.
+function wordDiff(before, after) {
+  const a = before.split(/(\s+)/);
+  const b = after.split(/(\s+)/);
+  const dp = Array.from({length: a.length+1}, () => new Array(b.length+1).fill(0));
+  for (let i = a.length-1; i>=0; i--) {
+    for (let j = b.length-1; j>=0; j--) {
+      dp[i][j] = a[i]===b[j] ? dp[i+1][j+1]+1 : Math.max(dp[i+1][j], dp[i][j+1]);
+    }
+  }
+  let i=0, j=0, out=[];
+  while (i<a.length && j<b.length) {
+    if (a[i]===b[j]) { out.push({t:'eq', v:a[i]}); i++; j++; }
+    else if (dp[i+1][j] >= dp[i][j+1]) { out.push({t:'del', v:a[i]}); i++; }
+    else { out.push({t:'ins', v:b[j]}); j++; }
+  }
+  while (i<a.length) { out.push({t:'del', v:a[i]}); i++; }
+  while (j<b.length) { out.push({t:'ins', v:b[j]}); j++; }
+  return out;
+}
+
+function renderDiffHtml(before, after) {
+  const parts = wordDiff(before, after);
+  return parts.map(p => {
+    const esc = escapeHtml(p.v);
+    if (p.t === 'del') return `<span class="diff-del">${esc}</span>`;
+    if (p.t === 'ins') return `<span class="diff-ins">${esc}</span>`;
+    return esc;
+  }).join('');
+}
+
 async function fetchComments() {
-  const res = await fetch(`/api/comments?page=${encodeURIComponent(ROUTE)}`);
+  const res = await fetch(`${API_BASE}/api/comments?page=${encodeURIComponent(ROUTE)}`);
   return res.json();
 }
 
 function renderCommentItem(c) {
   const div = document.createElement('div');
-  div.className = 'comment-item';
-  div.innerHTML = `<div class="meta">${c.author} · ${new Date(c.timestamp).toLocaleString()} · <span class="${badgeClass(c.status)}">${c.status}</span></div>
-    <div>${c.text.replace(/</g,'&lt;')}</div>`;
+  div.className = 'comment-item' + (c.type === 'edit' ? ' is-edit' : '') + (c.deleted ? ' deleted' : '');
+  div.dataset.id = c.id;
+  const badge = `<span class="${badgeClass(c.status)}">${c.status}</span>`;
+  const editedNote = c.edited_at ? ' <span style="color:#6a7280">(edited)</span>' : '';
+  const deletedNote = c.deleted ? ' <span style="color:#6a7280">(deleted)</span>' : '';
+  let bodyHtml;
+  if (c.type === 'edit') {
+    bodyHtml = `<div class="diff-view">${renderDiffHtml(c.snapshot || '', c.proposed || '')}</div>`;
+  } else {
+    bodyHtml = `<div class="comment-text">${escapeHtml(c.text)}</div>`;
+  }
+  const canEditDelete = c.author === 'mike' && !c.deleted && c.type !== 'edit';
+  const actions = canEditDelete
+    ? `<span class="comment-actions"><button class="edit-comment-btn" title="Edit">&#9998;</button><button class="delete-comment-btn" title="Delete">&#128465;</button></span>`
+    : '';
+  div.innerHTML = `<div class="meta">${actions}${c.author} · ${new Date(c.timestamp).toLocaleString()} · ${badge}${editedNote}${deletedNote}</div>
+    ${bodyHtml}`;
+
+  if (canEditDelete) {
+    div.querySelector('.edit-comment-btn').addEventListener('click', () => startInlineEdit(div, c));
+    div.querySelector('.delete-comment-btn').addEventListener('click', () => deleteComment(div, c));
+  }
   return div;
+}
+
+function startInlineEdit(div, c) {
+  const bodyEl = div.querySelector('.comment-text, .diff-view');
+  const ta = document.createElement('textarea');
+  ta.className = 'edit-inline-textarea';
+  ta.value = c.text;
+  bodyEl.replaceWith(ta);
+  ta.focus();
+  const commit = async () => {
+    const text = ta.value.trim();
+    if (text && text !== c.text) {
+      await fetch(`${API_BASE}/api/comments/update`, {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ page: ROUTE, id: c.id, text })
+      });
+      toast('Comment updated.');
+    }
+    loadThreadsIntoDOM();
+  };
+  ta.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); commit(); }
+    if (e.key === 'Escape') { loadThreadsIntoDOM(); }
+  });
+  ta.addEventListener('blur', commit);
+}
+
+async function deleteComment(div, c) {
+  if (!confirm('Delete this comment? (soft-delete, kept in the audit trail)')) return;
+  await fetch(`${API_BASE}/api/comments/delete`, {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ page: ROUTE, id: c.id })
+  });
+  toast('Comment deleted.');
+  loadThreadsIntoDOM();
 }
 
 async function loadThreadsIntoDOM() {
@@ -319,7 +554,7 @@ async function loadThreadsIntoDOM() {
   }
   document.querySelectorAll('.block-wrap').forEach(el => {
     const anchor = el.dataset.anchor;
-    const list = byAnchor[anchor] || [];
+    const list = (byAnchor[anchor] || []).filter(c => !c.deleted || c.author === 'mike');
     const threadEl = el.querySelector('.comment-thread');
     threadEl.innerHTML = '';
     if (list.length) {
@@ -330,7 +565,7 @@ async function loadThreadsIntoDOM() {
         pill.className = 'comment-count-pill';
         el.appendChild(pill);
       }
-      pill.textContent = list.length;
+      pill.textContent = list.filter(c => !c.deleted).length || list.length;
       list.sort((a,b) => a.timestamp.localeCompare(b.timestamp))
           .forEach(c => threadEl.appendChild(renderCommentItem(c)));
     } else {
@@ -345,26 +580,128 @@ async function loadThreadsIntoDOM() {
             .forEach(c => pageThread.appendChild(renderCommentItem(c)));
 }
 
-async function postComment({anchor, snapshot, text, threadId}) {
-  const res = await fetch('/api/comments', {
+async function postComment({anchor, snapshot, text, threadId, type, proposed}) {
+  const res = await fetch(`${API_BASE}/api/comments`, {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({ page: ROUTE, anchor, snapshot, text, thread_id: threadId || null })
+    body: JSON.stringify({ page: ROUTE, anchor, snapshot, text, thread_id: threadId || null,
+                            type: type || 'comment', proposed })
   });
   if (!res.ok) throw new Error('post failed: ' + res.status);
   return res.json();
+}
+
+// --- Voice-in (Web Speech API, Chrome/webkit only; hides gracefully elsewhere) ---
+const SpeechRec = window.SpeechRecognition || window.webkitSpeechRecognition;
+
+function wireMic(btn, textarea) {
+  if (!SpeechRec) { btn.style.display = 'none'; return; }
+  let rec = null;
+  let recording = false;
+  btn.addEventListener('click', () => {
+    if (recording) { rec && rec.stop(); return; }
+    rec = new SpeechRec();
+    rec.lang = 'en-US';
+    rec.interimResults = false;
+    rec.continuous = false;
+    rec.onstart = () => { recording = true; btn.classList.add('recording'); };
+    rec.onerror = () => { recording = false; btn.classList.remove('recording'); };
+    rec.onend = () => { recording = false; btn.classList.remove('recording'); };
+    rec.onresult = (e) => {
+      let transcript = '';
+      for (let i = 0; i < e.results.length; i++) transcript += e.results[i][0].transcript;
+      const sep = textarea.value && !textarea.value.endsWith(' ') ? ' ' : '';
+      textarea.value = textarea.value + sep + transcript;
+      textarea.focus();
+    };
+    rec.start();
+  });
+}
+
+// --- Edit-as-comment: click a block body -> textarea with raw markdown source.
+// On blur, if changed, POST a {type: "edit"} comment (snapshot=before, proposed=after).
+// The underlying .md file is never touched here — this only proposes.
+function wireEditableBlocks() {
+  document.querySelectorAll('.block-wrap.edit-eligible').forEach(el => {
+    const body = el.querySelector('.block-body');
+    body.classList.add('edit-hint');
+    body.addEventListener('click', (e) => {
+      if (e.target.closest('a')) return; // don't hijack link clicks
+      if (body.querySelector('textarea')) return; // already editing
+      enterEditMode(el, body);
+    });
+  });
+}
+
+function enterEditMode(el, body) {
+  const before = b64ToUtf8(el.dataset.source);
+  const originalHtml = body.innerHTML;
+  const ta = document.createElement('textarea');
+  ta.className = 'block-edit-textarea';
+  ta.value = before;
+  body.innerHTML = '';
+  body.appendChild(ta);
+  ta.style.height = Math.max(48, ta.scrollHeight) + 'px';
+  ta.focus();
+
+  let settled = false;
+  const settle = async (commit) => {
+    if (settled) return;
+    settled = true;
+    const after = ta.value;
+    if (commit && after.trim() !== before.trim()) {
+      await postComment({
+        anchor: el.dataset.anchor, snapshot: before, proposed: after,
+        text: 'Suggested edit', type: 'edit',
+      });
+      toast('Edit proposed — saved as a comment.');
+      loadThreadsIntoDOM();
+    }
+    body.innerHTML = originalHtml;
+  };
+
+  ta.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+      // Cmd/Ctrl+Enter while editing text: commit the edit immediately.
+      e.preventDefault();
+      settle(true);
+      return;
+    }
+    if (e.key === 'Escape') { e.preventDefault(); settle(false); return; }
+  });
+  ta.addEventListener('blur', () => settle(true));
+}
+
+// Enter at the end of a (non-edit-mode) block, or Cmd/Enter anywhere in the block,
+// opens the inline comment box right there (separate from edit-as-comment above,
+// which triggers on click-into-the-body-text).
+function wireEnterOpensComment() {
+  document.querySelectorAll('.block-wrap').forEach(el => {
+    const body = el.querySelector('.block-body');
+    if (!body) return;
+    body.addEventListener('keydown', (e) => {
+      if (body.querySelector('textarea')) return; // in edit mode, let that handler own Enter
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        const box = el.querySelector('.comment-box');
+        box.classList.add('open');
+        box.querySelector('textarea').focus();
+      }
+    });
+  });
 }
 
 function wireBlockAffordances() {
   document.querySelectorAll('.block-wrap').forEach(el => {
     const btn = el.querySelector('.comment-affordance');
     const box = el.querySelector('.comment-box');
+    const ta = box.querySelector('textarea');
+    wireMic(box.querySelector('.mic-btn'), ta);
     btn.addEventListener('click', () => {
       box.classList.toggle('open');
-      if (box.classList.contains('open')) box.querySelector('textarea').focus();
+      if (box.classList.contains('open')) ta.focus();
     });
-    box.querySelector('button').addEventListener('click', async () => {
-      const ta = box.querySelector('textarea');
+    const save = async () => {
       const text = ta.value.trim();
       if (!text) return;
       await postComment({ anchor: el.dataset.anchor, snapshot: el.dataset.snapshot, text });
@@ -372,19 +709,29 @@ function wireBlockAffordances() {
       box.classList.remove('open');
       toast('Comment saved.');
       loadThreadsIntoDOM();
+    };
+    box.querySelector('.save-btn').addEventListener('click', save);
+    ta.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); save(); }
+      if (e.key === 'Escape') { box.classList.remove('open'); }
     });
   });
 
   const pageBox = document.getElementById('page-comment-box');
   if (pageBox) {
-    pageBox.querySelector('button').addEventListener('click', async () => {
-      const ta = pageBox.querySelector('textarea');
+    const ta = pageBox.querySelector('textarea');
+    wireMic(pageBox.querySelector('.mic-btn'), ta);
+    const save = async () => {
       const text = ta.value.trim();
       if (!text) return;
       await postComment({ anchor: null, snapshot: '(page-level)', text });
       ta.value = '';
       toast('Comment saved.');
       loadThreadsIntoDOM();
+    };
+    pageBox.querySelector('.save-btn').addEventListener('click', save);
+    ta.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); save(); }
     });
   }
 
@@ -394,7 +741,7 @@ function wireBlockAffordances() {
       sendBtn.disabled = true;
       sendBtn.textContent = 'Dispatching...';
       try {
-        const res = await fetch('/api/dispatch', {
+        const res = await fetch(`${API_BASE}/api/dispatch`, {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
           body: JSON.stringify({ page: ROUTE })
@@ -416,24 +763,38 @@ function wireBlockAffordances() {
 
 document.addEventListener('DOMContentLoaded', () => {
   wireBlockAffordances();
+  wireEditableBlocks();
+  wireEnterOpensComment();
   loadThreadsIntoDOM();
 });
 """
 
 
-def render_sidebar(current_route):
-    reports = discover_nightly_reports()
+def render_workspace_switcher(current_workspace):
+    workspaces = load_workspaces()
+    opts = []
+    for slug, cfg in workspaces.items():
+        prefix = workspace_url_prefix(slug)
+        cls = ' class="active"' if slug == current_workspace else ''
+        opts.append(f'<a href="{prefix}/page/{cfg["home"]}"{cls}>{_html.escape(cfg["label"])}</a>')
+    return f'<div class="workspace-switcher">{"".join(opts)}</div>'
+
+
+def render_sidebar(current_route, workspace=DEFAULT_WORKSPACE):
+    ws = get_workspace(workspace)
+    url_prefix = workspace_url_prefix(workspace)
+    reports = discover_nightly_reports(ws.get('nightly_filter')) if ws['nightly'] else {}
     items = []
-    items.append('<h2>Estate</h2>')
-    for label, route in NAV_ENTRIES:
+    items.append(f'<h2>{_html.escape(ws["label"])}</h2>')
+    for label, route in ws['nav']:
         cls = ' class="active"' if route == current_route else ''
-        items.append(f'<a href="/page/{route}"{cls}>{render_inline(label)}</a>')
+        items.append(f'<a href="{url_prefix}/page/{route}"{cls}>{render_inline(label)}</a>')
     if reports:
         items.append('<h2>Nightly Reports</h2>')
         for slug in sorted(reports):
             route = f'{NIGHTLY_PREFIX}/{slug}'
             cls = ' class="active"' if route == current_route else ''
-            items.append(f'<a href="/page/{route}"{cls}>{render_inline(slug)}</a>')
+            items.append(f'<a href="{url_prefix}/page/{route}"{cls}>{render_inline(slug)}</a>')
     return '\n'.join(items)
 
 
@@ -442,13 +803,24 @@ def render_block_html(block, route_path):
     anchor = block['anchor']
     snapshot = _html_attr_escape(block['snapshot'])
     inner = block['html']
-    # heading blocks: keep affordance but don't nest interactive stuff awkwardly
-    return f'''<div class="block-wrap" data-anchor="{anchor}" data-snapshot="{snapshot}">
-  <button class="comment-affordance" title="Comment on this block">+</button>
-  {inner}
+    # Raw markdown source, base64'd, so the client can swap rendered HTML for an
+    # editable <textarea> pre-filled with the exact source text (edit-as-comment,
+    # see v2/CLAUDE.md "CM6 vs contenteditable" note). Base64 sidesteps any HTML/JS
+    # string-escaping edge cases in doc text (backticks, quotes, newlines).
+    import base64 as _b64
+    source_b64 = _b64.b64encode(block['text'].encode('utf-8')).decode('ascii')
+    # code/table blocks are excluded from click-to-edit — their raw source has
+    # internal structure (fences, pipes) that's easy to corrupt via a flat textarea
+    # edit and low-value to inline-edit anyway; they still get the comment affordance.
+    editable = kind not in ('code', 'table')
+    edit_cls = ' edit-eligible' if editable else ''
+    return f'''<div class="block-wrap{edit_cls}" data-anchor="{anchor}" data-snapshot="{snapshot}" data-kind="{kind}" data-source="{source_b64}">
+  <button class="comment-affordance" title="Comment on this block (Enter)">+</button>
+  <div class="block-body"{' tabindex="0"' if editable else ''}>{inner}</div>
   <div class="comment-box">
-    <textarea placeholder="Comment on this block..."></textarea>
-    <button>Save comment</button>
+    <textarea placeholder="Comment on this block... (Enter to save, Shift+Enter for newline)"></textarea>
+    <button class="mic-btn" type="button" title="Dictate">&#127908;</button>
+    <button class="save-btn" type="button">Save comment</button>
   </div>
   <div class="comment-thread"></div>
 </div>'''
@@ -458,17 +830,21 @@ def _html_attr_escape(s):
     return (s.replace('&', '&amp;').replace('"', '&quot;').replace('<', '&lt;').replace('>', '&gt;'))
 
 
-def render_page(route_path):
-    fs_path = resolve_page(route_path)
+def render_page(route_path, workspace=DEFAULT_WORKSPACE):
+    ws = get_workspace(workspace)
+    url_prefix = workspace_url_prefix(workspace)
+    fs_path = resolve_page(route_path, workspace)
     with open(fs_path, 'r', encoding='utf-8') as f:
         src = f.read()
-    resolver = make_link_resolver(fs_path, route_path)
+    resolver = make_link_resolver(fs_path, route_path, workspace)
     title, blocks = parse_markdown(src, link_resolver=resolver)
     title = title or route_path
 
     blocks_html = '\n'.join(render_block_html(b, route_path) for b in blocks)
 
-    has_dispatch = route_path.startswith(('estate/', 'nightly/', 'soma/', 'business-ops/'))
+    # Every route in a workspace's own roots (or its nightly reports) is dispatchable.
+    root_prefixes = tuple(f'{p}/' for p, _ in ws['roots'])
+    has_dispatch = route_path.startswith(root_prefixes) or (ws['nightly'] and route_path.startswith(f'{NIGHTLY_PREFIX}/'))
 
     html_doc = f"""<!DOCTYPE html>
 <html>
@@ -480,8 +856,9 @@ def render_page(route_path):
 </head>
 <body>
 <nav class="sidebar">
-  <a href="/page/{HOME_PAGE}" style="font-weight:700;font-size:15px;color:#e6e6e6;">soma-review</a>
-  {render_sidebar(route_path)}
+  <a href="{url_prefix}/page/{ws['home']}" style="font-weight:700;font-size:15px;color:#e6e6e6;">soma-review</a>
+  {render_workspace_switcher(workspace)}
+  {render_sidebar(route_path, workspace)}
 </nav>
 <main class="main">
   <div class="top-actions">
@@ -493,32 +870,40 @@ def render_page(route_path):
     <div id="page-thread-list"></div>
     <div class="comment-box open" id="page-comment-box">
       <textarea placeholder="General comment about this page..."></textarea>
-      <button>Save comment</button>
+      <button class="mic-btn" type="button" title="Dictate">&#127908;</button>
+      <button class="save-btn" type="button">Save comment</button>
     </div>
   </div>
 </main>
 <div class="toast" id="toast"></div>
-<script>window.__ROUTE__ = {json.dumps(route_path)};</script>
+<script>window.__ROUTE__ = {json.dumps(route_path)}; window.__API_BASE__ = {json.dumps(url_prefix)};</script>
 <script>{PAGE_JS}</script>
 </body>
 </html>"""
     return html_doc
 
 
-def render_404(route_path):
+def render_404(route_path, workspace=DEFAULT_WORKSPACE):
+    try:
+        ws = get_workspace(workspace)
+    except NotFoundError:
+        workspace = DEFAULT_WORKSPACE
+        ws = get_workspace(workspace)
+    url_prefix = workspace_url_prefix(workspace)
     return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>Not found — soma-review</title>
 <style>{PAGE_CSS}</style></head>
 <body>
 <nav class="sidebar">
-  <a href="/page/{HOME_PAGE}" style="font-weight:700;font-size:15px;color:#e6e6e6;">soma-review</a>
-  {render_sidebar('')}
+  <a href="{url_prefix}/page/{ws['home']}" style="font-weight:700;font-size:15px;color:#e6e6e6;">soma-review</a>
+  {render_workspace_switcher(workspace)}
+  {render_sidebar('', workspace)}
 </nav>
 <main class="main">
   <div class="notfound">
     <h1>404</h1>
     <p>No such page: <code>{_html.escape(route_path)}</code></p>
-    <p><a href="/page/{HOME_PAGE}">&larr; Back to Morning Review</a></p>
+    <p><a href="{url_prefix}/page/{ws['home']}">&larr; Back home</a></p>
   </div>
 </main>
 </body></html>"""
@@ -533,22 +918,27 @@ def load_dispatch_template():
     return "Read the sidecar JSONL for page {page} and act on each comment."
 
 
-def run_dispatch(route_path):
-    fs_path = resolve_page(route_path)
-    sidecar = sidecar_path(route_path)
+def run_dispatch(route_path, workspace=DEFAULT_WORKSPACE):
+    ws = get_workspace(workspace)
+    fs_path = resolve_page(route_path, workspace)
+    sidecar = sidecar_path(route_path, workspace)
     slug = page_slug(route_path)
     # cc-dispatch appends its own .md to build the report filename; strip any
     # .md already in the slug so we don't end up with foo.md.md-shaped names.
     task_slug = re.sub(r'\.md$', '', slug)
-    task_name = f'review-comments-{task_slug}'[:80]
+    ws_infix = '' if workspace == DEFAULT_WORKSPACE else f'{workspace}-'
+    task_name = f'review-comments-{ws_infix}{task_slug}'[:80]
     template = load_dispatch_template()
+    # api_base includes the workspace URL prefix so the dispatched worker's
+    # POST {api_base}/api/comments/reply calls land in the right workspace's sidecar
+    # (the plain /api/... routes default to the estate workspace).
     prompt = template.format(
         page=route_path,
         page_fs_path=fs_path,
         sidecar_path=sidecar,
-        api_base='http://localhost:8090',
+        api_base=f'http://localhost:8090{workspace_url_prefix(workspace)}',
     )
-    prompt_file = os.path.join(FEEDBACK_DIR, f'.dispatch-prompt-{slug}.md')
+    prompt_file = os.path.join(ws['feedback_dir'], f'.dispatch-prompt-{slug}.md')
     with open(prompt_file, 'w', encoding='utf-8') as f:
         f.write(prompt)
 
@@ -610,28 +1000,77 @@ class Handler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             return {}
 
+    @staticmethod
+    def _split_workspace(path):
+        """'/w/<slug>/rest/of/path' -> ('<slug>', '/rest/of/path'). Bare paths
+        ('/page/...', '/api/...', etc, no /w/ prefix) -> (DEFAULT_WORKSPACE, path)
+        unchanged, so every existing bookmark/sidecar keeps working."""
+        if path.startswith('/w/'):
+            rest = path[len('/w/'):]
+            parts = rest.split('/', 1)
+            workspace = parts[0]
+            remainder = '/' + parts[1] if len(parts) > 1 else '/'
+            return workspace, remainder
+        return DEFAULT_WORKSPACE, path
+
     def do_GET(self):
         parsed = urlparse(self.path)
-        path = parsed.path
+        workspace, path = self._split_workspace(parsed.path)
         qs = parse_qs(parsed.query)
 
-        if path == '/' :
+        if path == '/':
+            try:
+                ws = get_workspace(workspace)
+            except NotFoundError:
+                self._send_html('<h1>404</h1><p>Unknown workspace.</p>', status=404)
+                return
             self.send_response(302)
-            self.send_header('Location', f'/page/{HOME_PAGE}')
+            self.send_header('Location', f'{workspace_url_prefix(workspace)}/page/{ws["home"]}')
             self.end_headers()
             return
 
         if path.startswith('/page/'):
             route_path = path[len('/page/'):]
             try:
-                self._send_html(render_page(route_path))
+                self._send_html(render_page(route_path, workspace))
             except NotFoundError:
-                self._send_html(render_404(route_path), status=404)
+                self._send_html(render_404(route_path, workspace), status=404)
+            return
+
+        if path.startswith('/raw/'):
+            route_path = path[len('/raw/'):]
+            try:
+                fs_path = resolve_raw(route_path, workspace)
+            except NotFoundError:
+                self._send_html('<h1>404</h1><p>Not found or outside whitelist.</p>', status=404)
+                return
+            ext = os.path.splitext(fs_path)[1].lower()
+            mime = _RAW_MIME.get(ext, 'application/octet-stream')
+            with open(fs_path, 'rb') as f:
+                body = f.read()
+            self.send_response(200)
+            self.send_header('Content-Type', mime)
+            self.send_header('Content-Length', str(len(body)))
+            self.send_header('Content-Disposition', f'inline; filename="{os.path.basename(fs_path)}"')
+            self.end_headers()
+            self.wfile.write(body)
             return
 
         if path == '/api/comments':
             page = qs.get('page', [''])[0]
-            self._send_json(read_comments(page))
+            try:
+                self._send_json(read_comments(page, workspace))
+            except NotFoundError:
+                self._send_json({'error': 'unknown workspace'}, status=404)
+            return
+
+        if path == '/api/workspaces':
+            workspaces = load_workspaces()
+            self._send_json({
+                slug: {'label': cfg['label'], 'home': cfg['home'],
+                       'url_prefix': workspace_url_prefix(slug)}
+                for slug, cfg in workspaces.items()
+            })
             return
 
         if path == '/healthz':
@@ -642,17 +1081,31 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urlparse(self.path)
-        path = parsed.path
+        workspace, path = self._split_workspace(parsed.path)
 
         if path == '/api/comments':
             data = self._read_json_body()
             page = data.get('page', '')
-            text = (data.get('text') or '').strip()
-            if not page or not text:
-                self._send_json({'error': 'page and text required'}, status=400)
+            ctype = data.get('type', 'comment')
+            if ctype not in ('comment', 'edit'):
+                self._send_json({'error': 'invalid type'}, status=400)
                 return
+            if ctype == 'edit':
+                # Edit-as-comment: {type: "edit", anchor, snapshot (before), proposed (after)}.
+                # `text` is auto-derived (short label) if not supplied so existing render
+                # paths that expect a `text` field still have something sane to show.
+                proposed = data.get('proposed')
+                if not page or proposed is None:
+                    self._send_json({'error': 'page and proposed required for edit'}, status=400)
+                    return
+                text = (data.get('text') or '').strip() or '(proposed edit)'
+            else:
+                text = (data.get('text') or '').strip()
+                if not page or not text:
+                    self._send_json({'error': 'page and text required'}, status=400)
+                    return
             try:
-                resolve_page(page)
+                resolve_page(page, workspace)
             except NotFoundError:
                 self._send_json({'error': 'unknown page'}, status=404)
                 return
@@ -661,6 +1114,7 @@ class Handler(BaseHTTPRequestHandler):
             comment = {
                 'id': comment_id,
                 'page': page,
+                'type': ctype,
                 'anchor': data.get('anchor'),
                 'snapshot': data.get('snapshot', ''),
                 'author': data.get('author', 'mike'),
@@ -668,8 +1122,11 @@ class Handler(BaseHTTPRequestHandler):
                 'timestamp': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
                 'status': 'queued',
                 'thread_id': thread_id,
+                'deleted': False,
             }
-            append_comment(page, comment)
+            if ctype == 'edit':
+                comment['proposed'] = data.get('proposed')
+            append_comment(page, comment, workspace)
             self._send_json(comment, status=201)
             return
 
@@ -681,7 +1138,58 @@ class Handler(BaseHTTPRequestHandler):
             if status not in ('queued', 'seen', 'in-progress', 'done'):
                 self._send_json({'error': 'invalid status'}, status=400)
                 return
-            ok = update_comment(page, comment_id, {'status': status})
+            ok = update_comment(page, comment_id, {'status': status}, workspace)
+            if not ok:
+                self._send_json({'error': 'comment not found'}, status=404)
+                return
+            self._send_json({'ok': True})
+            return
+
+        if path == '/api/comments/update':
+            data = self._read_json_body()
+            page = data.get('page', '')
+            comment_id = data.get('id', '')
+            text = (data.get('text') or '').strip()
+            if not (page and comment_id and text):
+                self._send_json({'error': 'page, id, text required'}, status=400)
+                return
+            existing = [c for c in read_comments(page, workspace) if c.get('id') == comment_id]
+            if not existing:
+                self._send_json({'error': 'comment not found'}, status=404)
+                return
+            if existing[0].get('author') != 'mike':
+                self._send_json({'error': 'only mike-authored comments are editable via this endpoint'}, status=403)
+                return
+            ok = update_comment(page, comment_id, {
+                'text': text,
+                'edited_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+            }, workspace)
+            if not ok:
+                self._send_json({'error': 'comment not found'}, status=404)
+                return
+            self._send_json({'ok': True})
+            return
+
+        if path == '/api/comments/delete':
+            data = self._read_json_body()
+            page = data.get('page', '')
+            comment_id = data.get('id', '')
+            if not (page and comment_id):
+                self._send_json({'error': 'page and id required'}, status=400)
+                return
+            existing = [c for c in read_comments(page, workspace) if c.get('id') == comment_id]
+            if not existing:
+                self._send_json({'error': 'comment not found'}, status=404)
+                return
+            if existing[0].get('author') != 'mike':
+                self._send_json({'error': 'only mike-authored comments are deletable via this endpoint'}, status=403)
+                return
+            # Soft-delete: keep the row (audit trail survives) but flag it and let the
+            # UI hide/gray it out. deleted_at recorded for the same reason.
+            ok = update_comment(page, comment_id, {
+                'deleted': True,
+                'deleted_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+            }, workspace)
             if not ok:
                 self._send_json({'error': 'comment not found'}, status=404)
                 return
@@ -698,18 +1206,19 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({'error': 'page, thread_id, text required'}, status=400)
                 return
             try:
-                resolve_page(page)
+                resolve_page(page, workspace)
             except NotFoundError:
                 self._send_json({'error': 'unknown page'}, status=404)
                 return
             reply_id = str(uuid.uuid4())
             # anchor/snapshot copied from the first comment in the thread, if found
-            existing = [c for c in read_comments(page) if c.get('thread_id') == thread_id]
+            existing = [c for c in read_comments(page, workspace) if c.get('thread_id') == thread_id]
             anchor = existing[0]['anchor'] if existing else None
             snapshot = existing[0]['snapshot'] if existing else ''
             comment = {
                 'id': reply_id,
                 'page': page,
+                'type': 'comment',
                 'anchor': anchor,
                 'snapshot': snapshot,
                 'author': author,
@@ -717,8 +1226,9 @@ class Handler(BaseHTTPRequestHandler):
                 'timestamp': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
                 'status': data.get('status', 'seen'),
                 'thread_id': thread_id,
+                'deleted': False,
             }
-            append_comment(page, comment)
+            append_comment(page, comment, workspace)
             self._send_json(comment, status=201)
             return
 
@@ -726,12 +1236,12 @@ class Handler(BaseHTTPRequestHandler):
             data = self._read_json_body()
             page = data.get('page', '')
             try:
-                resolve_page(page)
+                resolve_page(page, workspace)
             except NotFoundError:
                 self._send_json({'error': 'unknown page'}, status=404)
                 return
             try:
-                task_name, pid = run_dispatch(page)
+                task_name, pid = run_dispatch(page, workspace)
             except Exception as e:  # noqa: BLE001
                 self._send_json({'error': str(e)}, status=500)
                 return
@@ -744,7 +1254,8 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     port = int(os.environ.get('SOMA_REVIEW_PORT', '8090'))
     server = ThreadingHTTPServer(('127.0.0.1', port), Handler)
-    print(f'soma-review v2 listening on http://localhost:{port}/page/{HOME_PAGE}')
+    home = get_workspace(DEFAULT_WORKSPACE)['home']
+    print(f'soma-review v2 listening on http://localhost:{port}/page/{home}')
     server.serve_forever()
 
 

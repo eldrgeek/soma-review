@@ -357,6 +357,132 @@ curl -s http://localhost:8090/healthz
   UI state; there's no toast explaining why. Acceptable for a v1 of voice-in; revisit if it
   becomes a friction point.
 
+## Board + Portfolio (2026-07-03)
+
+**Generated, never hand-curated.** Two documents compose from live streams and
+overwrite themselves on every run — nobody edits `_estate/BOARD.md` or
+`_estate/PORTFOLIO.md` by hand; they're regenerated nightly and on-demand.
+
+**`v2/generate_board.py`** composes `_estate/BOARD.md` (now the `estate`
+workspace's home page — `workspaces.json::estate.home`, replacing the
+hardcoded morning-review default; Morning Review stays in the nav). Streams,
+each independently fault-tolerant (`safe()` wrapper — one broken source never
+kills the run):
+1. `ESTATE.md` changelog entries (`### 2026-...` headers) from the last 48h.
+2. New files in `SOMA/audits/` (mtime < 48h) — name + first `#` heading.
+3. Memory index diff: `~/.claude/projects/-Users-mikewolf-Projects/memory/MEMORY.md`
+   vs a cached copy in `_estate/board-state/MEMORY.md.cache` (added/changed
+   `- [...]` lines only; cache advances every run).
+4. Open review comments (`status` in `queued`/`seen`, not `deleted`) across
+   every workspace's `_estate/review-feedback/**/*.jsonl`.
+5. Status lines: `_estate/hygiene/LATEST-STATUS.txt` +
+   `second-brain/scripts/freshness_report.py --summary` (best-effort, skipped
+   on error/timeout — costs ~15s max, usually <1s).
+6. **Board inbox** (`SOMA/board/inbox/`, contract below) — new cards surface
+   once under "Shipped/changed" the run that processes them, then move to
+   `inbox/processed/`. A `needs-mike: true` card additionally re-surfaces in
+   "Needs Mike" on **every** regeneration for 48h post-processing (mtime-gated
+   scan of `processed/`, `recent_needs_mike_from_processed()`) — a needs-mike
+   item is real work-in-flight for Mike, and surfacing it exactly once was a
+   real gap (caught during this build: a genuine cross-surface card vanished
+   from the board on the very next regen before it was fixed).
+
+Sections rendered: **Needs Mike** (open comments + needs-mike inbox cards +
+changelog lines matching `Mike`/`decision`) → **Shipped/changed (48h)**
+(changelog bodies + memory-index diff + this-run inbox cards) →
+**Fleet status** (hygiene + freshness one-liners) → **Streams digest** (counts).
+
+**`v2/generate_portfolio.py`** composes `_estate/PORTFOLIO.md`, Mike's
+cancel/restart triage board. Sources:
+1. `PROJECT-REGISTRY.json` — every project, grouped by lifecycle tag into
+   **Active** (`active`/`active(live)`/`canonical`/`canonical(docs)`/`infra`/
+   `infra-stable` — no verdict needed), **Parked/incubating/dormant**
+   (`parked`/`incubating`/`archive-lean`/`archive-lean/incubating`/
+   `fork-dup`/`fork-worktree`/`unmapped` — verdict needed; anything not
+   explicitly classified defaults into this bucket rather than being
+   silently dropped), and a small already-`archive`/`vendor` footnote
+   (out of scope, no verdict UI). **No literal `dormant` tag exists in the
+   registry today** — `parked`/`incubating`/`archive-lean`-shaped tags are the
+   closest real signal (see the registry's own taxonomy, `PROJECT-REGISTRY.json`).
+   Recency is reported as `branch` + dirty/clean, not a commit date — the
+   registry has no "last commit" field and shelling `git log` per repo (~90
+   repos) would make this slow; revisit if real recency becomes load-bearing.
+2. `_estate/PRODUCTIVITY-OPPORTUNITIES-2026-07-02.md` — Tier 1 table rows +
+   Tier 2/Tier 3/Watch-items bullets (with wrapped-line joining, since several
+   bullets in that doc paragraph-wrap across lines) as ideas/open-item rows.
+3. `_estate/audit-2026-07/raw-fleet-output-2026-07-01.json` — the directive
+   that commissioned this build expected a `backlog.items` array here;
+   **verified it does not exist in the file as shipped** (top-level keys are
+   `summary`/`agentCount`/`logs`/`result`/`workflowProgress`/`totalTokens`/
+   `totalToolCalls`; `result` has `districts`/`links`/`coverage`/`salvage`, no
+   `backlog`). Parsed defensively (`parse_raw_fleet_backlog()` checks both
+   `backlog.items` and `result.backlog.items`) — contributes 0 rows today,
+   picks up automatically if a future regeneration of that file adds the
+   shape.
+4. `SOMA/SOMA-STATE.md` §5 ("What's broken or missing pieces" — `###` headings,
+   skipping ones whose heading itself says FIXED/DONE/RUNNING) and §6
+   ("What's designed but unbuilt" — a markdown table) — both best-effort.
+
+**Verdict UI** — no new storage. Each verdict-needed row's rightmost cell gets
+a `[[VERDICT:<row-id>]]` token; `mdblocks.py::_VERDICT_TOKEN_RE` +
+`verdict_sub()` render it as four buttons (Keep/Restart/Cancel/Later,
+`.verdict-btn` + `data-verdict`/`data-row-id`). `PAGE_JS::wireVerdictButtons()`
+posts `{type:"verdict", verdict, row_id}` to the existing `POST /api/comments`
+— `do_POST` accepts `verdict` as a third comment `type` alongside `comment`/
+`edit`, stores `verdict` + `row_id` fields on the row, same JSONL sidecar.
+Rendered distinctly in the comment thread (`renderCommentItem` → `is-verdict`
+class, `badge-verdict-<verdict>` badge) and pre-marked on page load
+(`loadThreadsIntoDOM()` finds the latest verdict comment per `row_id` and
+writes a `✓ <verdict>` into that row's `.verdict-status` span — survives
+reload without any extra endpoint). Verdict comments are excluded from the
+pencil/trash (edit/delete) affordance, same as `type: "edit"`.
+
+**"Regenerate board" button** — appears on both `estate/BOARD.md` and
+`estate/PORTFOLIO.md` pages (`is_board_or_portfolio` check in `render_page()`).
+`POST /api/board/regenerate` (`run_board_regenerate()`) shells both generator
+scripts synchronously (each runs in well under a second) via `sys.executable`,
+returns `{ok, board: {rc,stdout,stderr}, portfolio: {...}}`; the client
+toasts and reloads the page on success.
+
+**Nightly wiring** — `scripts/nightly-estate-hygiene.sh` step 5 runs both
+generators (pinned to `$PY` = the same explicit-homebrew-python3 the rest of
+the script uses — same launchd-PATH gotcha as everywhere else in this repo)
+and folds a nonzero exit into the existing `problems[]`/`LATEST-STATUS.txt`/
+overall-exit-code machinery, so a generator crash surfaces the same way a
+failing launchd job does.
+
+**Board inbox contract** (`SOMA/board/inbox/`, `processed/` subdir
+auto-created): any surface — CDC, CCw, mobile/web via the email-dispatch path,
+another CCc instance — can drop a `.md` or `.json` file there as a card. `.md`
+cards: optional YAML-ish frontmatter block (`---\nneeds-mike: true\n---`) or a
+bare `needs-mike: true` line anywhere in the first 20 lines; title = first `#`
+heading found, else the filename. `.json` cards: `{"title": "...",
+"needs-mike": true}` (or `needs_mike`, underscore accepted). Cards are
+one-shot-consumed into the board (moved to `processed/` the run that reads
+them) but a `needs-mike: true` card stays visible in "Needs Mike" for 48h
+post-processing via the `processed/` mtime scan — see the needs-mike-persistence
+note above. **Proven live during this build**: a parallel Dee/CDC session
+independently wired the email→board intake path
+(`claude@mike-wolf.com` → `claude-email-daemon` → files a card here) while
+this session was building the generator — two cards
+(`2026-07-03-e2e-intake-test-cross-surface-board-wiring.md`,
+`2026-07-03-greg-call-prep.md`) landed in the inbox mid-session from that
+independent path and were correctly picked up by `generate_board.py` on the
+next run, no coordination between the two sessions required. That's the
+intended cross-surface contract working as designed, not a test I staged.
+
+**Verified end-to-end** (this build, 2026-07-03): both generators run clean
+and idempotent (second run: 0 new memory-diff lines, 0 re-surfaced inbox
+cards); `:8090/page/estate/BOARD.md` and `/PORTFOLIO.md` both 200; root `/`
+redirects to `BOARD.md`; Playwright click on a Portfolio verdict button →
+`{type:"verdict", verdict:"cancel", row_id:"project-ai-embassadors"}` landed
+in `_estate/review-feedback/estate_PORTFOLIO.md.jsonl`, `✓ cancel` persisted
+across a fresh page reload, comment-count pill appeared on the containing
+table block; `POST /api/board/regenerate` returns `rc:0` for both scripts;
+`nightly-estate-hygiene.sh` dry-run completed with the new step folded in, no
+new failures. Test verdict comment soft-deleted after verification (not a
+real Mike decision).
+
 ## Authorship
 
 v2 built 2026-07-02 by Dee (Claude Sonnet 5, engineering-lead/COO role) per Mike's spec

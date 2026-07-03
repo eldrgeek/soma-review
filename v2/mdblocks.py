@@ -34,6 +34,14 @@ _ITALIC_RE = re.compile(r'(?<!\*)\*([^*]+)\*(?!\*)')
 # swallow a following '**', ')', or sentence punctuation.
 _BARE_URL_RE = re.compile(r'(https?://[^\s<>\[\]()]+?)(?=[.,;:!?]?(?:\*\*)?(?:\s|$))')
 
+# Portfolio verdict token: [[VERDICT:<row-id>]], emitted by v2/generate_portfolio.py
+# in the rightmost cell of any table row that needs a keep/restart/cancel/later
+# call. Rendered as four buttons wired by PAGE_JS's wireVerdictButtons() — each
+# POSTs a {type:"verdict", verdict:..., row_id:...} comment to the existing
+# comment API (no new storage). Matched before bold/italic so the brackets don't
+# get mistaken for anything else.
+_VERDICT_TOKEN_RE = re.compile(r'\[\[VERDICT:([a-zA-Z0-9_-]+)\]\]')
+
 
 def render_inline(text, link_resolver=None):
     """Render inline markdown (links, bold, italic, code) to HTML.
@@ -75,6 +83,19 @@ def render_inline(text, link_resolver=None):
         label_html = _esc(label)
         href_out, cls, extra = _resolve(href)
         return stash(f'<a href="{_esc(href_out)}" class="{cls}"{extra}>{label_html}</a>')
+
+    def verdict_sub(m):
+        row_id = _esc(m.group(1))
+        buttons = ''.join(
+            f'<button type="button" class="verdict-btn verdict-{v}" data-verdict="{v}" data-row-id="{row_id}">{label}</button>'
+            for v, label in (('keep', 'Keep'), ('restart', 'Restart'), ('cancel', 'Cancel'), ('later', 'Later'))
+        )
+        return stash(f'<span class="verdict-row" data-row-id="{row_id}">{buttons}<span class="verdict-status"></span></span>')
+
+    # Verdict tokens BEFORE markdown-link stashing (tokens never contain '[label](href)'
+    # syntax so order vs. links doesn't matter for correctness, but doing it first keeps
+    # the intent — "this is UI, not a link" — clearest).
+    text = _VERDICT_TOKEN_RE.sub(verdict_sub, text)
 
     # Stash markdown-form links [label](href) BEFORE bare-URL autolinking, so a URL
     # used as the href of a real markdown link is never double-linked.

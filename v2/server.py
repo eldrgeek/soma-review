@@ -417,6 +417,20 @@ hr { border: none; border-top: 1px solid #2b3140; margin: 24px 0; }
 .mic-btn:hover { background: #24314a; }
 .mic-btn.recording { background: #4a1f24; border-color: #f0a3ab; animation: pulse 1s infinite; }
 @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .5; } }
+.comment-item.is-verdict { border-left: 3px solid #e6c26a; }
+.verdict-row { display: inline-flex; gap: 4px; align-items: center; flex-wrap: wrap; }
+.verdict-btn { background: #1c2634; border: 1px solid #2b3140; border-radius: 6px; padding: 3px 9px;
+               font-size: 11px; cursor: pointer; color: #c7ccd6; }
+.verdict-btn:hover { background: #24314a; color: #e6e6e6; }
+.verdict-btn.verdict-keep:hover { border-color: #9cf0ac; color: #9cf0ac; }
+.verdict-btn.verdict-restart:hover { border-color: #7ec6f0; color: #7ec6f0; }
+.verdict-btn.verdict-cancel:hover { border-color: #f0a3ab; color: #f0a3ab; }
+.verdict-btn.verdict-later:hover { border-color: #e6c26a; color: #e6c26a; }
+.verdict-status { font-size: 11px; color: #8a93a3; margin-left: 4px; }
+.badge-verdict-keep { background: #1f4a2a; color: #9cf0ac; }
+.badge-verdict-restart { background: #1c3a4a; color: #7ec6f0; }
+.badge-verdict-cancel { background: #4a1f24; color: #f0a3ab; }
+.badge-verdict-later { background: #4a3f1f; color: #e6c26a; }
 """
 
 PAGE_JS = r"""
@@ -484,18 +498,23 @@ async function fetchComments() {
 
 function renderCommentItem(c) {
   const div = document.createElement('div');
-  div.className = 'comment-item' + (c.type === 'edit' ? ' is-edit' : '') + (c.deleted ? ' deleted' : '');
+  div.className = 'comment-item' + (c.type === 'edit' ? ' is-edit' : '')
+                   + (c.type === 'verdict' ? ' is-verdict' : '') + (c.deleted ? ' deleted' : '');
   div.dataset.id = c.id;
-  const badge = `<span class="${badgeClass(c.status)}">${c.status}</span>`;
+  const badge = c.type === 'verdict'
+    ? `<span class="badge badge-verdict-${c.verdict}">${c.verdict}</span>`
+    : `<span class="${badgeClass(c.status)}">${c.status}</span>`;
   const editedNote = c.edited_at ? ' <span style="color:#6a7280">(edited)</span>' : '';
   const deletedNote = c.deleted ? ' <span style="color:#6a7280">(deleted)</span>' : '';
   let bodyHtml;
   if (c.type === 'edit') {
     bodyHtml = `<div class="diff-view">${renderDiffHtml(c.snapshot || '', c.proposed || '')}</div>`;
+  } else if (c.type === 'verdict') {
+    bodyHtml = `<div class="comment-text">Verdict: <strong>${c.verdict}</strong>${c.text && c.text !== 'Verdict: ' + c.verdict ? ' — ' + escapeHtml(c.text) : ''}</div>`;
   } else {
     bodyHtml = `<div class="comment-text">${escapeHtml(c.text)}</div>`;
   }
-  const canEditDelete = c.author === 'mike' && !c.deleted && c.type !== 'edit';
+  const canEditDelete = c.author === 'mike' && !c.deleted && c.type !== 'edit' && c.type !== 'verdict';
   const actions = canEditDelete
     ? `<span class="comment-actions"><button class="edit-comment-btn" title="Edit">&#9998;</button><button class="delete-comment-btn" title="Delete">&#128465;</button></span>`
     : '';
@@ -552,6 +571,23 @@ async function loadThreadsIntoDOM() {
     if (!c.anchor) { pageLevel.push(c); continue; }
     (byAnchor[c.anchor] = byAnchor[c.anchor] || []).push(c);
   }
+
+  // Pre-mark verdict-row status from the most recent verdict comment for that
+  // row_id (survives page reload — the button state itself isn't persisted,
+  // only the comment is, so we reconstruct the "already voted" indicator here).
+  const latestVerdictByRow = {};
+  for (const c of comments) {
+    if (c.type === 'verdict' && c.row_id && !c.deleted) {
+      const prev = latestVerdictByRow[c.row_id];
+      if (!prev || c.timestamp > prev.timestamp) latestVerdictByRow[c.row_id] = c;
+    }
+  }
+  document.querySelectorAll('.verdict-row').forEach(rowEl => {
+    const rowId = rowEl.dataset.rowId;
+    const v = latestVerdictByRow[rowId];
+    const statusEl = rowEl.querySelector('.verdict-status');
+    if (v && statusEl) statusEl.textContent = `✓ ${v.verdict}`;
+  });
   document.querySelectorAll('.block-wrap').forEach(el => {
     const anchor = el.dataset.anchor;
     const list = (byAnchor[anchor] || []).filter(c => !c.deleted || c.author === 'mike');
@@ -580,12 +616,12 @@ async function loadThreadsIntoDOM() {
             .forEach(c => pageThread.appendChild(renderCommentItem(c)));
 }
 
-async function postComment({anchor, snapshot, text, threadId, type, proposed}) {
+async function postComment({anchor, snapshot, text, threadId, type, proposed, row_id, verdict}) {
   const res = await fetch(`${API_BASE}/api/comments`, {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({ page: ROUTE, anchor, snapshot, text, thread_id: threadId || null,
-                            type: type || 'comment', proposed })
+                            type: type || 'comment', proposed, row_id, verdict })
   });
   if (!res.ok) throw new Error('post failed: ' + res.status);
   return res.json();
@@ -759,12 +795,66 @@ function wireBlockAffordances() {
       sendBtn.textContent = 'Send to Dee';
     });
   }
+
+  const regenBtn = document.getElementById('regenerate-board');
+  if (regenBtn) {
+    regenBtn.addEventListener('click', async () => {
+      regenBtn.disabled = true;
+      regenBtn.textContent = 'Regenerating...';
+      try {
+        const res = await fetch(`${API_BASE}/api/board/regenerate`, { method: 'POST' });
+        const data = await res.json();
+        if (res.ok) {
+          toast('Board + Portfolio regenerated — reloading.');
+          setTimeout(() => location.reload(), 600);
+        } else {
+          toast('Regenerate failed: ' + (data.error || res.status));
+        }
+      } catch (e) {
+        toast('Regenerate error: ' + e.message);
+      }
+      regenBtn.disabled = false;
+      regenBtn.textContent = 'Regenerate board';
+    });
+  }
+}
+
+// --- Portfolio verdict buttons (keep/restart/cancel/later) -----------------
+// Buttons are rendered server-side inside a table cell by mdblocks.py's
+// _VERDICT_TOKEN_RE ([[VERDICT:<row-id>]] -> .verdict-row span with 4
+// .verdict-btn children), emitted by v2/generate_portfolio.py. Clicking posts
+// a {type:"verdict", verdict, row_id} comment anchored to the containing
+// block (so it shows up in that block's comment thread like anything else).
+function wireVerdictButtons() {
+  document.querySelectorAll('.verdict-btn').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const rowId = btn.dataset.rowId;
+      const verdict = btn.dataset.verdict;
+      const wrap = btn.closest('.block-wrap');
+      const anchor = wrap ? wrap.dataset.anchor : null;
+      const snapshot = wrap ? wrap.dataset.snapshot : rowId;
+      const statusEl = btn.closest('.verdict-row').querySelector('.verdict-status');
+      btn.disabled = true;
+      try {
+        await postComment({ anchor, snapshot, text: `Verdict: ${verdict}`, type: 'verdict', row_id: rowId, verdict });
+      } catch (e) {
+        toast('Verdict post failed: ' + e.message);
+        btn.disabled = false;
+        return;
+      }
+      if (statusEl) statusEl.textContent = `✓ ${verdict}`;
+      toast(`Verdict recorded: ${verdict} (${rowId})`);
+      loadThreadsIntoDOM();
+      btn.disabled = false;
+    });
+  });
 }
 
 document.addEventListener('DOMContentLoaded', () => {
   wireBlockAffordances();
   wireEditableBlocks();
   wireEnterOpensComment();
+  wireVerdictButtons();
   loadThreadsIntoDOM();
 });
 """
@@ -845,6 +935,9 @@ def render_page(route_path, workspace=DEFAULT_WORKSPACE):
     # Every route in a workspace's own roots (or its nightly reports) is dispatchable.
     root_prefixes = tuple(f'{p}/' for p, _ in ws['roots'])
     has_dispatch = route_path.startswith(root_prefixes) or (ws['nightly'] and route_path.startswith(f'{NIGHTLY_PREFIX}/'))
+    # "Regenerate board" appears on the Board and Portfolio pages themselves
+    # (both are generated by the same nightly job, so one button covers both).
+    is_board_or_portfolio = route_path in ('estate/BOARD.md', 'estate/PORTFOLIO.md')
 
     html_doc = f"""<!DOCTYPE html>
 <html>
@@ -863,6 +956,7 @@ def render_page(route_path, workspace=DEFAULT_WORKSPACE):
 <main class="main">
   <div class="top-actions">
     {'<button id="send-to-dee">Send to Dee</button>' if has_dispatch else ''}
+    {'<button id="regenerate-board">Regenerate board</button>' if is_board_or_portfolio else ''}
   </div>
   {blocks_html}
   <div class="page-discussion">
@@ -966,6 +1060,35 @@ def run_dispatch(route_path, workspace=DEFAULT_WORKSPACE):
         env=env,
     )
     return task_name, proc.pid
+
+
+# --- Board / Portfolio regeneration -----------------------------------------
+
+GENERATE_BOARD_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'generate_board.py')
+GENERATE_PORTFOLIO_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'generate_portfolio.py')
+
+
+def run_board_regenerate():
+    """Blocking (both generators run in well under a second — see their own
+    module docstrings for the stream list). Runs board then portfolio; returns
+    {ok, board_stdout, portfolio_stdout} or raises on a hard failure (a script
+    crashing entirely, not an individual source being unavailable — the
+    generators already degrade gracefully per-source)."""
+    py = sys.executable or '/opt/homebrew/bin/python3'
+    results = {}
+    for key, script in (('board', GENERATE_BOARD_SCRIPT), ('portfolio', GENERATE_PORTFOLIO_SCRIPT)):
+        proc = subprocess.run(
+            [py, script],
+            capture_output=True, text=True, timeout=60, cwd=PROJECTS_ROOT,
+        )
+        results[key] = {
+            'rc': proc.returncode,
+            'stdout': proc.stdout,
+            'stderr': proc.stderr,
+        }
+        if proc.returncode != 0:
+            raise RuntimeError(f'{key} generator exited {proc.returncode}: {proc.stderr[-2000:]}')
+    return results
 
 
 # --- HTTP handler ------------------------------------------------------
@@ -1087,7 +1210,7 @@ class Handler(BaseHTTPRequestHandler):
             data = self._read_json_body()
             page = data.get('page', '')
             ctype = data.get('type', 'comment')
-            if ctype not in ('comment', 'edit'):
+            if ctype not in ('comment', 'edit', 'verdict'):
                 self._send_json({'error': 'invalid type'}, status=400)
                 return
             if ctype == 'edit':
@@ -1099,6 +1222,16 @@ class Handler(BaseHTTPRequestHandler):
                     self._send_json({'error': 'page and proposed required for edit'}, status=400)
                     return
                 text = (data.get('text') or '').strip() or '(proposed edit)'
+            elif ctype == 'verdict':
+                # Portfolio triage: {type: "verdict", verdict: keep|restart|cancel|later,
+                # row_id, anchor?, snapshot?}. No new storage — same JSONL sidecar, just
+                # a comment carrying a `verdict` field; the client badges it distinctly.
+                verdict = data.get('verdict')
+                if not page or verdict not in ('keep', 'restart', 'cancel', 'later'):
+                    self._send_json({'error': 'page and a valid verdict required'}, status=400)
+                    return
+                row_id = (data.get('row_id') or '').strip()
+                text = (data.get('text') or '').strip() or f'Verdict: {verdict}'
             else:
                 text = (data.get('text') or '').strip()
                 if not page or not text:
@@ -1126,6 +1259,9 @@ class Handler(BaseHTTPRequestHandler):
             }
             if ctype == 'edit':
                 comment['proposed'] = data.get('proposed')
+            if ctype == 'verdict':
+                comment['verdict'] = data.get('verdict')
+                comment['row_id'] = row_id
             append_comment(page, comment, workspace)
             self._send_json(comment, status=201)
             return
@@ -1246,6 +1382,15 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({'error': str(e)}, status=500)
                 return
             self._send_json({'ok': True, 'task_name': task_name, 'pid': pid})
+            return
+
+        if path == '/api/board/regenerate':
+            try:
+                results = run_board_regenerate()
+            except Exception as e:  # noqa: BLE001
+                self._send_json({'error': str(e)}, status=500)
+                return
+            self._send_json({'ok': True, **results})
             return
 
         self._send_json({'error': 'not found'}, status=404)

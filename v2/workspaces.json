@@ -8,6 +8,8 @@
     ],
     "nightly": true,
     "nav": [
+      ["Board", "estate/BOARD.md"],
+      ["Portfolio", "estate/PORTFOLIO.md"],
       ["Morning Review", "estate/MORNING-REVIEW-2026-07-02.md"],
       ["Productivity Opportunities", "estate/PRODUCTIVITY-OPPORTUNITIES-2026-07-02.md"],
       ["Business Plan", "business-ops/BUSINESS-PLAN-2026-07.md"],
@@ -16,7 +18,7 @@
       ["SOMA App Standard", "soma/SOMA-APP-STANDARD.md"],
       ["Vision Interview", "estate/audit-2026-07/VISION-INTERVIEW-2026-07-01.md"]
     ],
-    "home": "estate/MORNING-REVIEW-2026-07-02.md",
+    "home": "estate/BOARD.md",
     "feedback_dir": "_estate/review-feedback"
   },
   "playmaker": {

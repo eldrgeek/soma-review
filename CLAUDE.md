@@ -546,6 +546,75 @@ tour start, all 3 steps with correct highlights, live-link `target=_blank`,
 deep-link start, commenting intact on tour pages, zero page errors. Evidence:
 `_estate/evidence/quinn-tours/*.png`.
 
+## Tour v2: live demo + verdict capture + review inbox (2026-07-03 evening, WQ-70)
+
+Same-day v2 per Mike's directive ("continuous smooth flow… demo… approve or
+recommend changes right there"). All in `v2/tours.py` + small `server.py` /
+`generate_board.py` hooks, soma-review `79ad7ab`:
+
+- **Live-demo step.** A completion page may carry a `## Demo` section with a
+  machine-parsed `**Demo:** <product-url>?sg_tour=<walkthrough-id>` line
+  (convention: `_estate/completions/README.md`). It becomes step 3 ("Live
+  demo") in place of the plain See-it-live step: the highlighted block's
+  autolink opens the REAL product page in a new tab and the product site's
+  own guide starts the named walkthrough from the `sg_tour` param. The
+  engine reads no URL params — each product site needs a small handler in
+  its guide config (reference implementation:
+  `legends-membership-site/js/legends-guide-config.js`, walkthrough
+  `demo-scholarships-round2`, live). Playmaker does NOT embed soma-guide
+  (V'Eric is homegrown), so Legends is the pilot surface.
+- **Verdict capture.** Every completion tour ends on an `s9-verdict` step;
+  HELPER_JS wraps the engine's `_renderWtStep` to mount ✅ Approve /
+  ✏️ Recommend-changes buttons into `.sg-wt-ui` (auto-play is parked there —
+  the tour can't auto-finish out from under the buttons; Mike ends with
+  Finish). Approve POSTs a `type:"verdict", verdict:"approve"` row
+  (`row_id: completion:<route>`) to the existing comments API. Recommend
+  focuses the page-discussion box; on the next comment save (PAGE_JS's
+  `postComment` now fires a `soma-comment-saved` CustomEvent) the comment
+  text becomes BOTH a `recommend-changes` verdict row AND an RSI Development
+  Request — `server.py::file_development_request()` writes
+  `SOMA/rsi/requests/incoming/verdict-*.json` (app parsed from the page's
+  `**Project:**` meta, reporter.role=admin, intent=idea) and runs
+  `route_requests.py route` synchronously; the resulting board-card name is
+  returned in the response (`_dr`) and confirmed in Quinn's panel. Verdict
+  vocabulary in `do_POST` extended with `approve|recommend-changes`.
+- **Review inbox.** COMPLETED.md's main list = UNREVIEWED completions only.
+  `tours.py::review_state()` derives {route: verdict} from the latest
+  non-deleted verdict row per sidecar JSONL at render time (never the .md as
+  state); injected as `__SOMA_REVIEW_STATE__`; HELPER_JS moves reviewed
+  `li`s into a collapsed `details.sg-reviewed` section (badge ✅/✏️ + the
+  Tour pill travel with the item — reviewed stays tourable). Soft-deleting
+  the verdict row returns the item to the inbox (verified). The Board's
+  Done-today strip uses the same source (`generate_board.py::
+  _reviewed_completion_names()` imports tours) → "N to review · M reviewed".
+
+**Gotchas (v2):**
+- `?tour=` deep links pre-consume the engine's introduce-once localStorage
+  key (`soma-guide:soma-review-quinn:introduced`) — without it the 500ms
+  first-visit auto-offer (`_openIdle`) stomps the deep-linked tour. The same
+  race existed on Legends via its auto-greet: the `sg_tour` param does NOT
+  survive the engine's own cross-page hops, so the greet fired on page 2 of
+  the tour and killed it — guarded in the Legends config by checking the
+  engine's `soma-guide-xp:legends-bill:wt-id`/`resume-id` sessionStorage keys
+  (legends `b96574c7`).
+- The wt panel container is `.sg-wt-ui` (there is no `.sg-wt`).
+- Engine ready-gate = 2.5s poll then PROCEEDS (`READY_GATE_MS`) — a
+  login-gated demo page cannot make the tour wait for auth; the convention
+  is an instruction step ("sign in, then press Next"), documented in
+  `_estate/completions/README.md`.
+- The DR relay is best-effort by construction: routing failure lands in the
+  verdict response's `_dr.error` and Quinn says so; the verdict row itself
+  always persists. Router hardening that shipped with this: app strings
+  like `SOMA (tools/monitoring)` are slugified in card FILENAMES
+  (SOMA `9422b1a`) — a `/` in the app used to crash `write_card`.
+
+Verified 2026-07-03 evening, 21/21 headless e2e (approve → sidecar → inbox
+partition → soft-delete undo; recommend → comment → DR → board card →
+panel confirmation) plus the live continuous flow: review-surface demo step →
+new tab on legends-membership.netlify.app → 3-step cross-page product tour,
+zero page errors. Evidence: `_estate/evidence/quinn-tours/DEMO-*.png`;
+receipts: `_estate/completions/2026-07-03-demo-tour-verdict-flow.md`.
+
 ## Authorship
 
 v2 built 2026-07-02 by Dee (Claude Sonnet 5, engineering-lead/COO role) per Mike's spec

@@ -18,9 +18,13 @@ never a crash):
      summary (best-effort, skipped if the script errors or is slow).
   6. Board inbox: ~/Projects/SOMA/board/inbox/*.{md,json} — cards from other
      surfaces/conversations. Processed cards move to inbox/processed/.
+  7. Today's completions: _estate/completions/YYYY-MM-DD-*.md pages dated
+     today — rendered as the "Done today" strip at the top of the board so
+     completion state is visible at the front door (Mike missed COMPLETED.md
+     entirely before this existed).
 
-Sections rendered, in order: Needs Mike, Shipped/changed (48h), Fleet status,
-Streams digest.
+Sections rendered, in order: Done-today strip, Needs Mike, Shipped/changed
+(48h), Fleet status, Streams digest.
 
 Idempotent: re-running regenerates BOARD.md from scratch each time (except the
 board-state cache, which advances forward, and inbox cards, which move to
@@ -48,6 +52,7 @@ HYGIENE_STATUS = os.path.join(PROJECTS_ROOT, '_estate', 'hygiene', 'LATEST-STATU
 FRESHNESS_SCRIPT = os.path.join(PROJECTS_ROOT, 'second-brain', 'scripts', 'freshness_report.py')
 BOARD_INBOX = os.path.join(PROJECTS_ROOT, 'SOMA', 'board', 'inbox')
 BOARD_INBOX_PROCESSED = os.path.join(BOARD_INBOX, 'processed')
+COMPLETIONS_DIR = os.path.join(PROJECTS_ROOT, '_estate', 'completions')
 OUT_PATH = os.path.join(PROJECTS_ROOT, '_estate', 'BOARD.md')
 
 WINDOW_HOURS = 48
@@ -346,17 +351,85 @@ def recent_needs_mike_from_processed():
     return out
 
 
+# --- Stream 7: today's completions ---------------------------------------------
+
+def scan_todays_completions():
+    """Completion pages in _estate/completions/ whose filename is dated today
+    (local time — completion pages are written same-day by convention).
+    Returns list of (filename, title, mtime), newest-touched first. Title is
+    the page's first '#' heading, falling back to the filename."""
+    if not os.path.isdir(COMPLETIONS_DIR):
+        return []
+    today = datetime.now().strftime('%Y-%m-%d')
+    out = []
+    for name in sorted(os.listdir(COMPLETIONS_DIR)):
+        if not name.endswith('.md') or not name.startswith(today + '-'):
+            continue
+        path = os.path.join(COMPLETIONS_DIR, name)
+        if not os.path.isfile(path):
+            continue
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            continue
+        title = name
+        try:
+            with open(path, 'r', encoding='utf-8', errors='replace') as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith('#'):
+                        title = line.lstrip('#').strip()
+                        break
+        except OSError:
+            pass
+        out.append((name, title, mtime))
+    out.sort(key=lambda t: t[2], reverse=True)
+    return out
+
+
 # --- Compose ------------------------------------------------------------------
+
+def _completion_link_label(title, max_len=70):
+    """Shorten a completion-page title for the inline strip: prefer the part
+    before ' — ' when the full title is long, then hard-cap at max_len.
+    Square brackets are stripped so the label can't break the markdown link."""
+    label = title.replace('[', '(').replace(']', ')')
+    if len(label) > max_len and ' — ' in label:
+        label = label.split(' — ', 1)[0]
+    if len(label) > max_len:
+        label = label[:max_len - 1].rstrip() + '…'
+    return label
+
+
+def render_done_today_strip(todays_completions):
+    """One-line strip: count of completion pages dated today, the 3 most
+    recent titles as in-app links, and a link to the full COMPLETED.md index."""
+    n = len(todays_completions)
+    if n == 0:
+        return ('**✓ Done today: 0** — nothing finished yet today · '
+                '[full index →](COMPLETED.md)')
+    parts = []
+    for name, title, _mtime in todays_completions[:3]:
+        parts.append(f'[{_completion_link_label(title)}](completions/{name})')
+    strip = f"**✓ Done today: {n}** — " + ' · '.join(parts)
+    strip += f' · […all {n} →](COMPLETED.md)'
+    return strip
+
 
 def render_board(changelog_entries, audit_files, memory_changes,
                   open_comments, open_comments_total, hygiene_status,
-                  freshness_summary, inbox_cards, recent_needs_mike_cards):
+                  freshness_summary, inbox_cards, recent_needs_mike_cards,
+                  todays_completions):
     lines = []
     ts = now_utc().strftime('%Y-%m-%d %H:%M UTC')
     lines.append('# Board')
     lines.append('')
     lines.append(f'_Generated {ts} by `v2/generate_board.py` — never hand-curated, '
                   f'always regenerate (nightly + on-demand via the Regenerate button)._')
+    lines.append('')
+    # Done-today strip — completion state at the front door, derived from
+    # _estate/completions/ at generation time (self-maintaining).
+    lines.append(render_done_today_strip(todays_completions))
     lines.append('')
     # Standing links (not stream-derived — always present on the board).
     lines.append('**Work queue:** [WORKQUEUE.md](WORKQUEUE.md) — calibration review open: '
@@ -479,11 +552,13 @@ def main():
     recent_needs_mike_cards = safe(
         recent_needs_mike_from_processed, [], 'recent needs-mike processed-card scan'
     )
+    todays_completions = safe(scan_todays_completions, [], "today's completions scan")
 
     board_md = render_board(
         changelog_entries, audit_files, memory_changes,
         open_comments, open_comments_total, hygiene_status,
         freshness_summary, inbox_cards, recent_needs_mike_cards,
+        todays_completions,
     )
 
     os.makedirs(os.path.dirname(OUT_PATH), exist_ok=True)
@@ -497,6 +572,7 @@ def main():
     print(f'  open comments: {open_comments_total} across {len(open_comments)} page(s)')
     print(f'  inbox cards processed: {len(inbox_cards)}')
     print(f'  needs-mike cards still in 48h window: {len(recent_needs_mike_cards)}')
+    print(f"  completions dated today: {len(todays_completions)}")
     return 0
 
 

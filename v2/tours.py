@@ -33,6 +33,8 @@ import re
 from mdblocks import parse_markdown
 
 COMPLETIONS_DIR = os.path.expanduser('~/Projects/_estate/completions')
+# Estate workspace sidecars (tours are estate-only; see tour_page_assets guard).
+FEEDBACK_DIR = os.path.expanduser('~/Projects/_estate/review-feedback')
 # Route prefix (estate workspace) for completion pages.
 COMPLETIONS_ROUTE_PREFIX = 'estate/completions/'
 # Routes that get the index treatment (auto-offer + per-item Tour affordances).
@@ -47,6 +49,7 @@ GUIDE_CSS_URL = 'https://soma-guide.netlify.app/soma-guide.css'
 GUIDE_JS_URL = 'https://soma-guide.netlify.app/soma-guide.js'
 
 _LIVE_RE = re.compile(r'\*\*Live:?\*\*:?\s*<?(https?://\S+?)>?(?:\s|$)', re.IGNORECASE)
+_DEMO_RE = re.compile(r'\*\*Demo:?\*\*:?\s*<?(https?://\S+?)>?(?:\s|$)', re.IGNORECASE)
 _RECEIPTS_HEADING_RE = re.compile(r'receipt|evidence|commit|verif|proof', re.IGNORECASE)
 
 
@@ -151,6 +154,20 @@ def build_tour_for_file(name):
             live_url = m.group(1).rstrip('.,)')
             break
 
+    # Demo link (optional `## Demo` convention, completions/README.md): a
+    # `**Demo:** <product-url>?sg_tour=<id>` line. The URL deep-links the REAL
+    # product page; the product site's guide config starts that walkthrough
+    # from the sg_tour param. The block itself carries the autolinked URL, so
+    # highlighting it gives Mike a real click target (new tab).
+    demo_anchor = None
+    demo_url = None
+    for b in blocks:
+        m = _DEMO_RE.search(b['text'])
+        if m:
+            demo_anchor = b['anchor']
+            demo_url = m.group(1).rstrip('.,)')
+            break
+
     # -- assemble steps --------------------------------------------------------
     steps = [{
         'id': 's1-what',
@@ -176,7 +193,21 @@ def build_tour_for_file(name):
             'narration': rec_narration,
             'instruction': 'Skim the highlighted block. Comment on anything that doesn’t hold up.',
         })
-    if live_anchor and live_url:
+    if demo_anchor and demo_url:
+        # Live-demo step: the completion declared a demo — deep-link the real
+        # product page with the sg_tour param and the walkthrough continues
+        # THERE (registered in that site's guide config).
+        steps.append({
+            'id': 's3-demo',
+            'target': '[data-anchor="%s"]' % demo_anchor,
+            'page': page,
+            'label': 'Live demo',
+            'narration': 'Now the demo — the highlighted link opens the actual product page '
+                         'in a new tab, and the walkthrough picks up right there on the real thing.',
+            'instruction': 'Click the Demo link (opens in a new tab; the tour starts there '
+                           'automatically): %s' % demo_url,
+        })
+    elif live_anchor and live_url:
         steps.append({
             'id': 's3-live',
             'target': '[data-anchor="%s"]' % live_anchor,
@@ -197,6 +228,19 @@ def build_tour_for_file(name):
             'instruction': 'Use the + affordance on any block to leave a comment.',
         })
 
+    # Verdict step — every completion tour ends here. HELPER_JS renders the
+    # ✅ Approve / ✏️ Recommend-changes buttons into the walkthrough panel when
+    # the tour is on a step whose id is 's9-verdict' (see sg-verdict-bar).
+    steps.append({
+        'id': 's9-verdict',
+        'target': '[data-anchor="%s"]' % blocks[-1]['anchor'],
+        'page': page,
+        'label': 'Your verdict',
+        'narration': 'Your call. Approve it and it comes off the review list, or recommend '
+                     'changes and I’ll file it straight into the development loop.',
+        'instruction': 'Pick one below: ✅ Approve, or ✏️ Recommend changes.',
+    })
+
     return {
         'id': 'tour-' + _slug(re.sub(r'\.md$', '', name)),
         'label': title,
@@ -204,6 +248,48 @@ def build_tour_for_file(name):
         'steps': steps,
         '_route': route,  # stripped before serialization; used for the index map
     }
+
+
+def _sidecar_path(route):
+    """Estate-workspace sidecar for a route (matches server.py sidecar_path
+    for the estate workspace: route with '/' -> '_', + '.jsonl')."""
+    return os.path.join(FEEDBACK_DIR, route.replace('/', '_') + '.jsonl')
+
+
+def review_state():
+    """{route: {'verdict': 'approve'|'recommend-changes', 'timestamp': ts}}
+    for every completion page that has received a verdict. Derived per request
+    from the sidecar JSONL — the .md files are never the state store. The
+    LATEST non-deleted verdict row wins; soft-deleting a verdict row puts the
+    item back in the unreviewed inbox (verified behavior, relied on by
+    COMPLETED.md's Reviewed section)."""
+    state = {}
+    for name in list_completion_files():
+        route = COMPLETIONS_ROUTE_PREFIX + name
+        path = _sidecar_path(route)
+        if not os.path.isfile(path):
+            continue
+        latest = None
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except ValueError:
+                        continue
+                    if (row.get('type') == 'verdict' and not row.get('deleted')
+                            and row.get('verdict') in ('approve', 'recommend-changes')):
+                        if latest is None or row.get('timestamp', '') >= latest.get('timestamp', ''):
+                            latest = row
+        except OSError:
+            continue
+        if latest:
+            state[route] = {'verdict': latest['verdict'],
+                            'timestamp': latest.get('timestamp', '')}
+    return state
 
 
 def build_walkthroughs():
@@ -224,6 +310,127 @@ HELPER_JS = r"""
 (function () {
   'use strict';
   var IDX = window.__SOMA_TOUR_INDEX__ || {};
+  var REVIEWED = window.__SOMA_REVIEW_STATE__ || {};
+  // Reverse map: tour-id -> '/page/estate/completions/...' page path.
+  var REV = {};
+  Object.keys(IDX).forEach(function (k) { REV[IDX[k]] = k; });
+
+  function apiRoute(pagePath) {  // '/page/estate/...' -> 'estate/...'
+    return pagePath.replace(/^\/page\//, '');
+  }
+
+  /* ── Verdict capture: ✅ Approve / ✏️ Recommend changes on the tour's final
+     step. The engine has no custom-button step API, so we watch the wt panel:
+     after every engine render, if the current step is s9-verdict, mount the
+     bar into the walkthrough panel. Reuses the existing /api/comments verdict
+     machinery (type:"verdict") — no new storage. ── */
+  var pendingRecommend = null;
+
+  function currentTour(g) { return g && g.wt ? g.wt.id : null; }
+
+  function postVerdict(route, tourLabel, verdict, text) {
+    return fetch('/api/comments', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        page: route, anchor: null, snapshot: tourLabel,
+        type: 'verdict', verdict: verdict,
+        row_id: 'completion:' + route,
+        text: text || ('Verdict: ' + verdict)
+      })
+    }).then(function (r) {
+      if (!r.ok) throw new Error('verdict post failed: ' + r.status);
+      return r.json();
+    });
+  }
+
+  function mountVerdictBar(g) {
+    var panel = document.querySelector('#soma-guide .sg-wt-ui');
+    if (!panel || panel.querySelector('.sg-verdict-bar')) return;
+    var tourId = currentTour(g);
+    var pagePath = REV[tourId];
+    if (!pagePath) return;
+    var route = apiRoute(pagePath);
+    var label = '';
+    try { label = (g.cfg.walkthroughs.filter(function (w) { return w.id === tourId; })[0] || {}).label || ''; } catch (e) {}
+
+    var bar = document.createElement('div');
+    bar.className = 'sg-verdict-bar';
+    var ok = document.createElement('button');
+    ok.className = 'sg-verdict-approve';
+    ok.textContent = '✅ Approve';
+    var rec = document.createElement('button');
+    rec.className = 'sg-verdict-recommend';
+    rec.textContent = '✏️ Recommend changes';
+    var note = document.createElement('div');
+    note.className = 'sg-verdict-note';
+    bar.appendChild(ok); bar.appendChild(rec); bar.appendChild(note);
+
+    ok.addEventListener('click', function () {
+      ok.disabled = true; rec.disabled = true;
+      postVerdict(route, label, 'approve', 'Approved via Quinn tour').then(function () {
+        note.textContent = '✅ Approved — off the review list.';
+      }).catch(function (e) {
+        ok.disabled = false; rec.disabled = false;
+        note.textContent = 'Could not record the verdict (' + e.message + ') — try again.';
+      });
+    });
+
+    rec.addEventListener('click', function () {
+      pendingRecommend = { route: route, label: label };
+      note.textContent = 'Type what needs to change in the Page-discussion box below, ' +
+                         'then Save — I’ll file it as a Development Request.';
+      var box = document.querySelector('#page-comment-box textarea');
+      if (box) { box.scrollIntoView({ behavior: 'smooth', block: 'center' }); box.focus(); }
+    });
+
+    var instr = panel.querySelector('.sg-wt-instruction');
+    if (instr && instr.parentNode) instr.parentNode.insertBefore(bar, instr.nextSibling);
+    else panel.appendChild(bar);
+  }
+
+  function unmountVerdictBar() {
+    var bar = document.querySelector('#soma-guide .sg-verdict-bar');
+    if (bar) bar.remove();
+  }
+
+  function patchEngine(g) {
+    if (g.__sgVerdictPatched) return;
+    g.__sgVerdictPatched = true;
+    var origRender = g._renderWtStep.bind(g);
+    g._renderWtStep = function () {
+      origRender();
+      var step = null;
+      try { step = this._wtCurrentStep(); } catch (e) {}
+      if (step && step.id === 's9-verdict') {
+        // Park auto-play on the verdict step: the tour must not auto-finish
+        // out from under the buttons. Mike ends it with "Finish ✓".
+        this._autoStopped = true;
+        mountVerdictBar(this);
+      } else {
+        unmountVerdictBar();
+      }
+    };
+  }
+
+  // Comment machinery hook: PAGE_JS dispatches 'soma-comment-saved' after any
+  // successful comment POST. If a recommend-changes flow is pending, that
+  // comment's text becomes the Development Request narrative.
+  document.addEventListener('soma-comment-saved', function (ev) {
+    if (!pendingRecommend) return;
+    var c = ev.detail || {};
+    if (c.type !== 'comment' || !c.text) return;
+    var p = pendingRecommend; pendingRecommend = null;
+    postVerdict(p.route, p.label, 'recommend-changes', c.text).then(function (row) {
+      var note = document.querySelector('#soma-guide .sg-verdict-note');
+      var dr = row && row._dr;
+      if (note) {
+        note.textContent = dr && dr.card
+          ? '✏️ Filed — Development Request routed to a board card (' + dr.card + ').'
+          : '✏️ Changes requested — recorded' + (dr && dr.error ? ' (DR routing hit a snag: ' + dr.error + ')' : '') + '.';
+      }
+    }).catch(function () { pendingRecommend = p; /* let Mike retry by saving again */ });
+  });
 
   function whenGuideReady(cb, tries) {
     tries = tries || 0;
@@ -231,10 +438,22 @@ HELPER_JS = r"""
     if (tries < 80) setTimeout(function () { whenGuideReady(cb, tries + 1); }, 250);
   }
 
+  // Verdict-bar engine patch: as soon as the engine exists, wrap its step
+  // renderer so the final tour step mounts the Approve/Recommend buttons.
+  whenGuideReady(function () { patchEngine(window.somaGuide); });
+
   // Deep link: ?tour=<id> starts that tour once the engine is up.
   var tourParam = null;
   try { tourParam = new URLSearchParams(location.search).get('tour'); } catch (e) {}
-  if (tourParam) whenGuideReady(function () { window.somaGuide.startWalkthrough(tourParam); });
+  if (tourParam) {
+    // Kill the first-visit auto-offer race: 500ms after init the engine opens
+    // the idle offer panel for un-introduced users (_openIdle), which would
+    // stomp the walkthrough mode the deep link just started. A deep link IS
+    // the introduction — consume the introduce-once gate up front. (This
+    // classic script runs before the engine's module script by load order.)
+    try { localStorage.setItem('soma-guide:soma-review-quinn:introduced', '1'); } catch (e) {}
+    whenGuideReady(function () { window.somaGuide.startWalkthrough(tourParam); });
+  }
 
   // Per-item "Tour" affordance: next to any in-app link that points at a
   // completion page, add a small pill that starts Quinn's tour of it in place
@@ -265,6 +484,50 @@ HELPER_JS = r"""
         }
       }
     });
+
+    /* ── Review inbox: COMPLETED.md is the UNREVIEWED list. Any completion
+       that has a verdict (approve OR recommend-changes) moves out of the
+       main list into a collapsed "Reviewed" section at the bottom, showing
+       the verdict it got. State comes from __SOMA_REVIEW_STATE__ (derived
+       server-side from the sidecar JSONL at render time — the .md file is
+       never edited as state). Runs AFTER pill injection so the ▶ Tour pill
+       travels with the item: reviewed items stay tourable. ── */
+    if (!/COMPLETED\.md$/.test(location.pathname)) return;
+    var reviewedRoutes = Object.keys(REVIEWED);
+    if (!reviewedRoutes.length) return;
+
+    var main = document.querySelector('.main');
+    var moved = [];
+    document.querySelectorAll('.main .block-body li').forEach(function (li) {
+      var a = li.querySelector('a[href]');
+      if (!a) return;
+      var href = a.getAttribute('href') || '';
+      for (var i = 0; i < reviewedRoutes.length; i++) {
+        if (href.indexOf(reviewedRoutes[i]) !== -1) {
+          moved.push({ li: li, verdict: REVIEWED[reviewedRoutes[i]].verdict });
+          return;
+        }
+      }
+    });
+    if (!moved.length || !main) return;
+
+    var details = document.createElement('details');
+    details.className = 'sg-reviewed';
+    var summary = document.createElement('summary');
+    summary.textContent = 'Reviewed (' + moved.length + ') — verdict cast, off the inbox';
+    details.appendChild(summary);
+    var ul = document.createElement('ul');
+    details.appendChild(ul);
+    moved.forEach(function (m) {
+      var badge = document.createElement('span');
+      badge.className = 'sg-reviewed-badge sg-reviewed-' + m.verdict;
+      badge.textContent = m.verdict === 'approve' ? '✅ approved' : '✏️ changes requested';
+      m.li.insertBefore(badge, m.li.firstChild);
+      ul.appendChild(m.li);   // moves the node (tour pill + links travel with it)
+    });
+    var discussion = document.querySelector('.page-discussion');
+    if (discussion) main.insertBefore(details, discussion);
+    else main.appendChild(details);
   });
 })();
 """
@@ -279,6 +542,26 @@ TOUR_CSS = """
 /* Quinn has no ElevenLabs agent on this surface — hide voice-mode affordances
    (the engine renders them unconditionally; clicking would dead-end). */
 #soma-guide .sg-btn-voice, #soma-guide .sg-io-voice { display: none !important; }
+/* Verdict bar on the tour's final step. */
+.sg-verdict-bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 10px; }
+.sg-verdict-bar button { border-radius: 8px; padding: 6px 14px; font-size: 13px; font-weight: 600;
+                         cursor: pointer; border: 1px solid #2b3140; background: #1c2634; color: #d8dee9; }
+.sg-verdict-approve:hover { border-color: #7ee08a; color: #9cf0ac; }
+.sg-verdict-recommend:hover { border-color: #e6c26a; color: #f0c674; }
+.sg-verdict-bar button:disabled { opacity: 0.5; cursor: default; }
+.sg-verdict-note { flex-basis: 100%; font-size: 12px; color: #9aa3b5; }
+/* Reviewed section on COMPLETED.md (the review inbox). */
+.sg-reviewed { margin-top: 40px; border-top: 1px solid #2b3140; padding-top: 14px; }
+.sg-reviewed summary { cursor: pointer; color: #9aa3b5; font-size: 14px; font-weight: 600; }
+.sg-reviewed ul { margin-top: 10px; }
+.sg-reviewed li { margin: 6px 0; }
+.sg-reviewed-badge { display: inline-block; margin-right: 8px; padding: 1px 8px; border-radius: 10px;
+                     font-size: 11px; font-weight: 600; }
+.sg-reviewed-approve { background: #1f4a2a; color: #9cf0ac; }
+.sg-reviewed-recommend-changes { background: #4a3f1f; color: #e6c26a; }
+/* Verdict-badge colors for the new completion verdicts in comment threads. */
+.badge-verdict-approve { background: #1f4a2a; color: #9cf0ac; }
+.badge-verdict-recommend-changes { background: #4a3f1f; color: #e6c26a; }
 """
 
 
@@ -341,13 +624,24 @@ def tour_page_assets(route_path, url_prefix=''):
     }
 
     head = ('<link rel="stylesheet" href="%s">\n<style>%s</style>' % (GUIDE_CSS_URL, TOUR_CSS))
+    # Review-inbox state: which completions already carry a verdict (keyed by
+    # '/page/<route>' to match rendered hrefs, same convention as index_map).
+    reviewed = {}
+    try:
+        for route, st in review_state().items():
+            reviewed['/page/' + route] = st
+    except Exception:  # noqa: BLE001 — bad sidecar must not break tour assets
+        reviewed = {}
+
     body = (
         '<script>window.SomaGuideConfig = %s;\n'
-        'window.__SOMA_TOUR_INDEX__ = %s;</script>\n'
+        'window.__SOMA_TOUR_INDEX__ = %s;\n'
+        'window.__SOMA_REVIEW_STATE__ = %s;</script>\n'
         '<script type="module" src="%s"></script>\n'
         '<script>%s</script>'
         % (_json_for_script(config),
            _json_for_script(index_map),
+           _json_for_script(reviewed),
            GUIDE_JS_URL,
            HELPER_JS)
     )

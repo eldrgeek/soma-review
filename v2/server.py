@@ -627,7 +627,11 @@ async function postComment({anchor, snapshot, text, threadId, type, proposed, ro
                             type: type || 'comment', proposed, row_id, verdict })
   });
   if (!res.ok) throw new Error('post failed: ' + res.status);
-  return res.json();
+  const created = await res.json();
+  // Hook point for overlays (Quinn tour verdict capture listens for this):
+  // fired after ANY successful comment save with the created row as detail.
+  try { document.dispatchEvent(new CustomEvent('soma-comment-saved', { detail: created })); } catch (e) {}
+  return created;
 }
 
 // --- Voice-in (Web Speech API, Chrome/webkit only; hides gracefully elsewhere) ---
@@ -1142,6 +1146,63 @@ GENERATE_BOARD_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 GENERATE_PORTFOLIO_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'generate_portfolio.py')
 
 
+RSI_INCOMING_DIR = os.path.join(PROJECTS_ROOT, 'SOMA', 'rsi', 'requests', 'incoming')
+RSI_ROUTER = os.path.join(PROJECTS_ROOT, 'SOMA', 'tools', 'rsi', 'route_requests.py')
+_PROJECT_META_RE = re.compile(r'\*\*Project:\*\*\s*([^·\n]+)')
+_ROUTER_CARD_RE = re.compile(r'->\s*board/inbox/(\S+)')
+
+
+def file_development_request(page, narrative, workspace=DEFAULT_WORKSPACE):
+    """Quinn-tour "recommend changes" relay: write a Development Request
+    (schema v1, rsi/README.md) into SOMA/rsi/requests/incoming/ and run the
+    router synchronously (admin -> board card, idempotent per request-id).
+    app comes from the completion page's `**Project:**` meta field.
+    Returns {'file', 'app', 'card'?} or {'error': ...} — never raises."""
+    try:
+        fs_path = resolve_page(page, workspace)
+        app = ''
+        try:
+            with open(fs_path, 'r', encoding='utf-8') as f:
+                m = _PROJECT_META_RE.search(f.read())
+            if m:
+                # "playmaker + SOMA" / "SOMA (tools/monitoring)" -> first clean
+                # project token (the app field feeds card filenames downstream).
+                app = m.group(1).split('+')[0].strip().strip('*_ ').lower()
+                app = re.match(r'[a-z0-9_.-]*', app).group(0).rstrip('.-')
+        except OSError:
+            pass
+        app = app or 'estate'
+        req = {
+            'app': app,
+            'route': '/page/' + page,
+            'reporter': {'role': 'admin', 'id': 'mike'},
+            'intent': 'idea',
+            'narrative': narrative,
+            'evidence': ['_estate/completions/' + os.path.basename(fs_path)],
+        }
+        os.makedirs(RSI_INCOMING_DIR, exist_ok=True)
+        slug = re.sub(r'[^a-z0-9]+', '-', os.path.basename(fs_path).lower()).strip('-')[:50]
+        fname = 'verdict-%s-%s.json' % (slug, time.strftime('%Y%m%dT%H%M%SZ', time.gmtime()))
+        dr_path = os.path.join(RSI_INCOMING_DIR, fname)
+        with open(dr_path, 'w', encoding='utf-8') as f:
+            json.dump(req, f, indent=2)
+        # Route it now. Same launchd-PATH gotcha as run_dispatch: pin the
+        # interpreter explicitly rather than trusting the inherited PATH.
+        py = sys.executable or '/opt/homebrew/bin/python3'
+        proc = subprocess.run([py, RSI_ROUTER, 'route'],
+                              capture_output=True, text=True, timeout=30)
+        out = {'file': 'SOMA/rsi/requests/incoming/' + fname, 'app': app}
+        m = _ROUTER_CARD_RE.search(proc.stdout or '')
+        if proc.returncode == 0 and m:
+            out['card'] = m.group(1)
+        elif proc.returncode != 0:
+            out['error'] = ('router exited %d: %s'
+                            % (proc.returncode, (proc.stderr or proc.stdout or '')[-500:]))
+        return out
+    except Exception as e:  # noqa: BLE001 — verdict write must never 500 on DR relay
+        return {'error': str(e)}
+
+
 def run_board_regenerate():
     """Blocking (both generators run in well under a second — see their own
     module docstrings for the stream list). Runs board then portfolio; returns
@@ -1300,8 +1361,12 @@ class Handler(BaseHTTPRequestHandler):
                 # Portfolio triage: {type: "verdict", verdict: keep|restart|cancel|later,
                 # row_id, anchor?, snapshot?}. No new storage — same JSONL sidecar, just
                 # a comment carrying a `verdict` field; the client badges it distinctly.
+                # Completion review (Quinn tours) adds approve|recommend-changes:
+                # approve = off the review inbox; recommend-changes additionally files
+                # an RSI Development Request (see below) that routes to a board card.
                 verdict = data.get('verdict')
-                if not page or verdict not in ('keep', 'restart', 'cancel', 'later'):
+                if not page or verdict not in ('keep', 'restart', 'cancel', 'later',
+                                               'approve', 'recommend-changes'):
                     self._send_json({'error': 'page and a valid verdict required'}, status=400)
                     return
                 row_id = (data.get('row_id') or '').strip()
@@ -1337,6 +1402,13 @@ class Handler(BaseHTTPRequestHandler):
                 comment['verdict'] = data.get('verdict')
                 comment['row_id'] = row_id
             append_comment(page, comment, workspace)
+            if ctype == 'verdict' and data.get('verdict') == 'recommend-changes':
+                # RSI loop relay: a recommend-changes verdict on a completion page
+                # becomes a Development Request (reporter.role=admin) in
+                # SOMA/rsi/requests/incoming/, immediately routed (admin -> board
+                # card) by route_requests.py. Best-effort: a routing failure is
+                # reported in the response, never blocks the verdict itself.
+                comment['_dr'] = file_development_request(page, text, workspace)
             self._send_json(comment, status=201)
             return
 

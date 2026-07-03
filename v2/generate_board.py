@@ -401,18 +401,37 @@ def _completion_link_label(title, max_len=70):
     return label
 
 
+def _reviewed_completion_names():
+    """Completion filenames that already carry a review verdict (approve or
+    recommend-changes), derived from the sidecar JSONL via tours.review_state()
+    — same source of truth the review surface uses for COMPLETED.md's Reviewed
+    section. Best-effort: any failure means 'nothing reviewed'."""
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import tours  # noqa: PLC0415 — sibling module, imported lazily on purpose
+        return {os.path.basename(route): st['verdict']
+                for route, st in tours.review_state().items()}
+    except Exception:
+        return {}
+
+
 def render_done_today_strip(todays_completions):
-    """One-line strip: count of completion pages dated today, the 3 most
-    recent titles as in-app links, and a link to the full COMPLETED.md index."""
-    n = len(todays_completions)
+    """One-line strip: count of UNREVIEWED completion pages dated today (the
+    board is Mike's inbox — items with a verdict cast drop off), the 3 most
+    recent unreviewed titles as in-app links, and a link to COMPLETED.md."""
+    reviewed = _reviewed_completion_names()
+    unreviewed = [t for t in todays_completions if t[0] not in reviewed]
+    n_rev = len(todays_completions) - len(unreviewed)
+    rev_note = f' · {n_rev} reviewed' if n_rev else ''
+    n = len(unreviewed)
     if n == 0:
-        return ('**✓ Done today: 0** — nothing finished yet today · '
+        return (f'**✓ Done today: 0 to review**{rev_note} · '
                 '[full index →](COMPLETED.md)')
     parts = []
-    for name, title, _mtime in todays_completions[:3]:
+    for name, title, _mtime in unreviewed[:3]:
         parts.append(f'[{_completion_link_label(title)}](completions/{name})')
-    strip = f"**✓ Done today: {n}** — " + ' · '.join(parts)
-    strip += f' · […all {n} →](COMPLETED.md)'
+    strip = f"**✓ Done today: {n} to review** — " + ' · '.join(parts)
+    strip += f' · […all {n}{rev_note} →](COMPLETED.md)'
     return strip
 
 

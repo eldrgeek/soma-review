@@ -483,6 +483,69 @@ table block; `POST /api/board/regenerate` returns `rc:0` for both scripts;
 new failures. Test verdict comment soft-deleted after verification (not a
 real Mike decision).
 
+## Quinn tours of completed jobs (2026-07-03)
+
+**Completed work is presented as guided tours, not bare receipt links** — the
+same experience Greg gets from Quinn on Legends, running on the review surface.
+The real soma-guide widget engine (CDN: `https://soma-guide.netlify.app/soma-guide.{js,css}`,
+the exact build Legends loads) is mounted on tour-bearing pages with Quinn as
+the persona (reused from Legends' reviewer — `personas.review` there; here she's
+the primary persona, id `soma-review-quinn`, text mode, no ElevenLabs agent).
+
+**`v2/tours.py`** is the whole feature. Per request (inherently idempotent — a
+concurrent worker can keep adding completion pages), it globs
+`_estate/completions/*.md` (excluding `COMPLETED.md`/`README.md`), parses each
+with the SAME `mdblocks.parse_markdown` the renderer uses (so
+`[data-anchor="…"]` step targets always match the rendered DOM), and builds one
+3-step walkthrough per completion following the convention in
+`_estate/completions/README.md`:
+1. **What was done** — title block highlighted, opening paragraph narrated
+   (the `**Date:** …` meta line is skipped).
+2. **The receipts** — first `##` heading matching
+   `receipt|evidence|commit|verif|proof` highlighted.
+3. **See it live** — the block carrying the machine-parsed `**Live:** <url>`
+   line highlighted; the link itself is already an external `target=_blank`
+   autolink. No-live completions get a wrap-up step instead.
+
+**Feature flag:** `workspaces.json::<ws>.tours == true` (estate only today) AND
+the route must be tour-bearing (`estate/COMPLETED.md` or
+`estate/completions/*.md`) — `tour_page_assets()` returns `None` everywhere
+else and the page render is byte-identical. Asset build failures are caught in
+`render_page()` and logged, never break rendering.
+
+**Entry points:** (1) opening COMPLETED.md first-visit auto-opens Quinn's panel
+offering the tour list (engine's introduce-once localStorage gate); (2) a
+`▶ Tour` pill injected after every in-app link to a completion page (HELPER_JS
+matches hrefs against a server-built `__SOMA_TOUR_INDEX__` route→tour-id map) —
+click starts the tour in place, engine navigates to the completion page itself
+(sessionStorage tour-state resume, same mechanism as Legends cross-page tours);
+(3) deep link `?tour=<id>` on any tour-bearing page.
+
+**Chat:** Quinn answers questions via the same VPS inference endpoint Bill uses
+(`https://vpsmikewolf.duckdns.org/infer/ask`) with a knowledge pack compiled
+from the tour set (one line per completed job). Voice affordances are hidden
+via injected CSS (`.sg-btn-voice`, `.sg-io-voice`) since no ElevenLabs agent is
+configured here; tours auto-advance on the engine's text-length fallback timer.
+
+**Gotchas:**
+- The engine is CDN-loaded — offline, the review pages still render fine (the
+  module script just 404s; nothing else references it), but no Quinn.
+- `_computeConfigHash` (stale-tour-state guard) hashes walkthrough/step ids, so
+  a new completion page landing mid-tour invalidates saved tour state — safe,
+  by design.
+- The VPS infer endpoint was returning 500 on 2026-07-03 (Anthropic key out of
+  credits — affects Legends' Ask-Bill too). Quinn degrades to "doesn't see that
+  in the site content"; self-heals when credits are restored.
+- v2 candidate: pre-generated audio narration via the `gen-tour-audio.mjs`
+  hash-per-(agent|narration) path from soma-platform, once Quinn gets a
+  voice/TTS route that makes sense locally.
+
+Verified 2026-07-03 (Playwright, fresh headless context): 23 tours built from
+the worker's completion set; auto-offer panel, 23 pills, pill-click cross-page
+tour start, all 3 steps with correct highlights, live-link `target=_blank`,
+deep-link start, commenting intact on tour pages, zero page errors. Evidence:
+`_estate/evidence/quinn-tours/*.png`.
+
 ## Authorship
 
 v2 built 2026-07-02 by Dee (Claude Sonnet 5, engineering-lead/COO role) per Mike's spec

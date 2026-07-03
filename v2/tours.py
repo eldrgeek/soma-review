@@ -36,7 +36,12 @@ COMPLETIONS_DIR = os.path.expanduser('~/Projects/_estate/completions')
 # Route prefix (estate workspace) for completion pages.
 COMPLETIONS_ROUTE_PREFIX = 'estate/completions/'
 # Routes that get the index treatment (auto-offer + per-item Tour affordances).
-INDEX_ROUTES = ('estate/COMPLETED.md', 'estate/completions/COMPLETED.md')
+# WORKQUEUE.md added 2026-07-03: its Done-today lines end in
+# `→ [receipts](completions/<slug>.md)` links, which the HELPER_JS pill
+# injector matches against the same route→tour-id index — so the queue page
+# gets the exact ▶ Tour affordance COMPLETED.md has, no extra mechanism.
+INDEX_ROUTES = ('estate/COMPLETED.md', 'estate/completions/COMPLETED.md',
+                'estate/WORKQUEUE.md')
 
 GUIDE_CSS_URL = 'https://soma-guide.netlify.app/soma-guide.css'
 GUIDE_JS_URL = 'https://soma-guide.netlify.app/soma-guide.js'

@@ -58,6 +58,7 @@ def load_workspaces():
             'nightly': cfg.get('nightly', False),
             'nightly_filter': cfg.get('nightly_filter'),
             'tours': cfg.get('tours', False),
+            'status_badges': cfg.get('status_badges', []),
         }
     return out
 
@@ -890,7 +891,48 @@ def render_sidebar(current_route, workspace=DEFAULT_WORKSPACE):
     return '\n'.join(items)
 
 
-def render_block_html(block, route_path):
+# --- Workqueue status chips (flag-gated: workspaces.json::<ws>.status_badges) ---
+#
+# Render-time decoration only — the markdown file stays the single source of
+# truth. An item block (one-paragraph-per-item, IDs like WQ-n / G1.n / P-n)
+# carrying an in-row `**DONE 2026-07-03**` marker gets a small green DONE chip;
+# `**IN-FLIGHT**` (the marker the maintenance passes use for worker-running
+# items, e.g. WQ-67 pre-completion) gets an amber IN-FLIGHT chip. Everything
+# else: no chip. Palette matches the existing comment-status badges
+# (.badge-done green / .badge-queued amber) so the surface speaks one visual
+# language. CSS is injected only on flagged pages (like tour_head), so
+# non-flagged pages render byte-identically.
+
+_WQ_ITEM_RE = re.compile(r'^\*\*(?:WQ-\d|G\d+\.\d|P-\d)')
+_WQ_DONE_RE = re.compile(r'\*\*DONE(?:\s+\d{4}-\d{2}-\d{2})?\*\*')
+_WQ_INFLIGHT_RE = re.compile(r'\*\*IN-FLIGHT(?:\s+\d{4}-\d{2}-\d{2})?\*\*')
+
+STATUS_CHIP_CSS = """
+.wq-chip { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 10px;
+           text-transform: uppercase; letter-spacing: .04em; font-weight: 700;
+           margin-right: 8px; vertical-align: 2px; }
+.wq-chip-done { background: #1f4a2a; color: #7ee08a; }
+.wq-chip-in-flight { background: #4a3a1f; color: #f0c674; }
+"""
+
+
+def wq_status_chip(block):
+    """'done' | 'in-flight' | None for a workqueue item block. Only paragraph
+    blocks that start with an item ID are eligible — prose that merely mentions
+    the markers (footer notes, Done-today list) never gets a chip."""
+    if block['kind'] != 'paragraph':
+        return None
+    text = block['text']
+    if not _WQ_ITEM_RE.match(text):
+        return None
+    if _WQ_DONE_RE.search(text):
+        return 'done'
+    if _WQ_INFLIGHT_RE.search(text):
+        return 'in-flight'
+    return None
+
+
+def render_block_html(block, route_path, status_chip=None):
     kind = block['kind']
     anchor = block['anchor']
     snapshot = _html_attr_escape(block['snapshot'])
@@ -906,6 +948,16 @@ def render_block_html(block, route_path):
     # edit and low-value to inline-edit anyway; they still get the comment affordance.
     editable = kind not in ('code', 'table')
     edit_cls = ' edit-eligible' if editable else ''
+    if status_chip:
+        # Inline chip at the head of the item's first line. Item blocks are
+        # paragraphs, so splice inside the opening <p>; anchors/snapshots/
+        # data-source are untouched (chip is presentation-only).
+        label = status_chip.upper()
+        chip_html = f'<span class="wq-chip wq-chip-{status_chip}">{label}</span>'
+        if inner.startswith('<p>'):
+            inner = '<p>' + chip_html + inner[len('<p>'):]
+        else:
+            inner = chip_html + inner
     return f'''<div class="block-wrap{edit_cls}" data-anchor="{anchor}" data-snapshot="{snapshot}" data-kind="{kind}" data-source="{source_b64}">
   <button class="comment-affordance" title="Comment on this block (Enter)">+</button>
   <div class="block-body"{' tabindex="0"' if editable else ''}>{inner}</div>
@@ -932,7 +984,13 @@ def render_page(route_path, workspace=DEFAULT_WORKSPACE):
     title, blocks = parse_markdown(src, link_resolver=resolver)
     title = title or route_path
 
-    blocks_html = '\n'.join(render_block_html(b, route_path) for b in blocks)
+    badges_on = route_path in (ws.get('status_badges') or [])
+    blocks_html = '\n'.join(
+        render_block_html(b, route_path, status_chip=(wq_status_chip(b) if badges_on else None))
+        for b in blocks)
+    # trailing newline keeps flagged-page head formatting tidy; empty string on
+    # non-flagged pages keeps their rendered HTML byte-identical to pre-feature.
+    chip_head = f'<style>{STATUS_CHIP_CSS}</style>\n' if badges_on else ''
 
     # Every route in a workspace's own roots (or its nightly reports) is dispatchable.
     root_prefixes = tuple(f'{p}/' for p, _ in ws['roots'])
@@ -960,7 +1018,7 @@ def render_page(route_path, workspace=DEFAULT_WORKSPACE):
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{_html.escape(title)} — soma-review</title>
 <style>{PAGE_CSS}</style>
-{tour_head}
+{chip_head}{tour_head}
 </head>
 <body>
 <nav class="sidebar">

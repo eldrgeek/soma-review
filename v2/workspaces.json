@@ -7,8 +7,11 @@
       ["soma", "SOMA"]
     ],
     "nightly": true,
+    "tours": true,
     "nav": [
       ["Board", "estate/BOARD.md"],
+      ["Completed", "estate/COMPLETED.md"],
+      ["Workqueue", "estate/WORKQUEUE.md"],
       ["Portfolio", "estate/PORTFOLIO.md"],
       ["Morning Review", "estate/MORNING-REVIEW-2026-07-02.md"],
       ["Productivity Opportunities", "estate/PRODUCTIVITY-OPPORTUNITIES-2026-07-02.md"],

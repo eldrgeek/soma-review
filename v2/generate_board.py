@@ -358,6 +358,13 @@ def render_board(changelog_entries, audit_files, memory_changes,
     lines.append(f'_Generated {ts} by `v2/generate_board.py` — never hand-curated, '
                   f'always regenerate (nightly + on-demand via the Regenerate button)._')
     lines.append('')
+    # Standing links (not stream-derived — always present on the board).
+    lines.append('**Work queue:** [WORKQUEUE.md](WORKQUEUE.md) — calibration review open: '
+                  'every item carries a Conf score and a Mike column; comment on any item to recalibrate.')
+    lines.append('')
+    lines.append('**Completed:** [COMPLETED.md](COMPLETED.md) — every finished job, newest first, '
+                  'each linking to a what-was-done page with receipts (commits, evidence, live URLs).')
+    lines.append('')
 
     # --- Needs Mike ---
     lines.append('## Needs Mike')

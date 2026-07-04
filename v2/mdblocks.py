@@ -7,7 +7,8 @@ GFM-style pipe tables, fenced code blocks, blockquotes, hr, and inline emphasis/
 code/links. Good enough for rendering + block-level comment anchoring.
 
 Each parsed block gets:
-  - kind: heading|paragraph|list|table|code|blockquote|hr
+  - kind: heading|paragraph|list|table|code|blockquote|hr|film (film: Screening
+    Room video-player block, a ```film fenced JSON payload — see render_film_block())
   - level: heading level (1-6) if kind == heading
   - heading_path: list of heading texts above this block (breadcrumb), most-recent-first ancestry
   - index: 0-based index of this block within the whole document
@@ -19,10 +20,46 @@ Each parsed block gets:
 import re
 import html as _html
 import hashlib
+import json
 
 
 def _esc(s):
     return _html.escape(s, quote=False)
+
+
+def render_film_block(raw_json):
+    """Render a ```film fenced block (Screening Room, soma-review) — a JSON payload
+    describing one video into an HTML5 <video> player with poster + optional captions
+    track. Kept in mdblocks.py (not server.py) so it flows through the same
+    anchor/snapshot/edit-source machinery every other block kind gets for free.
+
+    Payload keys: src (required, a /raw/... URL already resolved by the caller),
+    poster (optional /raw/... URL), vtt (optional /raw/... URL), duration (optional
+    display string), data-testid (optional, for verification-video selectors).
+    Malformed JSON renders a visible error block instead of crashing page render.
+    """
+    try:
+        d = json.loads(raw_json)
+    except (json.JSONDecodeError, TypeError) as e:
+        return f'<div class="film-error">Malformed film block: {_esc(str(e))}</div>'
+    if d.get('placeholder'):
+        note = _esc(d.get('note', 'Placeholder — no video yet.'))
+        return f'<div class="film-placeholder">{note}</div>'
+    src = d.get('src', '')
+    if not src:
+        return '<div class="film-error">film block missing "src"</div>'
+    poster = d.get('poster')
+    vtt = d.get('vtt')
+    testid = d.get('testid', '')
+    poster_attr = f' poster="{_esc(poster)}"' if poster else ''
+    testid_attr = f' data-testid="{_esc(testid)}"' if testid else ''
+    track_html = f'<track kind="captions" src="{_esc(vtt)}" default>' if vtt else ''
+    return (
+        f'<video class="film-player" controls preload="none"{poster_attr}{testid_attr}>'
+        f'<source src="{_esc(src)}" type="video/mp4">{track_html}'
+        f'Your browser does not support HTML5 video.'
+        f'</video>'
+    )
 
 
 _INLINE_LINK_RE = re.compile(r'\[([^\]]*)\]\(([^)]+)\)')
@@ -153,7 +190,9 @@ def parse_markdown(src, link_resolver=None):
             i += 1
             continue
 
-        # Fenced code block
+        # Fenced code block (special-cased 'film' language: Screening Room video
+        # player block — see render_film_block(). Same fence syntax so anchor/
+        # snapshot/edit-source machinery is unchanged; only the rendered HTML differs.)
         if stripped.startswith('```'):
             fence = stripped[:3]
             lang = stripped[3:].strip()
@@ -164,9 +203,14 @@ def parse_markdown(src, link_resolver=None):
                 i += 1
             i += 1  # skip closing fence
             raw = '\n'.join(code_lines)
-            html_body = f'<pre><code class="lang-{_esc(lang)}">{_esc(raw)}</code></pre>'
+            if lang == 'film':
+                html_body = render_film_block(raw)
+                kind = 'film'
+            else:
+                html_body = f'<pre><code class="lang-{_esc(lang)}">{_esc(raw)}</code></pre>'
+                kind = 'code'
             blocks.append({
-                'kind': 'code', 'level': None, 'heading_path': heading_path(),
+                'kind': kind, 'level': None, 'heading_path': heading_path(),
                 'index': idx, 'text': raw, 'html': html_body,
             })
             idx += 1

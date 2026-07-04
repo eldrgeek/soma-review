@@ -440,6 +440,18 @@ hr { border: none; border-top: 1px solid #2b3140; margin: 24px 0; }
 .badge-verdict-restart { background: #1c3a4a; color: #7ec6f0; }
 .badge-verdict-cancel { background: #4a1f24; color: #f0a3ab; }
 .badge-verdict-later { background: #4a3f1f; color: #e6c26a; }
+.film-player { width: 100%; max-width: 720px; border-radius: 8px; background: #000;
+               display: block; margin: 6px 0; }
+.film-error { color: #f0a3ab; background: #2a1418; border: 1px solid #4a1f24;
+              border-radius: 6px; padding: 8px 12px; font-size: 13px; }
+.film-placeholder { color: #e6c26a; background: #2a2410; border: 1px solid #4a4020;
+                     border-radius: 6px; padding: 8px 12px; font-size: 13px; }
+.screening-hint { font-size: 12px; color: #8a93a3; font-style: italic; margin: -4px 0 12px; }
+.screening-group h2 { margin-top: 32px; border-bottom: 1px solid #262b33; padding-bottom: 6px; }
+.film-meta { font-size: 12px; color: #8a93a3; margin: 2px 0 8px; }
+.film-blurb { font-size: 14px; color: #c7ccd6; margin: 4px 0 10px; }
+details.verification-group summary { cursor: pointer; color: #8a93a3; font-size: 13px;
+                                      margin: 20px 0 8px; }
 """
 
 PAGE_JS = r"""
@@ -953,10 +965,11 @@ def render_block_html(block, route_path, status_chip=None):
     # string-escaping edge cases in doc text (backticks, quotes, newlines).
     import base64 as _b64
     source_b64 = _b64.b64encode(block['text'].encode('utf-8')).decode('ascii')
-    # code/table blocks are excluded from click-to-edit — their raw source has
-    # internal structure (fences, pipes) that's easy to corrupt via a flat textarea
-    # edit and low-value to inline-edit anyway; they still get the comment affordance.
-    editable = kind not in ('code', 'table')
+    # code/table/film blocks are excluded from click-to-edit — their raw source has
+    # internal structure (fences, pipes, JSON) that's easy to corrupt via a flat
+    # textarea edit and low-value to inline-edit anyway; they still get the comment
+    # affordance (film comments are exactly the "notes to the videographer" mechanism).
+    editable = kind not in ('code', 'table', 'film')
     edit_cls = ' edit-eligible' if editable else ''
     if status_chip:
         # Inline chip at the head of the item's first line. Item blocks are

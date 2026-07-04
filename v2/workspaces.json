@@ -4,12 +4,14 @@
     "roots": [
       ["estate", "_estate"],
       ["business-ops", "business-ops"],
-      ["soma", "SOMA"]
+      ["soma", "SOMA"],
+      ["screening-room-videos", "demo-producer/out"]
     ],
     "nightly": true,
     "tours": true,
     "status_badges": ["estate/WORKQUEUE.md"],
     "nav": [
+      ["Screening Room", "estate/SCREENING-ROOM.md"],
       ["Board", "estate/BOARD.md"],
       ["Completed", "estate/COMPLETED.md"],
       ["Workqueue", "estate/WORKQUEUE.md"],

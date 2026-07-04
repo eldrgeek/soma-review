@@ -181,6 +181,12 @@ _RAW_MIME = {
     '.pdf': 'application/pdf', '.png': 'image/png', '.jpg': 'image/jpeg',
     '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.svg': 'image/svg+xml',
     '.log': 'text/plain', '.yaml': 'text/plain', '.yml': 'text/plain',
+    # video (verification videos convention, WQ-93): without an explicit MIME
+    # these fell through to application/octet-stream -> browser downloads
+    # instead of playing inline. No Range support here (whole-file read) —
+    # fine for 1-2 min verification clips, progressive playback works.
+    '.mp4': 'video/mp4', '.webm': 'video/webm', '.mov': 'video/quicktime',
+    '.vtt': 'text/vtt', '.mp3': 'audio/mpeg',
 }
 
 

@@ -12,6 +12,7 @@
     "status_badges": ["estate/WORKQUEUE.md"],
     "nav": [
       ["Screening Room", "estate/SCREENING-ROOM.md"],
+      ["NBARPA Concept", "estate/NBARPA-CONCEPT-2026-07-04.md"],
       ["Board", "estate/BOARD.md"],
       ["Completed", "estate/COMPLETED.md"],
       ["Workqueue", "estate/WORKQUEUE.md"],
@@ -37,7 +38,8 @@
     "nav": [
       ["AGENTS", "playmaker/AGENTS.md"],
       ["CLAUDE", "playmaker/CLAUDE.md"],
-      ["DESIGN", "playmaker/DESIGN.md"]
+      ["DESIGN", "playmaker/DESIGN.md"],
+      ["Making Of design", "playmaker/docs/MAKING-OF-DESIGN-2026-07-04.md"]
     ],
     "home": "playmaker/CLAUDE.md",
     "feedback_dir": "_estate/review-feedback/playmaker"

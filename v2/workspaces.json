@@ -15,6 +15,7 @@
       ["NBARPA Concept", "estate/NBARPA-CONCEPT-2026-07-04.md"],
       ["Hands-off Hand-off", "estate/HANDS-OFF-HANDOFF-2026-07-04.md"],
       ["Verification Sweep", "estate/VERIFICATION-SWEEP-2026-07-04.md"],
+      ["Fleet Tooling Review", "estate/FLEET-TOOLING-REVIEW-2026-07-04.md"],
       ["Board", "estate/BOARD.md"],
       ["Completed", "estate/COMPLETED.md"],
       ["Workqueue", "estate/WORKQUEUE.md"],
@@ -28,7 +29,13 @@
       ["Vision Interview", "estate/audit-2026-07/VISION-INTERVIEW-2026-07-01.md"]
     ],
     "home": "estate/BOARD.md",
-    "feedback_dir": "_estate/review-feedback"
+    "feedback_dir": "_estate/review-feedback",
+    "dispatch_targets": {
+      "estate/FLEET-TOOLING-REVIEW-2026-07-04.md": {
+        "target": "cursor",
+        "button": "Send to Grok"
+      }
+    }
   },
   "playmaker": {
     "label": "Playmaker",
@@ -44,7 +51,13 @@
       ["Making Of design", "playmaker/docs/MAKING-OF-DESIGN-2026-07-04.md"]
     ],
     "home": "playmaker/CLAUDE.md",
-    "feedback_dir": "_estate/review-feedback/playmaker"
+    "feedback_dir": "_estate/review-feedback/playmaker",
+    "dispatch_targets": {
+      "*": {
+        "target": "rsi",
+        "button": "File feedback"
+      }
+    }
   },
   "platform": {
     "label": "Platform",

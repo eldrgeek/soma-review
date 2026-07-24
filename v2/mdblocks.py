@@ -21,10 +21,26 @@ import re
 import html as _html
 import hashlib
 import json
+import os
+
+
+PROJECTS_ROOT = os.path.expanduser('~/Projects')
+PUBLIC_FILMS_PATH = os.path.join(PROJECTS_ROOT, '_estate', 'public-films.json')
 
 
 def _esc(s):
     return _html.escape(s, quote=False)
+
+
+def _load_public_films():
+    if not os.path.isfile(PUBLIC_FILMS_PATH):
+        return {}
+    try:
+        with open(PUBLIC_FILMS_PATH, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 def render_film_block(raw_json):
@@ -54,11 +70,21 @@ def render_film_block(raw_json):
     poster_attr = f' poster="{_esc(poster)}"' if poster else ''
     testid_attr = f' data-testid="{_esc(testid)}"' if testid else ''
     track_html = f'<track kind="captions" src="{_esc(vtt)}" default>' if vtt else ''
+    public_control = ''
+    if testid:
+        checked_attr = ' checked' if _load_public_films().get(testid) is True else ''
+        public_control = (
+            '<label class="public-film-control">'
+            f'<input type="checkbox" class="public-film-toggle" data-testid="{_esc(testid)}"'
+            f' data-film-testid="{_esc(testid)}"{checked_attr}>'
+            '<span>Make public &mdash; feature on mikewolf.com</span>'
+            '</label>'
+        )
     return (
         f'<video class="film-player" controls preload="none"{poster_attr}{testid_attr}>'
         f'<source src="{_esc(src)}" type="video/mp4">{track_html}'
         f'Your browser does not support HTML5 video.'
-        f'</video>'
+        f'</video>{public_control}'
     )
 
 
@@ -78,6 +104,10 @@ _BARE_URL_RE = re.compile(r'(https?://[^\s<>\[\]()]+?)(?=[.,;:!?]?(?:\*\*)?(?:\s
 # comment API (no new storage). Matched before bold/italic so the brackets don't
 # get mistaken for anything else.
 _VERDICT_TOKEN_RE = re.compile(r'\[\[VERDICT:([a-zA-Z0-9_-]+)\]\]')
+# Recommendation review token: [[REVIEW:<row-id>]] — agree/disagree/discuss/defer
+# for structured review pages (e.g. fleet-tooling audits). Same comment API as
+# VERDICT; distinct button set wired by PAGE_JS's wireReviewButtons().
+_REVIEW_TOKEN_RE = re.compile(r'\[\[REVIEW:([a-zA-Z0-9_-]+)\]\]')
 
 
 def render_inline(text, link_resolver=None):
@@ -129,10 +159,27 @@ def render_inline(text, link_resolver=None):
         )
         return stash(f'<span class="verdict-row" data-row-id="{row_id}">{buttons}<span class="verdict-status"></span></span>')
 
-    # Verdict tokens BEFORE markdown-link stashing (tokens never contain '[label](href)'
+    def review_sub(m):
+        row_id = _esc(m.group(1))
+        buttons = ''.join(
+            f'<button type="button" class="review-btn review-{v}" data-review="{v}" data-row-id="{row_id}">{label}</button>'
+            for v, label in (
+                ('agree', 'Agree'),
+                ('disagree', 'Disagree'),
+                ('discuss', 'Discuss'),
+                ('defer', 'Defer'),
+            )
+        )
+        return stash(
+            f'<span class="review-row" data-row-id="{row_id}">{buttons}'
+            f'<span class="review-status"></span></span>'
+        )
+
+    # Verdict/review tokens BEFORE markdown-link stashing (tokens never contain '[label](href)'
     # syntax so order vs. links doesn't matter for correctness, but doing it first keeps
     # the intent — "this is UI, not a link" — clearest).
     text = _VERDICT_TOKEN_RE.sub(verdict_sub, text)
+    text = _REVIEW_TOKEN_RE.sub(review_sub, text)
 
     # Stash markdown-form links [label](href) BEFORE bare-URL autolinking, so a URL
     # used as the href of a real markdown link is never double-linked.

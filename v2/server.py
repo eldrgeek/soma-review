@@ -23,11 +23,13 @@ from urllib.parse import urlparse, parse_qs, unquote
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mdblocks import parse_markdown, render_inline  # noqa: E402
 import tours as tour_engine  # noqa: E402  (Quinn tours of completed jobs — see tours.py)
+import cursor_intake  # noqa: E402  (Grok/Cursor intake — see SOMA/cursor-intake/README.md)
 
 PROJECTS_ROOT = os.path.expanduser('~/Projects')
 DISPATCH_PROMPT_TEMPLATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dispatch-prompt-template.md')
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static')
 WORKSPACES_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'workspaces.json')
+PUBLIC_FILMS_PATH = os.path.join(PROJECTS_ROOT, '_estate', 'public-films.json')
 
 # Nightly worktree reports get their own synthetic route: nightly/<worktree-name>
 NIGHTLY_PREFIX = 'nightly'
@@ -59,8 +61,21 @@ def load_workspaces():
             'nightly_filter': cfg.get('nightly_filter'),
             'tours': cfg.get('tours', False),
             'status_badges': cfg.get('status_badges', []),
+            'dispatch_targets': cfg.get('dispatch_targets', {}),
         }
     return out
+
+
+def get_dispatch_config(route_path, workspace=DEFAULT_WORKSPACE):
+    """Per-page dispatch routing. Default target is cc-dispatch (Dee).
+    Supports exact match and wildcard '*' match."""
+    ws = get_workspace(workspace)
+    targets = ws.get('dispatch_targets') or {}
+    # Try exact match first, then fallback to wildcard
+    cfg = targets.get(route_path) or targets.get('*') or {}
+    target = cfg.get('target', 'dee')
+    button = cfg.get('button', 'Send to Grok' if target == 'cursor' else 'File feedback' if target == 'rsi' else 'Send to Dee')
+    return {'target': target, 'button': button}
 
 
 def get_workspace(slug):
@@ -329,6 +344,34 @@ def update_comment(route_path, comment_id, patch, workspace=DEFAULT_WORKSPACE):
         return found
 
 
+def read_public_films():
+    if not os.path.isfile(PUBLIC_FILMS_PATH):
+        return {}
+    try:
+        with open(PUBLIC_FILMS_PATH, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def write_public_films(data):
+    os.makedirs(os.path.dirname(PUBLIC_FILMS_PATH), exist_ok=True)
+    tmp = PUBLIC_FILMS_PATH + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=True)
+        f.write('\n')
+    os.replace(tmp, PUBLIC_FILMS_PATH)
+
+
+def update_public_film(testid, is_public):
+    with _lock:
+        data = read_public_films()
+        data[testid] = bool(is_public)
+        write_public_films(data)
+        return data
+
+
 # --- HTML rendering --------------------------------------------------------
 
 PAGE_CSS = """
@@ -440,8 +483,33 @@ hr { border: none; border-top: 1px solid #2b3140; margin: 24px 0; }
 .badge-verdict-restart { background: #1c3a4a; color: #7ec6f0; }
 .badge-verdict-cancel { background: #4a1f24; color: #f0a3ab; }
 .badge-verdict-later { background: #4a3f1f; color: #e6c26a; }
+.review-row { display: inline-flex; gap: 4px; align-items: center; flex-wrap: wrap; margin-top: 6px; }
+.review-btn { background: #1c2634; border: 1px solid #2b3140; border-radius: 6px; padding: 4px 10px;
+  font-size: 12px; color: #b8c0cc; cursor: pointer; }
+.review-btn:hover { background: #24314a; color: #e6e6e6; }
+.review-btn.review-agree:hover { border-color: #9cf0ac; color: #9cf0ac; }
+.review-btn.review-disagree:hover { border-color: #f0a3ab; color: #f0a3ab; }
+.review-btn.review-discuss:hover { border-color: #7ec6f0; color: #7ec6f0; }
+.review-btn.review-defer:hover { border-color: #e6c26a; color: #e6c26a; }
+.review-status { font-size: 11px; color: #8a93a3; margin-left: 4px; }
+.block-wrap.cursor-sent { display: none; }
+.cursor-sent-banner { background: #1a2e1f; border: 1px solid #2d5a38; border-radius: 8px;
+  padding: 10px 14px; margin-bottom: 16px; font-size: 13px; color: #9cf0ac; }
+.cursor-sent-banner a { color: #7ec6f0; }
+.review-row.is-sent .review-btn { display: none; }
+.review-row.is-sent .review-status { color: #9cf0ac; font-weight: 600; }
+.badge-verdict-agree { background: #1f4a2a; color: #9cf0ac; }
+.badge-verdict-disagree { background: #4a1f24; color: #f0a3ab; }
+.badge-verdict-discuss { background: #1c3a4a; color: #7ec6f0; }
+.badge-verdict-defer { background: #4a3f1f; color: #e6c26a; }
 .film-player { width: 100%; max-width: 720px; border-radius: 8px; background: #000;
                display: block; margin: 6px 0; }
+.public-film-control { display: inline-flex; align-items: center; gap: 8px; margin: 4px 0 12px;
+                       padding: 7px 10px; border-radius: 8px; border: 1px solid #2b3140;
+                       background: #141922; color: #cbd3e0; font-size: 13px; cursor: pointer; }
+.public-film-control:hover { border-color: #3a465a; background: #171e29; }
+.public-film-control input { width: 15px; height: 15px; accent-color: #4f8cff; }
+.public-film-control input:disabled + span { color: #6a7280; }
 .film-error { color: #f0a3ab; background: #2a1418; border: 1px solid #4a1f24;
               border-radius: 6px; padding: 8px 12px; font-size: 13px; }
 .film-placeholder { color: #e6c26a; background: #2a2410; border: 1px solid #4a4020;
@@ -584,11 +652,16 @@ async function deleteComment(div, c) {
   loadThreadsIntoDOM();
 }
 
+function isCursorDispatched(c) {
+  return !!(c && c.cursor_dispatched);
+}
+
 async function loadThreadsIntoDOM() {
   const comments = await fetchComments();
+  const visible = comments.filter(c => !isCursorDispatched(c));
   const byAnchor = {};
   const pageLevel = [];
-  for (const c of comments) {
+  for (const c of visible) {
     if (!c.anchor) { pageLevel.push(c); continue; }
     (byAnchor[c.anchor] = byAnchor[c.anchor] || []).push(c);
   }
@@ -603,11 +676,27 @@ async function loadThreadsIntoDOM() {
       if (!prev || c.timestamp > prev.timestamp) latestVerdictByRow[c.row_id] = c;
     }
   }
+  let sentRecCount = 0;
   document.querySelectorAll('.verdict-row').forEach(rowEl => {
     const rowId = rowEl.dataset.rowId;
     const v = latestVerdictByRow[rowId];
     const statusEl = rowEl.querySelector('.verdict-status');
     if (v && statusEl) statusEl.textContent = `✓ ${v.verdict}`;
+  });
+  document.querySelectorAll('.review-row').forEach(rowEl => {
+    const rowId = rowEl.dataset.rowId;
+    const v = latestVerdictByRow[rowId];
+    const statusEl = rowEl.querySelector('.review-status');
+    const wrap = rowEl.closest('.block-wrap');
+    const sent = v && v.verdict === 'agree' && isCursorDispatched(v);
+    if (sent) {
+      sentRecCount += 1;
+      rowEl.classList.add('is-sent');
+      if (statusEl) statusEl.textContent = '✓ Sent to Grok';
+      if (wrap) wrap.classList.add('cursor-sent');
+    } else if (v && statusEl) {
+      statusEl.textContent = `✓ ${v.verdict}`;
+    }
   });
   document.querySelectorAll('.block-wrap').forEach(el => {
     const anchor = el.dataset.anchor;
@@ -635,6 +724,45 @@ async function loadThreadsIntoDOM() {
   pageThread.innerHTML = '';
   pageLevel.sort((a,b) => a.timestamp.localeCompare(b.timestamp))
             .forEach(c => pageThread.appendChild(renderCommentItem(c)));
+
+  updateCursorSentBanner(sentRecCount);
+}
+
+function updateCursorSentBanner(sentRecCount) {
+  if (window.__DISPATCH_TARGET__ !== 'cursor') return;
+  let banner = document.getElementById('cursor-sent-banner');
+  const flash = sessionStorage.getItem('soma-cursor-sent-flash');
+  if (flash) {
+    try {
+      const data = JSON.parse(flash);
+      sessionStorage.removeItem('soma-cursor-sent-flash');
+      if (!banner) {
+        banner = document.createElement('div');
+        banner.id = 'cursor-sent-banner';
+        banner.className = 'cursor-sent-banner';
+        const actions = document.querySelector('.top-actions');
+        if (actions) actions.insertAdjacentElement('afterend', banner);
+      }
+      const n = data.dispatched_count || 0;
+      const card = data.card_path || '';
+      banner.innerHTML = `Sent <strong>${n}</strong> item(s) to Grok`
+        + (card ? ` · <code>${escapeHtml(card)}</code>` : '')
+        + ' — dispatched recommendations are hidden below. Disagree/Defer items stay visible.';
+      return;
+    } catch (e) { /* ignore */ }
+  }
+  if (sentRecCount > 0) {
+    if (!banner) {
+      banner = document.createElement('div');
+      banner.id = 'cursor-sent-banner';
+      banner.className = 'cursor-sent-banner';
+      const actions = document.querySelector('.top-actions');
+      if (actions) actions.insertAdjacentElement('afterend', banner);
+    }
+    banner.textContent = `${sentRecCount} recommendation(s) already sent to Grok (hidden). Open SOMA/cursor-intake/inbox/ for the card.`;
+  } else if (banner) {
+    banner.remove();
+  }
 }
 
 async function postComment({anchor, snapshot, text, threadId, type, proposed, row_id, verdict}) {
@@ -797,10 +925,12 @@ function wireBlockAffordances() {
   }
 
   const sendBtn = document.getElementById('send-to-dee');
+  const dispatchButtonLabel = window.__DISPATCH_BUTTON__ || 'Send to Dee';
   if (sendBtn) {
+    sendBtn.textContent = dispatchButtonLabel;
     sendBtn.addEventListener('click', async () => {
       sendBtn.disabled = true;
-      sendBtn.textContent = 'Dispatching...';
+      sendBtn.textContent = 'Sending...';
       try {
         const res = await fetch(`${API_BASE}/api/dispatch`, {
           method: 'POST',
@@ -809,6 +939,20 @@ function wireBlockAffordances() {
         });
         const data = await res.json();
         if (res.ok) {
+          if (data.target === 'cursor') {
+            sessionStorage.setItem('soma-cursor-sent-flash', JSON.stringify({
+              card_path: data.card_path,
+              dispatched_count: data.dispatched_count || 0
+            }));
+            location.reload();
+            return;
+          }
+          if (data.target === 'rsi') {
+            const count = data.dispatched_count || 0;
+            toast(`Filed ${count} feedback card${count !== 1 ? 's' : ''} · team will see it on the board`);
+            setTimeout(() => location.reload(), 800);
+            return;
+          }
           toast('Dispatched: ' + data.task_name);
         } else {
           toast('Dispatch failed: ' + (data.error || res.status));
@@ -817,7 +961,7 @@ function wireBlockAffordances() {
         toast('Dispatch error: ' + e.message);
       }
       sendBtn.disabled = false;
-      sendBtn.textContent = 'Send to Dee';
+      sendBtn.textContent = dispatchButtonLabel;
     });
   }
 
@@ -875,11 +1019,83 @@ function wireVerdictButtons() {
   });
 }
 
+// --- Recommendation review buttons (agree/disagree/discuss/defer) -----------
+function wireReviewButtons() {
+  document.querySelectorAll('.review-btn').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const rowId = btn.dataset.rowId;
+      const verdict = btn.dataset.review;
+      const wrap = btn.closest('.block-wrap');
+      const anchor = wrap ? wrap.dataset.anchor : null;
+      const snapshot = wrap ? wrap.dataset.snapshot : rowId;
+      const statusEl = btn.closest('.review-row').querySelector('.review-status');
+      if (verdict === 'discuss' && wrap) {
+        const box = wrap.querySelector('.comment-box');
+        const ta = box && box.querySelector('textarea');
+        if (box && ta) {
+          box.classList.add('open');
+          ta.placeholder = 'Your thoughts on this recommendation…';
+          ta.focus();
+        }
+      }
+      btn.disabled = true;
+      try {
+        await postComment({
+          anchor,
+          snapshot,
+          text: `Review: ${verdict}`,
+          type: 'verdict',
+          row_id: rowId,
+          verdict
+        });
+      } catch (e) {
+        toast('Review post failed: ' + e.message);
+        btn.disabled = false;
+        return;
+      }
+      if (statusEl) statusEl.textContent = `✓ ${verdict}`;
+      if (verdict === 'agree' && window.__DISPATCH_TARGET__ === 'cursor') {
+        toast(`Agreed — staged for Grok (${rowId}). Click Send to Grok when ready.`);
+      } else {
+        toast(`Recorded: ${verdict} (${rowId})`);
+      }
+      loadThreadsIntoDOM();
+      btn.disabled = false;
+    });
+  });
+}
+
+function wirePublicFilmToggles() {
+  document.querySelectorAll('.public-film-toggle').forEach(input => {
+    input.addEventListener('change', async () => {
+      const testid = input.dataset.filmTestid;
+      const nextValue = input.checked;
+      input.disabled = true;
+      try {
+        const res = await fetch(`${API_BASE}/api/public-film`, {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ testid, public: nextValue })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || res.status);
+        toast(nextValue ? 'Film marked public.' : 'Film removed from public list.');
+      } catch (e) {
+        input.checked = !nextValue;
+        toast('Public-film update failed: ' + e.message);
+      }
+      input.disabled = false;
+    });
+  });
+}
+
 document.addEventListener('DOMContentLoaded', () => {
   wireBlockAffordances();
   wireEditableBlocks();
   wireEnterOpensComment();
   wireVerdictButtons();
+  wireReviewButtons();
+  wirePublicFilmToggles();
   loadThreadsIntoDOM();
 });
 """
@@ -1018,6 +1234,8 @@ def render_page(route_path, workspace=DEFAULT_WORKSPACE):
     # Every route in a workspace's own roots (or its nightly reports) is dispatchable.
     root_prefixes = tuple(f'{p}/' for p, _ in ws['roots'])
     has_dispatch = route_path.startswith(root_prefixes) or (ws['nightly'] and route_path.startswith(f'{NIGHTLY_PREFIX}/'))
+    dispatch_cfg = get_dispatch_config(route_path, workspace)
+    dispatch_button = dispatch_cfg['button'] if has_dispatch else ''
     # "Regenerate board" appears on the Board and Portfolio pages themselves
     # (both are generated by the same nightly job, so one button covers both).
     is_board_or_portfolio = route_path in ('estate/BOARD.md', 'estate/PORTFOLIO.md')
@@ -1051,7 +1269,7 @@ def render_page(route_path, workspace=DEFAULT_WORKSPACE):
 </nav>
 <main class="main">
   <div class="top-actions">
-    {'<button id="send-to-dee">Send to Dee</button>' if has_dispatch else ''}
+    {f'<button id="send-to-dee">{_html.escape(dispatch_button)}</button>' if has_dispatch else ''}
     {'<button id="regenerate-board">Regenerate board</button>' if is_board_or_portfolio else ''}
   </div>
   {blocks_html}
@@ -1066,7 +1284,9 @@ def render_page(route_path, workspace=DEFAULT_WORKSPACE):
   </div>
 </main>
 <div class="toast" id="toast"></div>
-<script>window.__ROUTE__ = {json.dumps(route_path)}; window.__API_BASE__ = {json.dumps(url_prefix)};</script>
+<script>window.__ROUTE__ = {json.dumps(route_path)}; window.__API_BASE__ = {json.dumps(url_prefix)};
+window.__DISPATCH_TARGET__ = {json.dumps(dispatch_cfg['target'])};
+window.__DISPATCH_BUTTON__ = {json.dumps(dispatch_cfg['button'])};</script>
 <script>{PAGE_JS}</script>
 {tour_body}
 </body>
@@ -1109,7 +1329,74 @@ def load_dispatch_template():
     return "Read the sidecar JSONL for page {page} and act on each comment."
 
 
+def run_cursor_dispatch(route_path, workspace=DEFAULT_WORKSPACE):
+    """Bundle staged review work for Grok in Cursor — not cc-dispatch."""
+    comments = read_comments(route_path, workspace)
+    prefix = workspace_url_prefix(workspace)
+
+    def persist(updated):
+        write_all_comments(route_path, updated, workspace)
+
+    rel_path, err, count = cursor_intake.file_intake_card(route_path, comments, persist, prefix)
+    if err:
+        raise RuntimeError(err)
+    return rel_path, count
+
+
+def run_rsi_dispatch(route_path, workspace=DEFAULT_WORKSPACE):
+    """File queued review comments as RSI Development Requests (workspace-scoped app routing)."""
+    comments = read_comments(route_path, workspace)
+
+    # Use workspace as app (playmaker -> 'playmaker', estate -> 'estate', etc.)
+    app_override = workspace if workspace != DEFAULT_WORKSPACE else None
+
+    # File one DR per queued comment
+    count = 0
+    for comment in comments:
+        if comment.get('status') not in ('queued', 'seen'):
+            continue
+        if comment.get('type') == 'edit':
+            continue  # Skip edit-type comments
+
+        narrative = comment.get('text', '')
+        dr_result = file_development_request(
+            route_path,
+            narrative,
+            workspace,
+            app_override=app_override
+        )
+        if not dr_result.get('error'):
+            count += 1
+            # Mark comment seen after filing
+            comment['status'] = 'seen'
+
+    if count > 0:
+        write_all_comments(route_path, comments, workspace)
+
+    return {
+        'target': 'rsi',
+        'dispatched_count': count,
+        'task_name': None,
+        'pid': None,
+    }
+
+
 def run_dispatch(route_path, workspace=DEFAULT_WORKSPACE):
+    cfg = get_dispatch_config(route_path, workspace)
+    if cfg['target'] == 'cursor':
+        card_path, dispatched_count = run_cursor_dispatch(route_path, workspace)
+        return {
+            'target': 'cursor',
+            'card_path': card_path,
+            'dispatched_count': dispatched_count,
+            'task_name': None,
+            'pid': None,
+        }
+
+    if cfg['target'] == 'rsi':
+        result = run_rsi_dispatch(route_path, workspace)
+        return result
+
     ws = get_workspace(workspace)
     fs_path = resolve_page(route_path, workspace)
     sidecar = sidecar_path(route_path, workspace)
@@ -1156,7 +1443,7 @@ def run_dispatch(route_path, workspace=DEFAULT_WORKSPACE):
         cwd=PROJECTS_ROOT,
         env=env,
     )
-    return task_name, proc.pid
+    return {'target': 'dee', 'task_name': task_name, 'pid': proc.pid, 'card_path': None}
 
 
 # --- Board / Portfolio regeneration -----------------------------------------
@@ -1171,25 +1458,26 @@ _PROJECT_META_RE = re.compile(r'\*\*Project:\*\*\s*([^·\n]+)')
 _ROUTER_CARD_RE = re.compile(r'->\s*board/inbox/(\S+)')
 
 
-def file_development_request(page, narrative, workspace=DEFAULT_WORKSPACE):
+def file_development_request(page, narrative, workspace=DEFAULT_WORKSPACE, app_override=None):
     """Quinn-tour "recommend changes" relay: write a Development Request
     (schema v1, rsi/README.md) into SOMA/rsi/requests/incoming/ and run the
     router synchronously (admin -> board card, idempotent per request-id).
-    app comes from the completion page's `**Project:**` meta field.
+    app comes from the completion page's `**Project:**` meta field, or app_override parameter.
     Returns {'file', 'app', 'card'?} or {'error': ...} — never raises."""
     try:
         fs_path = resolve_page(page, workspace)
-        app = ''
-        try:
-            with open(fs_path, 'r', encoding='utf-8') as f:
-                m = _PROJECT_META_RE.search(f.read())
-            if m:
-                # "playmaker + SOMA" / "SOMA (tools/monitoring)" -> first clean
-                # project token (the app field feeds card filenames downstream).
-                app = m.group(1).split('+')[0].strip().strip('*_ ').lower()
-                app = re.match(r'[a-z0-9_.-]*', app).group(0).rstrip('.-')
-        except OSError:
-            pass
+        app = app_override or ''
+        if not app:
+            try:
+                with open(fs_path, 'r', encoding='utf-8') as f:
+                    m = _PROJECT_META_RE.search(f.read())
+                if m:
+                    # "playmaker + SOMA" / "SOMA (tools/monitoring)" -> first clean
+                    # project token (the app field feeds card filenames downstream).
+                    app = m.group(1).split('+')[0].strip().strip('*_ ').lower()
+                    app = re.match(r'[a-z0-9_.-]*', app).group(0).rstrip('.-')
+            except OSError:
+                pass
         app = app or 'estate'
         req = {
             'app': app,
@@ -1385,7 +1673,8 @@ class Handler(BaseHTTPRequestHandler):
                 # an RSI Development Request (see below) that routes to a board card.
                 verdict = data.get('verdict')
                 if not page or verdict not in ('keep', 'restart', 'cancel', 'later',
-                                               'approve', 'recommend-changes'):
+                                               'approve', 'recommend-changes',
+                                               'agree', 'disagree', 'discuss', 'defer'):
                     self._send_json({'error': 'page and a valid verdict required'}, status=400)
                     return
                 row_id = (data.get('row_id') or '').strip()
@@ -1421,6 +1710,13 @@ class Handler(BaseHTTPRequestHandler):
                 comment['verdict'] = data.get('verdict')
                 comment['row_id'] = row_id
             append_comment(page, comment, workspace)
+            if ctype == 'verdict' and data.get('verdict') == 'agree':
+                if get_dispatch_config(page, workspace)['target'] == 'cursor':
+                    cursor_intake.refresh_staged_manifest(
+                        page,
+                        read_comments(page, workspace),
+                        workspace_url_prefix(workspace),
+                    )
             if ctype == 'verdict' and data.get('verdict') == 'recommend-changes':
                 # RSI loop relay: a recommend-changes verdict on a completion page
                 # becomes a Development Request (reporter.role=admin) in
@@ -1429,6 +1725,19 @@ class Handler(BaseHTTPRequestHandler):
                 # reported in the response, never blocks the verdict itself.
                 comment['_dr'] = file_development_request(page, text, workspace)
             self._send_json(comment, status=201)
+            return
+
+        if path == '/api/public-film':
+            data = self._read_json_body()
+            testid = (data.get('testid') or '').strip()
+            if not testid:
+                self._send_json({'error': 'testid required'}, status=400)
+                return
+            if 'public' not in data:
+                self._send_json({'error': 'public required'}, status=400)
+                return
+            manifest = update_public_film(testid, bool(data.get('public')))
+            self._send_json({'ok': True, 'testid': testid, 'public': manifest[testid]})
             return
 
         if path == '/api/comments/status':
@@ -1542,11 +1851,11 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({'error': 'unknown page'}, status=404)
                 return
             try:
-                task_name, pid = run_dispatch(page, workspace)
+                result = run_dispatch(page, workspace)
             except Exception as e:  # noqa: BLE001
                 self._send_json({'error': str(e)}, status=500)
                 return
-            self._send_json({'ok': True, 'task_name': task_name, 'pid': pid})
+            self._send_json({'ok': True, **result})
             return
 
         if path == '/api/board/regenerate':

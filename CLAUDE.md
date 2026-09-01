@@ -2,8 +2,8 @@
 district: soma-core
 status: active
 depends_on: [cc-dispatch]
-capabilities: [document-review, anchored-comments, local-collab-pages]
-last_reviewed: 2026-07-02
+capabilities: [document-review, sentence-marks, anchored-comments, local-collab-pages]
+last_reviewed: 2026-09-01
 ---
 
 # soma-review — v1 static VPS-feedback intake (`index.html`) PLUS v2 local interactive review server (`v2/`)
@@ -122,6 +122,34 @@ workspace. When the estate does its next morning review cycle, update `workspace
 `estate.home`/`estate.nav` to point at the new dated files (or generalize to a manifest — not
 done yet, see Gotchas).
 
+## Mark Layer review surface (2026-09-01)
+
+Ordinary document pages now use a document-first review instrument modeled on the Playmaker
+Mark Layer. The Markdown remains the primary surface: scrolling selects the sentence nearest
+38% of the viewport and a 1.2-second dwell records it as read. Keyboard marks are `A` agree
+(repeat up to x3), `?`/`/` clarify, `E` rewrite, `X` clear-and-rewrite/strike, `S`
+acknowledge, `N` note, and `J`/`K` next/previous. Section endings offer agree-all or a
+sentence-by-sentence walk. Ruling-shaped sections expose explicit Ratify / Not yet / Reject
+controls; an agree mark never implies a ruling.
+
+Paragraphs and blockquotes are split into sentence spans using Unicode code-point offsets in
+the durable normalized block coordinate system. A list stays one stable block but each
+rendered list item receives its own exact child range; tables, code, film, and other rich
+blocks fall back to one addressable block unit. This preserves the original rendering while
+making the review binding precise enough to survive edits through `blockmap.py` reconciliation.
+
+Marks queue in `localStorage` until explicitly sent, the weighted threshold reaches 9, the
+page is idle for 60 seconds, or the reviewer leaves. Weights are clarify 3; rewrite, strike,
+and note 2; agree 1; acknowledge 0.5; ruling 9. Composing or editing pauses idle/leave sends.
+Each mark is persisted through the existing comments endpoint with `type: "mark"`,
+`mark_kind`, `strength`, optional `scope`, `reason`, `proposed`, and `sent_because`; after a
+successful batch, a dispatchable page launches one review turn. Failed sends stay in browser
+storage. Deleted and unresolved rows retain the existing audit/recovery behavior.
+
+The surface is enabled by default and can be disabled per workspace with
+`"mark_layer": false`. Tour-bearing pages keep the purpose-built Quinn flow. The Board and
+Portfolio also retain their regenerate action inside the Mark Layer header.
+
 ## Edit-as-comment (2026-07-02)
 
 **Decision: contenteditable-per-block (textarea swap), not CodeMirror 6.** CM6 is
@@ -192,7 +220,9 @@ from heading-path + block-index + a hash of the first 40 chars of block text
 (`mdblocks.py::_make_anchor`) — stable across reloads of an unchanged doc; if the doc is
 edited, `snapshot` is what lets a human (or Claude) figure out what the comment was about even
 if the anchor no longer matches anything. `type` is `"comment"` (default, back-compat with
-pre-2026-07-02 rows that lack the field) or `"edit"` (suggested-edit, has `proposed`).
+pre-2026-07-02 rows that lack the field), `"edit"` (suggested-edit, has `proposed`),
+`"verdict"`, or `"mark"` (Mark Layer metadata described above). Stable-binding fields
+appended by Anchoring v2 are documented in that section below.
 
 ## Comment API
 
@@ -206,7 +236,9 @@ under `/w/<workspace>/...` for any other workspace.
 - `POST /api/comments` `{page, anchor, snapshot, text, author?, type?, proposed?}` → creates a
   new root comment, `status: "queued"`, `thread_id` = its own id, `deleted: false`. `type`
   defaults `"comment"`; pass `"edit"` with `proposed` set (and `snapshot` = the before-text)
-  for a suggested-edit. Returns the created object, `201`.
+  for a suggested-edit. Mark Layer passes `type: "mark"` plus `mark_kind`, stable range
+  fields, `strength`, and optional `scope`/`reason`/`proposed`/`sent_because`. Returns the
+  created object, `201`.
 - `POST /api/comments/update` `{page, id, text}` → edits an existing comment's `text` in
   place, sets `edited_at`. **Author-gated: only comments with `author == "mike"` are editable**
   via this endpoint (403 otherwise) — a dispatched worker's own replies aren't meant to be

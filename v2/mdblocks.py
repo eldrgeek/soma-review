@@ -95,6 +95,7 @@ _INLINE_LINK_RE = re.compile(r'\[([^\]]*)\]\(([^)]+)\)')
 _INLINE_CODE_RE = re.compile(r'`([^`]+)`')
 _BOLD_RE = re.compile(r'\*\*([^*]+)\*\*')
 _ITALIC_RE = re.compile(r'(?<!\*)\*([^*]+)\*(?!\*)')
+_UNDERSCORE_ITALIC_RE = re.compile(r'(?<!\w)_(?!_)(.+?)(?<!_)_(?!\w)')
 # Bare autolinks: a raw http(s) URL not already inside [label](...) markdown-link syntax.
 # Stops at whitespace or a small set of trailing punctuation/markup chars so it doesn't
 # swallow a following '**', ')', or sentence punctuation.
@@ -200,6 +201,7 @@ def render_inline(text, link_resolver=None):
     text = _esc(text)
     text = _BOLD_RE.sub(r'<strong>\1</strong>', text)
     text = _ITALIC_RE.sub(r'<em>\1</em>', text)
+    text = _UNDERSCORE_ITALIC_RE.sub(r'<em>\1</em>', text)
 
     # Placeholders can nest (a link's stashed HTML can itself contain a code-span
     # placeholder token, e.g. `[`file.md`](file.md)`), so a single forward pass isn't

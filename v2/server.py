@@ -61,6 +61,7 @@ def load_workspaces():
             'nightly': cfg.get('nightly', False),
             'nightly_filter': cfg.get('nightly_filter'),
             'tours': cfg.get('tours', False),
+            'mark_layer': cfg.get('mark_layer', True),
             'status_badges': cfg.get('status_badges', []),
             'dispatch_targets': cfg.get('dispatch_targets', {}),
         }
@@ -555,6 +556,148 @@ details.verification-group summary { cursor: pointer; color: #8a93a3; font-size:
                                       margin: 20px 0 8px; }
 """
 
+MARK_LAYER_CSS = r"""
+body.mark-layer {
+  --ml-paper:#FCFCFA; --ml-panel:#F3F3EF; --ml-ink:#1A1C22; --ml-graphite:#63666F;
+  --ml-rule:#DBDCD6; --ml-rule-soft:#E8E8E3; --ml-read:#EFEFE9;
+  --ml-blue:#27508C; --ml-blue-soft:#E7EDF6;
+  --ml-agree:#3B7358; --ml-clarify:#9A6A14; --ml-rewrite:#27508C;
+  --ml-strike:#AE352F; --ml-note:#5A4A8A; --ml-ruling:#27508C;
+  --ml-ack:#63666F; --ml-focus:#27508C;
+  background:var(--ml-paper); color:var(--ml-ink);
+}
+@media (prefers-color-scheme: dark) {
+  body.mark-layer {
+    --ml-paper:#16171C; --ml-panel:#1E2027; --ml-ink:#E5E4DE; --ml-graphite:#9A9DA6;
+    --ml-rule:#2E313A; --ml-rule-soft:#24272E; --ml-read:#1F2129;
+    --ml-blue:#8FB3E0; --ml-blue-soft:#1C2532;
+    --ml-agree:#7FBE9C; --ml-clarify:#D8AC5A; --ml-rewrite:#8FB3E0;
+    --ml-strike:#E08984; --ml-note:#B0A0DA; --ml-ruling:#8FB3E0;
+    --ml-ack:#9A9DA6; --ml-focus:#8FB3E0;
+  }
+}
+body.mark-layer .sidebar { background:var(--ml-panel); border-color:var(--ml-rule); }
+body.mark-layer .main {
+  max-width:47rem; padding:3.25rem 1.5rem 12rem;
+  font-family:Spectral,Georgia,serif; font-size:17px; line-height:1.65;
+  -webkit-font-smoothing:antialiased;
+}
+body.mark-layer .top-actions, body.mark-layer .page-discussion,
+body.mark-layer .comment-affordance, body.mark-layer .comment-box,
+body.mark-layer .comment-thread, body.mark-layer .edit-hint-label,
+body.mark-layer .document-title-block { display:none !important; }
+.review-doc-header { border-bottom:1px solid var(--ml-rule); padding-bottom:1.6rem; }
+.review-eyebrow { font-family:"IBM Plex Sans",system-ui,sans-serif; font-size:.688rem;
+  letter-spacing:.14em; text-transform:uppercase; color:var(--ml-graphite); font-weight:600; }
+.review-doc-header h1 { font-size:2.3rem; line-height:1.12; font-weight:600;
+  margin:.55rem 0 .6rem; letter-spacing:-.015em; text-wrap:balance; }
+.review-doc-header .review-sub { color:var(--ml-graphite); font-size:1rem; margin:0; max-width:36rem; }
+.review-gears { display:flex; flex-wrap:wrap; gap:.5rem; margin-top:1.3rem; }
+body.mark-layer .block-wrap { position:relative; padding:.8rem 0 .8rem 2.2rem;
+  border-radius:0; border-bottom:1px solid var(--ml-rule-soft); margin:0; }
+body.mark-layer .block-wrap:hover { background:transparent; }
+body.mark-layer .block-wrap[data-kind="heading"] { border-bottom:none; padding-bottom:.1rem; }
+body.mark-layer .block-wrap[data-kind="heading"] h1,
+body.mark-layer .block-wrap[data-kind="heading"] h2,
+body.mark-layer .block-wrap[data-kind="heading"] h3,
+body.mark-layer .block-wrap[data-kind="heading"] h4 {
+  font-family:"IBM Plex Sans",system-ui,sans-serif; font-size:.75rem; line-height:1.4;
+  letter-spacing:.14em; text-transform:uppercase; font-weight:600;
+  color:var(--ml-blue); margin:2rem 0 0;
+}
+body.mark-layer .block-body p { margin:0; }
+body.mark-layer .block-body.edit-hint { cursor:default; }
+body.mark-layer .block-body.edit-hint:hover { outline:none; }
+body.mark-layer .block-wrap.mark-decision .block-body > p,
+body.mark-layer .block-wrap.mark-decision .block-body > blockquote {
+  border-left:2px solid var(--ml-blue); padding-left:1rem; margin-left:-1rem;
+}
+.ml-gutter { position:absolute; left:0; top:.85rem; width:1.7rem;
+  font-family:"IBM Plex Mono",ui-monospace,monospace; font-size:.9rem; line-height:1.25;
+  display:flex; flex-direction:column; gap:.05rem; }
+.ml-decision-tag { font-family:"IBM Plex Sans",system-ui,sans-serif; font-size:.625rem;
+  letter-spacing:.1em; text-transform:uppercase; font-weight:600; color:var(--ml-blue);
+  background:var(--ml-blue-soft); padding:.14rem .4rem; display:inline-block; margin-bottom:.4rem; }
+.mark-sentence, .mark-block-unit { border-radius:1px; cursor:pointer; }
+.mark-sentence.ml-seen, .mark-block-unit.ml-seen { background:var(--ml-read); }
+.mark-sentence.ml-current, .mark-block-unit.ml-current {
+  background:var(--ml-blue-soft); box-shadow:0 0 0 2px var(--ml-blue-soft); }
+.mark-sentence.ml-struck, .mark-block-unit.ml-struck {
+  color:var(--ml-strike); text-decoration:line-through; }
+.mark-sentence del { color:var(--ml-strike); text-decoration-thickness:1px; }
+.mark-sentence ins { color:var(--ml-rewrite); text-decoration:none; border-bottom:1px solid var(--ml-rewrite); }
+.ml-glyph { font-family:"IBM Plex Mono",ui-monospace,monospace; font-size:.78em;
+  vertical-align:.15em; margin-right:.15em; letter-spacing:-.02em; }
+.ml-hint { font-family:"IBM Plex Sans",system-ui,sans-serif; font-size:.66rem;
+  letter-spacing:.08em; text-transform:uppercase; color:var(--ml-graphite); margin-top:.45rem; }
+.ml-hint b { color:var(--ml-ink); font-weight:600; }
+.ml-marks { display:flex; flex-direction:column; margin-top:.6rem; }
+.ml-mark { border-top:1px solid var(--ml-rule); padding:.55rem 0 .5rem;
+  font-family:"IBM Plex Sans",system-ui,sans-serif; font-size:.85rem; line-height:1.5; }
+.ml-mark .ml-who { font-size:.625rem; letter-spacing:.1em; text-transform:uppercase;
+  font-weight:600; display:flex; align-items:baseline; gap:.5rem; }
+.ml-mark .ml-body { margin-top:.25rem; white-space:pre-wrap; }
+.ml-mark .ml-quote { font-family:Spectral,Georgia,serif; font-size:.9rem;
+  color:var(--ml-graphite); border-left:2px solid var(--ml-rule);
+  padding-left:.6rem; margin-bottom:.35rem; }
+.ml-mark .ml-meta { font-family:"IBM Plex Mono",monospace; font-size:.6rem;
+  color:var(--ml-graphite); letter-spacing:0; }
+.ml-mark.ml-agree .ml-who { color:var(--ml-agree); }
+.ml-mark.ml-clarify .ml-who { color:var(--ml-clarify); }
+.ml-mark.ml-rewrite .ml-who { color:var(--ml-rewrite); }
+.ml-mark.ml-strike .ml-who { color:var(--ml-strike); }
+.ml-mark.ml-note .ml-who { color:var(--ml-note); }
+.ml-mark.ml-ruling .ml-who { color:var(--ml-ruling); }
+.ml-mark.ml-ack .ml-who { color:var(--ml-ack); }
+.ml-drop { background:none; border:none; color:var(--ml-graphite);
+  font-family:"IBM Plex Mono",monospace; font-size:.75rem; padding:0 .2rem; margin-left:auto; }
+.ml-drop:hover { color:var(--ml-strike); }
+.ml-section-end { display:flex; gap:.4rem; flex-wrap:wrap; align-items:center;
+  margin-top:.9rem; padding-top:.7rem; border-top:1px solid var(--ml-rule); }
+.ml-label { font-family:"IBM Plex Sans",system-ui,sans-serif; font-size:.625rem;
+  letter-spacing:.1em; text-transform:uppercase; font-weight:600;
+  color:var(--ml-graphite); margin-right:.2rem; }
+.ml-rulebar { display:flex; gap:.4rem; flex-wrap:wrap; margin-top:.7rem; align-items:center; }
+.ml-act { font-family:"IBM Plex Sans",system-ui,sans-serif; font-size:.7rem;
+  letter-spacing:.09em; text-transform:uppercase; font-weight:600; padding:.42rem .85rem;
+  border:1px solid var(--ml-ink); background:var(--ml-ink); color:var(--ml-paper); cursor:pointer; }
+.ml-act.ml-ghost { background:transparent; color:var(--ml-graphite); border-color:var(--ml-rule); }
+.ml-act.ml-ghost:hover { color:var(--ml-ink); border-color:var(--ml-ink); }
+.ml-act:focus-visible, .ml-composer textarea:focus-visible { outline:2px solid var(--ml-focus); outline-offset:2px; }
+.ml-composer { margin-top:.6rem; display:flex; flex-direction:column; gap:.45rem; }
+.ml-composer textarea { font-family:"IBM Plex Sans",system-ui,sans-serif; font-size:.9rem;
+  line-height:1.5; background:var(--ml-paper); color:var(--ml-ink);
+  border:1px solid var(--ml-rule); padding:.55rem .65rem; resize:vertical; width:100%; min-height:4rem; }
+.ml-composer.ml-edit textarea { min-height:5.5rem; font-family:Spectral,Georgia,serif; font-size:1rem; line-height:1.6; }
+.ml-composer-row { display:flex; gap:.4rem; align-items:center; flex-wrap:wrap; }
+.ml-legend { margin-top:2.25rem; padding-top:1rem; border-top:1px solid var(--ml-rule);
+  font-family:"IBM Plex Sans",system-ui,sans-serif; font-size:.74rem; color:var(--ml-graphite);
+  display:flex; flex-wrap:wrap; gap:.85rem 1.3rem; }
+.ml-legend code { font-family:"IBM Plex Mono",monospace; color:var(--ml-ink); }
+.ml-dock { position:fixed; left:260px; right:0; bottom:0; background:var(--ml-panel);
+  border-top:1px solid var(--ml-rule); padding:.7rem 1.25rem; z-index:20;
+  font-family:"IBM Plex Sans",system-ui,sans-serif; font-size:.78rem; color:var(--ml-graphite); }
+.ml-dock-inner { max-width:44rem; margin:0 auto; display:flex; gap:.85rem;
+  align-items:center; flex-wrap:wrap; }
+.ml-counter { display:flex; align-items:center; gap:.5rem; background:transparent;
+  border:1px solid var(--ml-rule); padding:.3rem .6rem; color:var(--ml-ink); }
+.ml-counter:hover { border-color:var(--ml-ink); }
+.ml-counter .ml-n { font-family:"IBM Plex Mono",monospace; font-weight:500; font-size:.95rem; }
+.ml-counter .ml-lb { font-size:.68rem; letter-spacing:.09em; text-transform:uppercase; color:var(--ml-graphite); }
+.ml-fill { flex:1; min-width:5rem; height:2px; background:var(--ml-rule); position:relative; }
+.ml-fill i { position:absolute; inset:0 auto 0 0; background:var(--ml-clarify); display:block; }
+.ml-trace { font-family:"IBM Plex Mono",monospace; font-size:.68rem; letter-spacing:0; }
+body.mark-layer .unresolved-marks { border-color:var(--ml-strike); background:transparent; }
+@media (max-width:760px) {
+  body.mark-layer { display:block; }
+  body.mark-layer .sidebar { position:relative; width:100%; height:auto; max-height:12rem; }
+  body.mark-layer .main { font-size:16px; }
+  .review-doc-header h1 { font-size:1.85rem; }
+  .ml-dock { left:0; }
+}
+"""
+
+
 PAGE_JS = r"""
 const ROUTE = window.__ROUTE__;
 const API_BASE = window.__API_BASE__ || '';
@@ -854,13 +997,15 @@ function blockPayload(el) {
 }
 
 async function postComment({anchor, snapshot, text, threadId, type, proposed, row_id, verdict,
-                            block_id, from, to, quote, block_text_sha}) {
+                            block_id, from, to, quote, block_text_sha, mark_kind, strength,
+                            scope, reason, sent_because}) {
   const res = await fetch(`${API_BASE}/api/comments`, {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({ page: ROUTE, anchor, snapshot, text, thread_id: threadId || null,
                             type: type || 'comment', proposed, row_id, verdict,
-                            block_id, from, to, quote, block_text_sha })
+                            block_id, from, to, quote, block_text_sha, mark_kind, strength,
+                            scope, reason, sent_because })
   });
   if (!res.ok) throw new Error('post failed: ' + res.status);
   const created = await res.json();
@@ -1184,6 +1329,13 @@ function wirePublicFilmToggles() {
 }
 
 document.addEventListener('DOMContentLoaded', () => {
+  if (window.__MARK_LAYER__ && typeof window.initMarkLayer === 'function') {
+    wireVerdictButtons();
+    wireReviewButtons();
+    wirePublicFilmToggles();
+    window.initMarkLayer();
+    return;
+  }
   wireBlockAffordances();
   wireEditableBlocks();
   wireEnterOpensComment();
@@ -1192,6 +1344,410 @@ document.addEventListener('DOMContentLoaded', () => {
   wirePublicFilmToggles();
   loadThreadsIntoDOM();
 });
+"""
+
+
+MARK_LAYER_JS = r"""
+window.initMarkLayer = function initMarkLayer() {
+  const K = {
+    agree:{glyph:'✓', label:'Agree', weight:1, color:'agree'},
+    clarify:{glyph:'?', label:'Clarify', weight:3, color:'clarify'},
+    rewrite:{glyph:'✎', label:'Rewrite', weight:2, color:'rewrite'},
+    strike:{glyph:'✗', label:'Strike', weight:2, color:'strike'},
+    note:{glyph:'✎', label:'Note', weight:2, color:'note'},
+    ack:{glyph:'•', label:'Acknowledged', weight:.5, color:'ack'},
+    ruling:{glyph:'§', label:'Ruling', weight:9, color:'ruling'}
+  };
+  const SEND_AT = 9;
+  const IDLE_MS = 60000;
+  const DWELL_READ = 1200;
+  const STORAGE_KEY = `soma-mark-layer:${API_BASE}:${ROUTE}`;
+  const blocks = Array.from(document.querySelectorAll('.block-wrap'));
+  const dock = document.getElementById('mark-layer-dock-inner');
+  let serverRows = [];
+  let pending = [];
+  let reading = {dwell:{}, furthest:null, last:null};
+  let current = null;
+  let composing = null;
+  let editing = null;
+  let sending = false;
+  let lastActivity = Date.now();
+  let lastTick = Date.now();
+
+  function uid() { return `ml_${Math.random().toString(36).slice(2,8)}${Date.now().toString(36).slice(-5)}`; }
+  function plain(html) { const d=document.createElement('div'); d.innerHTML=html; return d.textContent || ''; }
+  function decode(value) { try { return b64ToUtf8(value || ''); } catch (_) { return ''; } }
+  function encode(value) {
+    const bytes=new TextEncoder().encode(value||'');let binary='';
+    bytes.forEach(byte=>{binary+=String.fromCharCode(byte);});
+    return btoa(binary);
+  }
+  function hydrateRichUnits() {
+    blocks.forEach(wrap => {
+      const encoded=wrap.dataset.listUnits;
+      if(!encoded)return;
+      let listUnits=[];
+      try{listUnits=JSON.parse(decode(encoded));}catch(_){return;}
+      const items=Array.from(wrap.querySelectorAll('.block-body li'));
+      listUnits.forEach((unit,index)=>{
+        const item=items[index];if(!item)return;
+        item.classList.add('mark-block-unit');
+        item.dataset.from=unit.from;
+        item.dataset.to=unit.to;
+        item.dataset.quote=encode(unit.quote||'');
+      });
+    });
+  }
+  function units() { return Array.from(document.querySelectorAll('.mark-sentence,.mark-block-unit')); }
+  function unitMeta(el) {
+    const wrap = el.closest('.block-wrap');
+    const hasRange = el.dataset.from != null && el.dataset.to != null;
+    const from = hasRange ? Number(el.dataset.from) : 0;
+    const to = hasRange ? Number(el.dataset.to) : null;
+    const quote = hasRange ? decode(el.dataset.quote) : decode(wrap.dataset.normText);
+    return { el, wrap, blockId:wrap.dataset.blockId, from, to, quote,
+      key:`${wrap.dataset.blockId}:${from}:${to == null ? '' : to}` };
+  }
+  function metas() { return units().map(unitMeta); }
+  function currentMeta() { return metas().find(m => m.key === current) || null; }
+  function dwell(key) { return reading.dwell[key] || 0; }
+  function urgency() { return pending.reduce((sum,m) => sum + ((K[m.kind]||K.note).weight * (m.strength||1)), 0); }
+  function allMarks() { return serverRows.map(rowToMark).concat(pending); }
+  function rowToMark(c) {
+    let kind = 'note';
+    if (c.type === 'mark' && K[c.mark_kind]) kind = c.mark_kind;
+    else if (c.type === 'edit') kind = 'rewrite';
+    else if (c.type === 'verdict') kind = 'ruling';
+    return {
+      id:c.id, blockId:c.block_id || null, from:c.from, to:c.to,
+      quote:c.quote || c.snapshot || '', kind, author:c.author || 'mike',
+      body:c.text || '', before:c.before || c.snapshot || '', after:c.proposed || '',
+      reason:c.reason || '', strength:c.strength || 1, scope:c.scope || null,
+      sent:true, status:c.status || 'queued', deleted:!!c.deleted, unresolved:!!c.unresolved,
+      threadId:c.thread_id
+    };
+  }
+  function markAt(meta) {
+    return allMarks().filter(m => !m.deleted && !m.unresolved && m.blockId === meta.blockId
+      && Number(m.from || 0) === meta.from
+      && ((m.to == null && meta.to == null) || Number(m.to) === meta.to));
+  }
+  function blockMarks(blockId) { return allMarks().filter(m => !m.deleted && !m.unresolved && m.blockId === blockId); }
+  function sectionMarks(sectionId) {
+    return allMarks().filter(m => !m.deleted && !m.unresolved && m.blockId === sectionId && m.scope === 'section');
+  }
+  function save() {
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify({pending, reading, current, composing, editing})); } catch (_) {}
+  }
+  function restore() {
+    try {
+      const data = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}');
+      pending = Array.isArray(data.pending) ? data.pending : [];
+      reading = data.reading && data.reading.dwell ? data.reading : reading;
+      current = data.current || reading.last || null;
+      composing = data.composing || null;
+      editing = data.editing || null;
+    } catch (_) {}
+  }
+  function color(kind) { return `var(--ml-${(K[kind]||K.note).color})`; }
+  function glyph(mark) {
+    const def = K[mark.kind] || K.note;
+    return `<span class="ml-glyph ml-ui" style="color:${color(mark.kind)}" title="${escapeHtml(def.label)}">${def.glyph}${mark.strength>1?mark.strength:''}</span>`;
+  }
+
+  function render() {
+    document.querySelectorAll('.ml-ui').forEach(el => el.remove());
+    metas().forEach(meta => {
+      if (meta.el.dataset.mlOriginal == null) meta.el.dataset.mlOriginal = meta.el.innerHTML;
+      meta.el.innerHTML = meta.el.dataset.mlOriginal;
+      meta.el.classList.remove('ml-current','ml-seen','ml-struck');
+      if (dwell(meta.key) >= DWELL_READ) meta.el.classList.add('ml-seen');
+      if (meta.key === current) meta.el.classList.add('ml-current');
+      const marks = markAt(meta);
+      const rewrite = marks.filter(m => m.kind === 'rewrite' && m.after).pop();
+      if (rewrite) meta.el.innerHTML = `<del>${meta.el.dataset.mlOriginal}</del> <ins>${escapeHtml(rewrite.after)}</ins>`;
+      if (marks.some(m => m.kind === 'strike')) meta.el.classList.add('ml-struck');
+      if (marks.length) meta.el.insertAdjacentHTML('beforebegin', marks.map(glyph).join(''));
+    });
+
+    blocks.forEach(wrap => {
+      if (wrap.classList.contains('document-title-block')) return;
+      const marks = blockMarks(wrap.dataset.blockId);
+      const blockLevel = marks.filter(m => m.to == null || m.scope === 'section');
+      if (blockLevel.length) {
+        const gutter = document.createElement('div');
+        gutter.className = 'ml-gutter ml-ui';
+        gutter.innerHTML = blockLevel.map(glyph).join('');
+        wrap.appendChild(gutter);
+      }
+      if (wrap.dataset.decision === '1') renderDecision(wrap, marks);
+      if (marks.length) renderMarkRows(wrap, marks);
+      if (currentMeta() && currentMeta().wrap === wrap) {
+        const hint = document.createElement('div');
+        hint.className = 'ml-hint ml-ui';
+        hint.innerHTML = '<b>A</b> agree · <b>?</b> clarify · <b>E</b> edit · <b>X</b> clear &amp; rewrite · <b>S</b> ack · <b>N</b> note';
+        wrap.appendChild(hint);
+      }
+    });
+    renderSectionEnds();
+    renderUnresolved();
+    if (editing) mountEditor();
+    else if (composing) mountComposer();
+    renderDock();
+  }
+
+  function renderDecision(wrap, marks) {
+    const ruling = marks.filter(m => m.kind === 'ruling').pop();
+    const tag = document.createElement('span');
+    tag.className = 'ml-decision-tag ml-ui';
+    tag.textContent = ruling ? (ruling.body || 'Ruled') : 'Needs your ruling';
+    wrap.querySelector('.block-body').insertAdjacentElement('beforebegin', tag);
+    if (!ruling) {
+      const bar = document.createElement('div');
+      bar.className = 'ml-rulebar ml-ui';
+      bar.innerHTML = '<span class="ml-label">Your ruling</span>'+
+        `<button class="ml-act" data-ml-rule="Ratified" data-block="${wrap.dataset.blockId}">Ratify</button>`+
+        `<button class="ml-act ml-ghost" data-ml-rule="Not yet" data-block="${wrap.dataset.blockId}">Not yet</button>`+
+        `<button class="ml-act ml-ghost" data-ml-rule="Rejected" data-block="${wrap.dataset.blockId}">Reject</button>`;
+      wrap.appendChild(bar);
+    }
+  }
+
+  function renderMarkRows(wrap, marks) {
+    const host = document.createElement('div');
+    host.className = 'ml-marks ml-ui';
+    host.innerHTML = marks.filter(m => m.scope !== 'section').map(m => {
+      const def = K[m.kind] || K.note;
+      let body = m.body || '';
+      if (m.kind === 'rewrite') body = `→ ${m.after || body}${m.reason ? `\nR: ${m.reason}` : ''}`;
+      if (m.kind === 'strike') body = m.reason ? `struck\nR: ${m.reason}` : 'struck';
+      const quote = (m.to != null && m.quote && ['clarify','rewrite','strike','note'].includes(m.kind))
+        ? `<div class="ml-quote">on “${escapeHtml(m.quote)}”</div>` : '';
+      return `<div class="ml-mark ml-${m.kind}">${quote}<div class="ml-who">${escapeHtml(m.author || 'Mike')} · ${def.label}`+
+        `${m.strength>1?` ×${m.strength}`:''}<span class="ml-meta">${m.sent?(m.status||'sent'):'queued'}</span>`+
+        `<button class="ml-drop" data-ml-drop="${m.id}" data-pending="${m.sent?'0':'1'}" title="Remove">×</button></div>`+
+        `${body?`<div class="ml-body">${escapeHtml(body)}</div>`:''}</div>`;
+    }).join('');
+    wrap.appendChild(host);
+  }
+
+  function renderSectionEnds() {
+    const grouped = new Map();
+    blocks.forEach(w => {
+      const id = w.dataset.sectionId;
+      if (!id || w.classList.contains('document-title-block')) return;
+      if (!grouped.has(id)) grouped.set(id, []);
+      grouped.get(id).push(w);
+    });
+    grouped.forEach((sectionBlocks, sectionId) => {
+      const last = sectionBlocks.filter(w => w.dataset.kind !== 'heading').pop();
+      if (!last) return;
+      const agreed = sectionMarks(sectionId).filter(m => m.kind === 'agree').pop();
+      const bar = document.createElement('div');
+      bar.className = 'ml-section-end ml-ui';
+      bar.innerHTML = agreed
+        ? `<span class="ml-label" style="color:var(--ml-agree)">✓ Section agreed</span><span>${escapeHtml(agreed.body||'')}</span>`
+        : `<span class="ml-label">This section</span><button class="ml-act" data-ml-secagree="${sectionId}">Agree with all of it</button>`+
+          `<button class="ml-act ml-ghost" data-ml-secwalk="${sectionId}">Review sentence by sentence</button>`;
+      last.appendChild(bar);
+    });
+  }
+
+  function renderUnresolved() {
+    const section=document.getElementById('unresolved-marks');
+    const list=document.getElementById('unresolved-thread-list');
+    const count=document.getElementById('unresolved-count');
+    if(!section||!list||!count)return;
+    const rows=serverRows.map(rowToMark).filter(m=>m.unresolved&&!m.deleted);
+    count.textContent=rows.length;
+    section.hidden=!rows.length;
+    list.innerHTML=rows.map(m=>`<div class="unresolved-item"><div class="unresolved-location">Original location unavailable</div>`+
+      `<blockquote class="unresolved-quote">${escapeHtml(m.quote||m.before||'(no source quote)')}</blockquote>`+
+      `<div class="ml-who">${escapeHtml(m.author||'Mike')} · ${(K[m.kind]||K.note).label}</div>`+
+      `${m.body?`<div class="ml-body">${escapeHtml(m.body)}</div>`:''}</div>`).join('');
+  }
+
+  function currentHost() { const m=currentMeta(); return m && m.wrap; }
+  function mountComposer() {
+    const host = currentHost(); if (!host) return;
+    const c = document.createElement('div'); c.className='ml-composer ml-ui';
+    c.innerHTML = '<textarea aria-label="Note" placeholder="What about this sentence? Cmd/Control+Enter sends it."></textarea>'+
+      '<div class="ml-composer-row"><button class="ml-act" data-ml-save-note>Save note</button>'+
+      '<button class="ml-act ml-ghost" data-ml-cancel>Cancel</button></div>';
+    host.appendChild(c);
+    const ta=c.querySelector('textarea'); ta.value=composing.body||''; ta.focus();
+    ta.addEventListener('input',()=>{ composing.body=ta.value; lastActivity=Date.now(); save(); });
+    ta.addEventListener('keydown',e=>{
+      if (e.key==='Enter'&&(e.metaKey||e.ctrlKey)){e.preventDefault();saveNote();}
+      if (e.key==='Escape'){e.preventDefault();composing=null;save();render();}
+    });
+  }
+  function saveNote() {
+    if (composing && (composing.body||'').trim()) add({kind:'note',body:composing.body.trim()});
+    composing=null; save(); render();
+  }
+  function mountEditor() {
+    const host=currentHost(); if (!host) return;
+    const c=document.createElement('div'); c.className='ml-composer ml-edit ml-ui';
+    c.innerHTML='<textarea aria-label="Rewrite this sentence" placeholder="Rewrite it. Start a line with R: to give the reason."></textarea>'+
+      '<div class="ml-composer-row"><button class="ml-act" data-ml-save-edit>Save rewrite</button>'+
+      '<button class="ml-act ml-ghost" data-ml-strike>Strike without replacing</button>'+
+      '<button class="ml-act ml-ghost" data-ml-cancel>Cancel</button></div>';
+    host.appendChild(c);
+    const ta=c.querySelector('textarea'); ta.value=editing.text||''; ta.focus(); ta.setSelectionRange(ta.value.length,ta.value.length);
+    ta.addEventListener('input',()=>{editing.text=ta.value;lastActivity=Date.now();save();});
+    ta.addEventListener('keydown',e=>{
+      if(e.key==='Enter'&&(e.metaKey||e.ctrlKey)){e.preventDefault();saveEdit();}
+      if(e.key==='Escape'){e.preventDefault();editing=null;save();render();}
+    });
+  }
+  function saveEdit() {
+    if (!editing) return;
+    let after=(editing.text||'').trim(); let reason=''; const keep=[];
+    after.split('\n').forEach(line=>{/^\s*R:/i.test(line)?reason+=(reason?' ':'')+line.replace(/^\s*R:\s*/i,''):keep.push(line);});
+    after=keep.join('\n').trim();
+    if (!after) add({kind:'strike',reason});
+    else if (after !== editing.before) add({kind:'rewrite',before:editing.before,after,reason});
+    editing=null; save(); render();
+  }
+
+  function add(extra, explicitMeta) {
+    const meta=explicitMeta||currentMeta(); if (!meta && !extra.pageLevel) return;
+    if (extra.kind==='agree' && meta) {
+      const existing=pending.find(m=>m.kind==='agree'&&m.blockId===meta.blockId&&m.from===meta.from&&m.to===meta.to);
+      if(existing){existing.strength=Math.min(3,(existing.strength||1)+1);touch();render();return;}
+    }
+    pending.push(Object.assign({id:uid(),blockId:meta?meta.blockId:null,from:meta?meta.from:null,to:meta?meta.to:null,
+      quote:meta?meta.quote:null,author:'Mike',strength:1,scope:null,body:'',before:'',after:'',reason:'',sent:false,
+      ts:new Date().toISOString()},extra));
+    touch(); render();
+  }
+  function touch(){lastActivity=Date.now();save();maybeSend();}
+  function startEdit(clear){const meta=currentMeta();if(!meta)return;const before=plain(meta.el.dataset.mlOriginal||meta.el.innerHTML);
+    editing={before,text:clear?'':before};composing=null;save();render();}
+
+  function renderDock() {
+    if (!dock) return;
+    const count=pending.length, score=urgency(), pct=Math.min(100,Math.round(score/SEND_AT*100));
+    const seen=metas().filter(m=>dwell(m.key)>=DWELL_READ).length, total=metas().length;
+    const unread=blocks.filter(w=>w.dataset.decision==='1').filter(w=>{
+      const us=metas().filter(m=>m.wrap===w); return !us.some(m=>dwell(m.key)>=DWELL_READ);
+    }).length;
+    let bits=!count?'<span>Nothing queued.</span>':`<button class="ml-counter" id="ml-send"><span class="ml-n">${count}</span>`+
+      `<span class="ml-lb">${count===1?'mark':'marks'} — send</span></button><span class="ml-fill"><i style="width:${pct}%"></i></span>`+
+      `<span>${sending?'sending':`auto-sends at ${SEND_AT}`}</span>`;
+    bits+=`<span class="ml-trace">read ${seen}/${total}${unread?` · ${unread} ruling${unread===1?'':'s'} unread`:''}</span>`;
+    dock.innerHTML=bits;
+    const send=document.getElementById('ml-send'); if(send)send.addEventListener('click',()=>sendPending('you'));
+  }
+
+  async function sendPending(why) {
+    if(sending||!pending.length)return;
+    sending=true;renderDock();let sent=0;
+    for(const mark of [...pending]){
+      const wrap=mark.blockId?document.querySelector(`.block-wrap[data-block-id="${CSS.escape(mark.blockId)}"]`):null;
+      try{
+        await postComment({anchor:wrap?wrap.dataset.anchor:null,snapshot:mark.before||mark.quote||'(page-level mark)',
+          text:mark.body||`${(K[mark.kind]||K.note).label}${mark.reason?`: ${mark.reason}`:''}`,
+          type:'mark',proposed:mark.after||undefined,block_id:mark.blockId,from:mark.from,to:mark.to,
+          quote:mark.quote,block_text_sha:wrap?wrap.dataset.blockSha:null,mark_kind:mark.kind,
+          strength:mark.strength||1,scope:mark.scope,reason:mark.reason||undefined,sent_because:why});
+        pending=pending.filter(m=>m.id!==mark.id);sent++;save();
+      }catch(err){toast(`Could not send; ${pending.length} mark${pending.length===1?' is':'s are'} safe in this browser.`);break;}
+    }
+    if(sent && window.__HAS_DISPATCH__){
+      try{await fetch(`${API_BASE}/api/dispatch`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({page:ROUTE})});}
+      catch(_){toast('Marks were saved; dispatch can be retried from the page.');}
+    }
+    serverRows=await fetchComments();sending=false;render();
+    if(sent)toast(`Sent ${sent} mark${sent===1?'':'s'} as one review turn.`);
+  }
+  function maybeSend(){if(!sending&&urgency()>=SEND_AT)sendPending('threshold');}
+  setInterval(()=>{
+    if(!sending&&pending.length&&!composing&&!editing&&Date.now()-lastActivity>IDLE_MS)sendPending('idle');
+    renderDock();
+  },5000);
+  document.addEventListener('visibilitychange',()=>{
+    if(document.hidden&&!sending&&pending.length&&!composing&&!editing)sendPending('left the page');
+  });
+
+  function pick() {
+    const y=window.innerHeight*.38;let best=null,bestDistance=Infinity;
+    metas().forEach(meta=>{const r=meta.el.getBoundingClientRect();if(r.bottom<0||r.top>window.innerHeight)return;
+      const distance=Math.abs((r.top+r.bottom)/2-y);if(distance<bestDistance){bestDistance=distance;best=meta;}});
+    if(best&&best.key!==current){current=best.key;reading.last=current;const all=metas().map(m=>m.key);
+      if(all.indexOf(current)>all.indexOf(reading.furthest||''))reading.furthest=current;
+      save();if(!editing&&!composing)render();else renderDock();}
+  }
+  function tick(){const now=Date.now(),dt=now-lastTick;lastTick=now;if(!document.hidden&&current&&dt<2000)reading.dwell[current]=dwell(current)+dt;requestAnimationFrame(tick);}
+  function jump(){render();const meta=currentMeta();if(meta)meta.el.scrollIntoView({block:'center',behavior:'smooth'});}
+
+  document.addEventListener('click',async e=>{
+    const drop=e.target.closest('[data-ml-drop]');
+    if(drop){
+      if(drop.dataset.pending==='1'){pending=pending.filter(m=>m.id!==drop.dataset.mlDrop);save();render();}
+      else if(confirm('Remove this mark? It remains in the audit trail as deleted.')){
+        await fetch(`${API_BASE}/api/comments/delete`,{method:'POST',headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({page:ROUTE,id:drop.dataset.mlDrop})});serverRows=await fetchComments();render();
+      }return;
+    }
+    if(e.target.closest('[data-ml-save-note]')){saveNote();return;}
+    if(e.target.closest('[data-ml-save-edit]')){saveEdit();return;}
+    if(e.target.closest('[data-ml-strike]')){add({kind:'strike'},currentMeta());editing=null;save();render();return;}
+    if(e.target.closest('[data-ml-cancel]')){composing=null;editing=null;save();render();return;}
+    const rule=e.target.closest('[data-ml-rule]');
+    if(rule){const wrap=document.querySelector(`.block-wrap[data-block-id="${CSS.escape(rule.dataset.block)}"]`);
+      const meta={blockId:wrap.dataset.blockId,from:0,to:null,quote:decode(wrap.dataset.normText),wrap};
+      add({kind:'ruling',body:rule.dataset.mlRule},meta);return;}
+    const agree=e.target.closest('[data-ml-secagree]');
+    if(agree){const heading=document.querySelector(`.block-wrap[data-block-id="${CSS.escape(agree.dataset.mlSecagree)}"]`);
+      const sectionUnits=metas().filter(m=>m.wrap.dataset.sectionId===agree.dataset.mlSecagree);
+      const covered=sectionUnits.filter(m=>!markAt(m).length).length;
+      add({kind:'agree',scope:'section',body:`Agreed with the section — ${covered} unmarked sentence${covered===1?'':'s'} covered.`},
+        {blockId:heading.dataset.blockId,from:0,to:null,quote:decode(heading.dataset.normText),wrap:heading});return;}
+    const walk=e.target.closest('[data-ml-secwalk]');
+    if(walk){const first=metas().find(m=>m.wrap.dataset.sectionId===walk.dataset.mlSecwalk);
+      if(first){current=first.key;composing=null;editing=null;jump();}return;}
+    if(e.target.closest('button,a,input,textarea,select'))return;
+    const unit=e.target.closest('.mark-sentence,.mark-block-unit');
+    if(unit){current=unitMeta(unit).key;composing=null;editing=null;save();render();}
+  });
+  document.addEventListener('dblclick',e=>{const unit=e.target.closest('.mark-sentence,.mark-block-unit');if(!unit)return;
+    current=unitMeta(unit).key;startEdit(false);});
+  document.addEventListener('keydown',e=>{
+    if(['TEXTAREA','INPUT'].includes(e.target.tagName)||e.metaKey||e.ctrlKey||e.altKey)return;
+    const all=metas(),index=all.findIndex(m=>m.key===current),key=e.key.toLowerCase();
+    if(key==='j'||key==='k'){e.preventDefault();const next=key==='j'?Math.min(index+1,all.length-1):Math.max(index-1,0);
+      current=(all[next]||all[0]).key;composing=null;editing=null;jump();return;}
+    if(e.key==='Escape'){composing=null;editing=null;save();render();return;}
+    if(!currentMeta())return;
+    if(key==='a'){e.preventDefault();add({kind:'agree'});return;}
+    if(e.key==='?'||key==='/'){e.preventDefault();add({kind:'clarify',body:`Unclear: “${plain(currentMeta().el.dataset.mlOriginal||currentMeta().el.innerHTML).slice(0,120)}”`});return;}
+    if(key==='e'){e.preventDefault();startEdit(false);return;}
+    if(key==='x'){e.preventDefault();startEdit(true);return;}
+    if(key==='s'){e.preventDefault();add({kind:'ack'});return;}
+    if(key==='n'){e.preventDefault();composing={body:''};editing=null;save();render();}
+  });
+  let scrollFrame=null;window.addEventListener('scroll',()=>{if(scrollFrame)return;scrollFrame=requestAnimationFrame(()=>{scrollFrame=null;pick();});},{passive:true});
+
+  document.getElementById('ml-synthesis')?.addEventListener('click',()=>add({kind:'note',pageLevel:true,
+    body:'Synthesis pass: re-read the whole document as it now stands and tell me what it says.'},null));
+  document.getElementById('ml-reframe')?.addEventListener('click',()=>add({kind:'note',pageLevel:true,
+    body:'Step back and reframe: read everything at once and propose a different frame, not a patch.'},null));
+  document.getElementById('ml-jump-new')?.addEventListener('click',()=>{
+    const target=document.querySelector('.block-wrap.mark-decision,.unresolved-marks:not([hidden]),.block-wrap.has-comments');
+    if(target)target.scrollIntoView({block:'center',behavior:'smooth'});
+  });
+  document.getElementById('ml-regenerate')?.addEventListener('click',async e=>{
+    e.target.disabled=true;e.target.textContent='Regenerating…';
+    const res=await fetch(`${API_BASE}/api/board/regenerate`,{method:'POST'});
+    if(res.ok)location.reload();else{toast('Regeneration failed.');e.target.disabled=false;e.target.textContent='Regenerate board';}
+  });
+
+  hydrateRichUnits();
+  restore();
+  fetchComments().then(rows=>{serverRows=rows;render();pick();tick();}).catch(()=>{render();pick();tick();});
+};
 """
 
 
@@ -1264,13 +1820,112 @@ def wq_status_chip(block):
     return None
 
 
-def render_block_html(block, route_path, status_chip=None):
+_SENTENCE_ABBREVIATIONS = {
+    'mr', 'mrs', 'ms', 'dr', 'prof', 'sr', 'jr', 'st', 'vs', 'etc',
+    'e.g', 'i.e', 'no', 'fig', 'rev', 'sept', 'jan', 'feb', 'mar', 'apr',
+    'jun', 'jul', 'aug', 'oct', 'nov', 'dec',
+}
+
+
+def sentence_ranges(text):
+    """Split normalized block text into conservative sentence ranges.
+
+    Offsets are Unicode code-point offsets into ``blockmap.norm(text)`` — the
+    same coordinate system validated_binding() persists.  We deliberately keep
+    abbreviations and decimal/version dots together; a false negative merely
+    produces a slightly larger addressable unit, while a false positive makes a
+    sentence fragment feel broken in the reading instrument.
+    """
+    normalized = blockmap.norm(text)
+    if not normalized:
+        return []
+    ranges = []
+    start = 0
+    for match in re.finditer(r'[.!?](?:[\"\u201d\u2019)\]]+)?(?=\s+|$)', normalized):
+        end = match.end()
+        punct_at = match.start()
+        if normalized[punct_at] == '.':
+            prefix = normalized[start:punct_at]
+            token_match = re.search(r'([A-Za-z](?:[A-Za-z.]*)?)$', prefix)
+            token = (token_match.group(1).lower().rstrip('.') if token_match else '')
+            if token in _SENTENCE_ABBREVIATIONS or (len(token) == 1 and token.isalpha()):
+                continue
+            if (punct_at > 0 and punct_at + 1 < len(normalized)
+                    and normalized[punct_at - 1].isdigit()
+                    and normalized[punct_at + 1].isdigit()):
+                continue
+        quote = normalized[start:end].strip()
+        if quote:
+            quote_start = normalized.find(quote, start, end)
+            ranges.append((quote_start, quote_start + len(quote), quote))
+        start = end
+        while start < len(normalized) and normalized[start].isspace():
+            start += 1
+    if start < len(normalized):
+        quote = normalized[start:].strip()
+        if quote:
+            quote_start = normalized.find(quote, start)
+            ranges.append((quote_start, quote_start + len(quote), quote))
+    return ranges or [(0, len(normalized), normalized)]
+
+
+def list_item_ranges(text):
+    """Return exact normalized ranges for each visible Markdown list item.
+
+    Lists remain one durable block, while each rendered ``li`` becomes an
+    independently addressable review unit inside that block.
+    """
+    normalized = blockmap.norm(text)
+    ranges = []
+    cursor = 0
+    for line in text.splitlines():
+        match = re.match(r'^\s*(?:[-*+]|\d+\.)\s+(.*)$', line)
+        if not match:
+            continue
+        quote = blockmap.norm(match.group(1))
+        if not quote:
+            continue
+        start = normalized.find(quote, cursor)
+        if start < 0:
+            start = normalized.find(quote)
+        if start < 0:
+            continue
+        end = start + len(quote)
+        ranges.append((start, end, quote))
+        cursor = end
+    return ranges
+
+
+def mark_layer_inner(block, link_resolver=None):
+    """Render prose as sentence-addressable spans without disturbing rich blocks."""
+    kind = block['kind']
+    if kind == 'list':
+        block['mark_layer_list_units'] = [
+            {'from': start, 'to': end, 'quote': quote}
+            for start, end, quote in list_item_ranges(block['text'])
+        ]
+        return block['html'], bool(block['mark_layer_list_units'])
+    if kind not in ('paragraph', 'blockquote'):
+        return block['html'], False
+    pieces = []
+    for start, end, quote in sentence_ranges(block['text']):
+        quote_b64 = __import__('base64').b64encode(quote.encode('utf-8')).decode('ascii')
+        pieces.append(
+            f'<span class="mark-sentence" data-from="{start}" data-to="{end}" '
+            f'data-quote="{quote_b64}">{render_inline(quote, link_resolver)}</span>'
+        )
+    content = ' '.join(pieces)
+    tag = 'blockquote' if kind == 'blockquote' else 'p'
+    return f'<{tag}>{content}</{tag}>', True
+
+
+def render_block_html(block, route_path, status_chip=None, link_resolver=None):
     kind = block['kind']
     anchor = block['anchor']
     block_id = _html_attr_escape(block['id'])
     block_sha = _html_attr_escape(blockmap.block_text_sha(block))
     snapshot = _html_attr_escape(block['snapshot'])
-    inner = block['html']
+    inner, has_sentence_units = mark_layer_inner(block, link_resolver)
     # Raw markdown source, base64'd, so the client can swap rendered HTML for an
     # editable <textarea> pre-filled with the exact source text (edit-as-comment,
     # see v2/CLAUDE.md "CM6 vs contenteditable" note). Base64 sidesteps any HTML/JS
@@ -1278,12 +1933,22 @@ def render_block_html(block, route_path, status_chip=None):
     import base64 as _b64
     source_b64 = _b64.b64encode(block['text'].encode('utf-8')).decode('ascii')
     norm_b64 = _b64.b64encode(blockmap.norm(block['text']).encode('utf-8')).decode('ascii')
+    list_units = block.get('mark_layer_list_units') or []
+    list_units_b64 = _b64.b64encode(
+        json.dumps(list_units, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+    ).decode('ascii') if list_units else ''
     # code/table/film blocks are excluded from click-to-edit — their raw source has
     # internal structure (fences, pipes, JSON) that's easy to corrupt via a flat
     # textarea edit and low-value to inline-edit anyway; they still get the comment
     # affordance (film comments are exactly the "notes to the videographer" mechanism).
     editable = kind not in ('code', 'table', 'film')
     edit_cls = ' edit-eligible' if editable else ''
+    title_cls = (' document-title-block' if kind == 'heading' and block.get('level') == 1
+                 and block.get('index') == 0 else '')
+    decision = bool(block.get('mark_layer_decision'))
+    decision_cls = ' mark-decision' if decision else ''
+    section_id = _html_attr_escape(block.get('mark_layer_section_id') or '')
+    section_title = _html_attr_escape(block.get('mark_layer_section_title') or '')
     if status_chip:
         # Inline chip at the head of the item's first line. Item blocks are
         # paragraphs, so splice inside the opening <p>; anchors/snapshots/
@@ -1294,9 +1959,11 @@ def render_block_html(block, route_path, status_chip=None):
             inner = '<p>' + chip_html + inner[len('<p>'):]
         else:
             inner = chip_html + inner
-    return f'''<div class="block-wrap{edit_cls}" data-block-id="{block_id}" data-block-sha="{block_sha}" data-norm-text="{norm_b64}" data-anchor="{anchor}" data-snapshot="{snapshot}" data-kind="{kind}" data-source="{source_b64}">
+    unit_cls = ' mark-block-unit' if not has_sentence_units and kind != 'heading' else ''
+    list_units_attr = f' data-list-units="{list_units_b64}"' if list_units_b64 else ''
+    return f'''<div class="block-wrap{edit_cls}{title_cls}{decision_cls}" data-block-id="{block_id}" data-block-sha="{block_sha}" data-norm-text="{norm_b64}" data-anchor="{anchor}" data-snapshot="{snapshot}" data-kind="{kind}" data-source="{source_b64}" data-section-id="{section_id}" data-section-title="{section_title}" data-decision="{'1' if decision else '0'}"{list_units_attr}>
   <button class="comment-affordance" title="Comment on this block (Enter)">+</button>
-  <div class="block-body"{' tabindex="0"' if editable else ''}>{inner}</div>
+  <div class="block-body{unit_cls}"{' tabindex="0"' if editable else ''}>{inner}</div>
   <div class="comment-box">
     <textarea placeholder="Comment on this block... (Enter to save, Shift+Enter for newline)"></textarea>
     <button class="mic-btn" type="button" title="Dictate">&#127908;</button>
@@ -1419,9 +2086,40 @@ def render_page(route_path, workspace=DEFAULT_WORKSPACE):
     )
     title = title or route_path
 
+    # Sentence-level review rides on the durable block map.  A heading starts a
+    # section; prose below it inherits that heading's stable id.  "Needs Mike" /
+    # ruling-shaped sections become explicit decision blocks, matching the
+    # artifact's rule that a ruling is never inferred from an agree mark.
+    current_section_id = ''
+    current_section_title = ''
+    decision_section = False
+    heading_decision_terms = re.compile(
+        r'\b(needs mike|needs your ruling|decision(?:s)?(?: needed)?|ruling(?:s)?|approval(?:s)?)\b',
+        re.I,
+    )
+    block_decision_terms = re.compile(
+        r"\b(needs mike|needs your ruling|mike(?:\u2019s|'s)? (?:decision|ruling|approval))\b",
+        re.I,
+    )
+    for block in blocks:
+        if block['kind'] == 'heading':
+            current_section_id = block['id']
+            current_section_title = blockmap.norm(block['text'])
+            decision_section = bool(heading_decision_terms.search(current_section_title))
+        block['mark_layer_section_id'] = current_section_id
+        block['mark_layer_section_title'] = current_section_title
+        block['mark_layer_decision'] = (
+            block['kind'] != 'heading'
+            and (decision_section or bool(block_decision_terms.search(blockmap.norm(block['text'])[:160])))
+        )
+
     badges_on = route_path in (ws.get('status_badges') or [])
     blocks_html = '\n'.join(
-        render_block_html(b, route_path, status_chip=(wq_status_chip(b) if badges_on else None))
+        render_block_html(
+            b, route_path,
+            status_chip=(wq_status_chip(b) if badges_on else None),
+            link_resolver=resolver,
+        )
         for b in blocks)
     # trailing newline keeps flagged-page head formatting tidy; empty string on
     # non-flagged pages keeps their rendered HTML byte-identical to pre-feature.
@@ -1448,27 +2146,66 @@ def render_page(route_path, workspace=DEFAULT_WORKSPACE):
         except Exception as e:  # noqa: BLE001 — a tour bug must never break page render
             sys.stderr.write(f'[tours] asset build failed for {route_path}: {e}\n')
 
+    # Tour-bearing pages keep their purpose-built Quinn review flow.  Every
+    # other document uses the sentence-level mark layer by default; workspaces
+    # can opt out while migrating with `"mark_layer": false`.
+    mark_layer = bool(ws.get('mark_layer', True)) and not bool(tour_body)
+    body_class = ' class="mark-layer"' if mark_layer else ''
+    mark_fonts = ('<link rel="preconnect" href="https://fonts.googleapis.com">\n'
+                  '<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>\n'
+                  '<link rel="stylesheet" href="https://fonts.googleapis.com/css2?'
+                  'family=Spectral:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&'
+                  'family=IBM+Plex+Sans:wght@400;500;600&display=swap">') if mark_layer else ''
+    review_header = ''
+    mark_legend = ''
+    mark_dock = ''
+    if mark_layer:
+        eyebrow = f'{ws["label"]} · {os.path.basename(route_path)}'
+        regen = ('<button class="ml-act ml-ghost" id="ml-regenerate">Regenerate board</button>'
+                 if is_board_or_portfolio else '')
+        review_header = f'''<header class="review-doc-header">
+    <div class="review-eyebrow">{_html.escape(eyebrow)}</div>
+    <h1>{_html.escape(title)}</h1>
+    <p class="review-sub">Scroll and the current sentence highlights. <b>A</b> agree · <b>?</b> clarify · <b>E</b> edit · <b>X</b> clear &amp; rewrite · <b>S</b> acknowledge · <b>N</b> note. Marks gather at the bottom and travel as review turns.</p>
+    <div class="review-gears">
+      <button class="ml-act ml-ghost" id="ml-synthesis">Ask for a synthesis pass</button>
+      <button class="ml-act ml-ghost" id="ml-reframe">Step back and reframe</button>
+      <button class="ml-act ml-ghost" id="ml-jump-new">Jump to what’s new</button>
+      {regen}
+    </div>
+  </header>'''
+        mark_legend = '''<div class="ml-legend">
+    <span><code>A</code> agree (press again for emphasis)</span><span><code>?</code> clarify</span>
+    <span><code>E</code> edit</span><span><code>X</code> clear &amp; rewrite</span>
+    <span><code>S</code> acknowledge</span><span><code>N</code> note</span>
+    <span><code>J/K</code> next/previous sentence</span>
+  </div>'''
+        mark_dock = '<div class="ml-dock" id="mark-layer-dock"><div class="ml-dock-inner" id="mark-layer-dock-inner"></div></div>'
+
     html_doc = f"""<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{_html.escape(title)} — soma-review</title>
-<style>{PAGE_CSS}</style>
+{mark_fonts}
+<style>{PAGE_CSS}{MARK_LAYER_CSS if mark_layer else ''}</style>
 {chip_head}{tour_head}
 </head>
-<body>
+<body{body_class}>
 <nav class="sidebar">
   <a href="{url_prefix}/page/{ws['home']}" style="font-weight:700;font-size:15px;color:#e6e6e6;">soma-review</a>
   {render_workspace_switcher(workspace)}
   {render_sidebar(route_path, workspace)}
 </nav>
 <main class="main">
+  {review_header}
   <div class="top-actions">
     {f'<button id="send-to-dee">{_html.escape(dispatch_button)}</button>' if has_dispatch else ''}
     {'<button id="regenerate-board">Regenerate board</button>' if is_board_or_portfolio else ''}
   </div>
   {blocks_html}
+  {mark_legend}
   <section class="unresolved-marks" id="unresolved-marks" hidden>
     <h2>Unresolved marks (<span id="unresolved-count">0</span>)</h2>
     <p class="unresolved-explainer">Their source text moved or disappeared. Nothing was discarded.</p>
@@ -1487,9 +2224,12 @@ def render_page(route_path, workspace=DEFAULT_WORKSPACE):
 <div class="toast" id="toast"></div>
 <script>window.__ROUTE__ = {json.dumps(route_path)}; window.__API_BASE__ = {json.dumps(url_prefix)};
 window.__DISPATCH_TARGET__ = {json.dumps(dispatch_cfg['target'])};
-window.__DISPATCH_BUTTON__ = {json.dumps(dispatch_cfg['button'])};</script>
+window.__DISPATCH_BUTTON__ = {json.dumps(dispatch_cfg['button'])};
+window.__MARK_LAYER__ = {json.dumps(mark_layer)}; window.__HAS_DISPATCH__ = {json.dumps(has_dispatch)};</script>
 <script>{PAGE_JS}</script>
+{f'<script>{MARK_LAYER_JS}</script>' if mark_layer else ''}
 {tour_body}
+{mark_dock}
 </body>
 </html>"""
     return html_doc
@@ -1855,10 +2595,25 @@ class Handler(BaseHTTPRequestHandler):
             data = self._read_json_body()
             page = data.get('page', '')
             ctype = data.get('type', 'comment')
-            if ctype not in ('comment', 'edit', 'verdict'):
+            if ctype not in ('comment', 'edit', 'verdict', 'mark'):
                 self._send_json({'error': 'invalid type'}, status=400)
                 return
-            if ctype == 'edit':
+            if ctype == 'mark':
+                mark_kind = data.get('mark_kind')
+                if mark_kind not in ('agree', 'clarify', 'rewrite', 'strike',
+                                     'note', 'ack', 'ruling'):
+                    self._send_json({'error': 'invalid mark_kind'}, status=400)
+                    return
+                if not page:
+                    self._send_json({'error': 'page required for mark'}, status=400)
+                    return
+                text = (data.get('text') or '').strip() or mark_kind.title()
+                try:
+                    strength = max(0.5, min(3.0, float(data.get('strength', 1))))
+                except (TypeError, ValueError):
+                    self._send_json({'error': 'invalid mark strength'}, status=400)
+                    return
+            elif ctype == 'edit':
                 # Edit-as-comment: {type: "edit", anchor, snapshot (before), proposed (after)}.
                 # `text` is auto-derived (short label) if not supplied so existing render
                 # paths that expect a `text` field still have something sane to show.
@@ -1913,6 +2668,17 @@ class Handler(BaseHTTPRequestHandler):
             }
             if ctype == 'edit':
                 comment['proposed'] = data.get('proposed')
+            if ctype == 'mark':
+                comment['mark_kind'] = mark_kind
+                comment['strength'] = strength
+                if data.get('scope') in ('section', 'page'):
+                    comment['scope'] = data.get('scope')
+                if data.get('reason'):
+                    comment['reason'] = str(data.get('reason'))
+                if data.get('proposed') is not None:
+                    comment['proposed'] = data.get('proposed')
+                if data.get('sent_because'):
+                    comment['sent_because'] = str(data.get('sent_because'))
             if ctype == 'verdict':
                 comment['verdict'] = data.get('verdict')
                 comment['row_id'] = row_id

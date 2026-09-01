@@ -39,6 +39,9 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 
+import blockmap
+from mdblocks import parse_markdown
+
 PROJECTS_ROOT = os.path.expanduser('~/Projects')
 ESTATE_MD = os.path.join(PROJECTS_ROOT, 'ESTATE.md')
 AUDITS_DIR = os.path.join(PROJECTS_ROOT, 'SOMA', 'audits')
@@ -54,6 +57,7 @@ BOARD_INBOX = os.path.join(PROJECTS_ROOT, 'SOMA', 'board', 'inbox')
 BOARD_INBOX_PROCESSED = os.path.join(BOARD_INBOX, 'processed')
 COMPLETIONS_DIR = os.path.join(PROJECTS_ROOT, '_estate', 'completions')
 OUT_PATH = os.path.join(PROJECTS_ROOT, '_estate', 'BOARD.md')
+WORKSPACES_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'workspaces.json')
 
 WINDOW_HOURS = 48
 
@@ -191,17 +195,75 @@ def diff_memory_index():
 
 # --- Stream 4: open review comments ------------------------------------------
 
+def _route_source(page, workspace):
+    if not page or '/' not in page:
+        return None
+    try:
+        with open(WORKSPACES_CONFIG, 'r', encoding='utf-8') as handle:
+            config = json.load(handle)[workspace]
+    except (OSError, ValueError, KeyError):
+        return None
+    prefix, rest = page.split('/', 1)
+    for route_prefix, relative_root in config.get('roots', []):
+        if route_prefix == prefix:
+            candidate = os.path.normpath(os.path.join(PROJECTS_ROOT, relative_root, rest))
+            root = os.path.normpath(os.path.join(PROJECTS_ROOT, relative_root))
+            if candidate.startswith(root + os.sep) and os.path.isfile(candidate):
+                return candidate
+    return None
+
+
+def _is_unresolved(row, page, workspace, sidecar, cache):
+    if not any(row.get(key) is not None for key in ('block_id', 'anchor', 'quote')):
+        return False
+    key = (page, workspace)
+    if key not in cache:
+        source = _route_source(page, workspace)
+        if not source:
+            cache[key] = None
+        else:
+            with open(source, 'rb') as handle:
+                src_bytes = handle.read()
+            _title, blocks = parse_markdown(src_bytes.decode('utf-8'))
+            map_path = re.sub(r'\.jsonl$', '.blocks.json', sidecar)
+            try:
+                mapping = blockmap.load_map(map_path) or {}
+            except (OSError, ValueError):
+                mapping = {}
+            records = mapping.get('blocks') or []
+            if (mapping.get('source_sha256') == blockmap.source_sha256(src_bytes)
+                    and len(records) == len(blocks)):
+                for block, record in zip(blocks, records):
+                    if blockmap.fingerprint(block) == blockmap.fingerprint(record):
+                        block['id'] = record['id']
+            old_by_id = {
+                record.get('id'): record
+                for record in records + list(mapping.get('retired') or [])
+                if record.get('id')
+            }
+            cache[key] = (blocks, old_by_id)
+    state = cache[key]
+    if state is None:
+        return True
+    outcome = blockmap.resolve(row, state[0], state[1])
+    return outcome['status'] != 'bound'
+
+
 def scan_open_comments():
     """Walk every workspace's feedback dir for *.jsonl sidecars, count comments
     with status in (queued, seen) and not deleted. Returns list of
-    (page_route, workspace_guess, open_count) plus a grand total."""
+    (page_route, workspace_guess, open_count, unresolved_count) plus both totals."""
     if not os.path.isdir(REVIEW_FEEDBACK_ROOT):
-        return [], 0
+        return [], 0, 0
     results = []
     total = 0
+    unresolved_total = 0
+    page_cache = {}
     for path in sorted(glob.glob(os.path.join(REVIEW_FEEDBACK_ROOT, '**', '*.jsonl'), recursive=True)):
         open_count = 0
+        unresolved_count = 0
         page = None
+        rows = []
         with open(path, 'r', encoding='utf-8') as f:
             for line in f:
                 line = line.strip()
@@ -212,20 +274,25 @@ def scan_open_comments():
                 except json.JSONDecodeError:
                     continue
                 page = row.get('page', page)
-                if row.get('deleted'):
-                    continue
-                if row.get('status') in ('queued', 'seen'):
-                    open_count += 1
-        if open_count:
-            rel = os.path.relpath(path, REVIEW_FEEDBACK_ROOT)
+                rows.append(row)
+        rel = os.path.relpath(path, REVIEW_FEEDBACK_ROOT)
+        parts = rel.split(os.sep)
+        workspace = parts[0] if len(parts) > 1 else 'estate'
+        for row in rows:
+            if row.get('deleted') or row.get('status') not in ('queued', 'seen'):
+                continue
+            if _is_unresolved(row, page or row.get('page'), workspace, path, page_cache):
+                unresolved_count += 1
+            else:
+                open_count += 1
+        if open_count or unresolved_count:
             # workspace = subdir if nested, else 'estate' (root sidecars are the
             # estate workspace's back-compat no-subdir location).
-            parts = rel.split(os.sep)
-            workspace = parts[0] if len(parts) > 1 else 'estate'
-            results.append((page or rel, workspace, open_count))
+            results.append((page or rel, workspace, open_count, unresolved_count))
             total += open_count
-    results.sort(key=lambda t: t[2], reverse=True)
-    return results, total
+            unresolved_total += unresolved_count
+    results.sort(key=lambda t: (t[2] + t[3], t[3]), reverse=True)
+    return results, total, unresolved_total
 
 
 # --- Stream 5: status lines ----------------------------------------------------
@@ -436,7 +503,7 @@ def render_done_today_strip(todays_completions):
 
 
 def render_board(changelog_entries, audit_files, memory_changes,
-                  open_comments, open_comments_total, hygiene_status,
+                  open_comments, open_comments_total, unresolved_comments_total, hygiene_status,
                   freshness_summary, inbox_cards, recent_needs_mike_cards,
                   todays_completions):
     lines = []
@@ -463,9 +530,14 @@ def render_board(changelog_entries, audit_files, memory_changes,
     lines.append('')
     needs_mike_items = []
 
-    for page, workspace, count in open_comments:
+    for page, workspace, count, unresolved_count in open_comments:
+        pieces = []
+        if count:
+            pieces.append(f"{count} open comment{'s' if count != 1 else ''}")
+        if unresolved_count:
+            pieces.append(f"{unresolved_count} unresolved mark{'s' if unresolved_count != 1 else ''}")
         needs_mike_items.append(
-            f"- **{count} open comment{'s' if count != 1 else ''}** on `{page}` "
+            f"- **{' · '.join(pieces)}** on `{page}` "
             f"(workspace: {workspace}) — [open]({_page_link(page, workspace)})"
         )
 
@@ -545,6 +617,7 @@ def render_board(changelog_entries, audit_files, memory_changes,
             lines.append(f'  - _...and {len(audit_files) - 15} more._')
     lines.append(f'- Memory index lines added/changed: {len(memory_changes)}')
     lines.append(f'- Open review comments (queued/seen): {open_comments_total} across {len(open_comments)} page(s)')
+    lines.append(f'- Unresolved review marks: {unresolved_comments_total}')
     lines.append(f'- Board inbox cards processed this run: {len(inbox_cards)}')
     lines.append('')
 
@@ -562,8 +635,8 @@ def main():
     changelog_entries = safe(parse_estate_changelog, [], 'ESTATE.md changelog parse')
     audit_files = safe(scan_recent_audits, [], 'audits scan')
     memory_changes = safe(diff_memory_index, [], 'memory index diff')
-    open_comments, open_comments_total = safe(
-        scan_open_comments, ([], 0), 'open comments scan'
+    open_comments, open_comments_total, unresolved_comments_total = safe(
+        scan_open_comments, ([], 0, 0), 'open comments scan'
     )
     hygiene_status = safe(read_hygiene_status, None, 'hygiene status read')
     freshness_summary = safe(read_freshness_summary, None, 'freshness summary')
@@ -575,7 +648,7 @@ def main():
 
     board_md = render_board(
         changelog_entries, audit_files, memory_changes,
-        open_comments, open_comments_total, hygiene_status,
+        open_comments, open_comments_total, unresolved_comments_total, hygiene_status,
         freshness_summary, inbox_cards, recent_needs_mike_cards,
         todays_completions,
     )
@@ -589,6 +662,7 @@ def main():
     print(f'  recent audits: {len(audit_files)}')
     print(f'  memory changes: {len(memory_changes)}')
     print(f'  open comments: {open_comments_total} across {len(open_comments)} page(s)')
+    print(f'  unresolved marks: {unresolved_comments_total}')
     print(f'  inbox cards processed: {len(inbox_cards)}')
     print(f'  needs-mike cards still in 48h window: {len(recent_needs_mike_cards)}')
     print(f"  completions dated today: {len(todays_completions)}")

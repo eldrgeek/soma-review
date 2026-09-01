@@ -22,6 +22,9 @@ import html as _html
 import hashlib
 import json
 import os
+import unicodedata
+
+from blockmap import norm
 
 
 PROJECTS_ROOT = os.path.expanduser('~/Projects')
@@ -218,6 +221,7 @@ def _make_anchor(heading_path, index, text):
 
 def parse_markdown(src, link_resolver=None):
     """Return (title, blocks) where blocks is a list of dicts (see module docstring)."""
+    src = unicodedata.normalize('NFC', src)
     lines = src.split('\n')
     blocks = []
     heading_stack = []  # list of (level, text)
@@ -366,6 +370,7 @@ def parse_markdown(src, link_resolver=None):
     for b in blocks:
         b['anchor'] = _make_anchor(b['heading_path'], b['index'], b['text'])
         b['snapshot'] = b['text'][:80]
+        b['norm_text'] = norm(b['text'])
 
     return title, blocks
 

@@ -22,6 +22,7 @@ from urllib.parse import urlparse, parse_qs, unquote
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mdblocks import parse_markdown, render_inline  # noqa: E402
+import blockmap  # noqa: E402
 import tours as tour_engine  # noqa: E402  (Quinn tours of completed jobs — see tours.py)
 import cursor_intake  # noqa: E402  (Grok/Cursor intake — see SOMA/cursor-intake/README.md)
 
@@ -290,7 +291,7 @@ def make_link_resolver(current_fs_path, current_route, workspace=DEFAULT_WORKSPA
 
 # --- Comment sidecar storage ------------------------------------------
 
-_lock = threading.Lock()
+_process_lock = threading.Lock()
 
 
 def sidecar_path(route_path, workspace=DEFAULT_WORKSPACE):
@@ -298,49 +299,72 @@ def sidecar_path(route_path, workspace=DEFAULT_WORKSPACE):
     return os.path.join(ws['feedback_dir'], page_slug(route_path) + '.jsonl')
 
 
-def read_comments(route_path, workspace=DEFAULT_WORKSPACE):
-    path = sidecar_path(route_path, workspace)
+def block_map_path(route_path, workspace=DEFAULT_WORKSPACE):
+    ws = get_workspace(workspace)
+    return os.path.join(ws['feedback_dir'], page_slug(route_path) + '.blocks.json')
+
+
+def _read_comments_unlocked(path):
     if not os.path.isfile(path):
         return []
     out = []
     with open(path, 'r', encoding='utf-8') as f:
-        for line in f:
+        for line_number, line in enumerate(f, start=1):
             line = line.strip()
             if not line:
                 continue
             try:
                 out.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
+            except json.JSONDecodeError as exc:
+                sys.stderr.write(f'[comments] malformed row {path}:{line_number}: {exc}\n')
     return out
+
+
+def read_comments(route_path, workspace=DEFAULT_WORKSPACE):
+    path = sidecar_path(route_path, workspace)
+    with blockmap.file_lock(path, exclusive=False):
+        return _read_comments_unlocked(path)
+
+
+def _write_all_comments_unlocked(path, comments):
+    payload = ''.join(json.dumps(c, ensure_ascii=False) + '\n' for c in comments).encode('utf-8')
+    blockmap.atomic_write(path, payload)
 
 
 def write_all_comments(route_path, comments, workspace=DEFAULT_WORKSPACE):
     path = sidecar_path(route_path, workspace)
-    tmp = path + '.tmp'
-    with open(tmp, 'w', encoding='utf-8') as f:
-        for c in comments:
-            f.write(json.dumps(c, ensure_ascii=False) + '\n')
-    os.replace(tmp, path)
+    with blockmap.file_lock(path):
+        _write_all_comments_unlocked(path, comments)
 
 
 def append_comment(route_path, comment, workspace=DEFAULT_WORKSPACE):
-    with _lock:
-        path = sidecar_path(route_path, workspace)
-        with open(path, 'a', encoding='utf-8') as f:
-            f.write(json.dumps(comment, ensure_ascii=False) + '\n')
+    path = sidecar_path(route_path, workspace)
+    with blockmap.file_lock(path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        needs_guard = False
+        if os.path.isfile(path) and os.path.getsize(path):
+            with open(path, 'rb') as existing:
+                existing.seek(-1, os.SEEK_END)
+                needs_guard = existing.read(1) != b'\n'
+        with open(path, 'ab') as f:
+            if needs_guard:
+                f.write(b'\n')
+            f.write((json.dumps(comment, ensure_ascii=False) + '\n').encode('utf-8'))
+            f.flush()
+            os.fsync(f.fileno())
 
 
 def update_comment(route_path, comment_id, patch, workspace=DEFAULT_WORKSPACE):
-    with _lock:
-        comments = read_comments(route_path, workspace)
+    path = sidecar_path(route_path, workspace)
+    with blockmap.file_lock(path):
+        comments = _read_comments_unlocked(path)
         found = False
         for c in comments:
             if c.get('id') == comment_id:
                 c.update(patch)
                 found = True
         if found:
-            write_all_comments(route_path, comments, workspace)
+            _write_all_comments_unlocked(path, comments)
         return found
 
 
@@ -365,7 +389,7 @@ def write_public_films(data):
 
 
 def update_public_film(testid, is_public):
-    with _lock:
+    with _process_lock:
         data = read_public_films()
         data[testid] = bool(is_public)
         write_public_films(data)
@@ -456,6 +480,15 @@ hr { border: none; border-top: 1px solid #2b3140; margin: 24px 0; }
 .diff-del { background: #4a1f24; color: #f0a3ab; text-decoration: line-through; padding: 0 2px; border-radius: 2px; }
 .diff-ins { background: #1f4a2a; color: #9cf0ac; padding: 0 2px; border-radius: 2px; }
 .comment-item.is-edit { border-left: 3px solid #a89cf0; }
+.unresolved-marks { margin: 32px 0 18px; padding: 18px; border: 1px solid #a56b35;
+  border-radius: 10px; background: rgba(165,107,53,.09); }
+.unresolved-marks h2 { margin-top: 0; color: #efb36f; }
+.unresolved-explainer { color: #aeb6c3; margin-top: -4px; }
+.unresolved-item { margin: 12px 0; padding: 12px; border-left: 3px solid #d89452;
+  background: rgba(10,13,18,.45); }
+.unresolved-quote { margin: 0 0 8px; padding: 8px 10px; white-space: pre-wrap;
+  color: #e4d1b9; background: rgba(0,0,0,.22); border-radius: 5px; }
+.unresolved-location { color: #8f98a8; font-size: 11px; margin-bottom: 6px; }
 .comment-item .comment-actions { float: right; display: flex; gap: 6px; }
 .comment-item .comment-actions button { background: none; border: none; color: #8a93a3; cursor: pointer;
                                           font-size: 12px; padding: 0 3px; }
@@ -659,11 +692,25 @@ function isCursorDispatched(c) {
 async function loadThreadsIntoDOM() {
   const comments = await fetchComments();
   const visible = comments.filter(c => !isCursorDispatched(c));
+  const blockElements = Array.from(document.querySelectorAll('.block-wrap'));
+  const blockIds = new Set(blockElements.map(el => el.dataset.blockId));
+  const anchors = new Set(blockElements.map(el => el.dataset.anchor));
+  const byBlockId = {};
   const byAnchor = {};
   const pageLevel = [];
+  const unresolved = [];
   for (const c of visible) {
-    if (!c.anchor) { pageLevel.push(c); continue; }
-    (byAnchor[c.anchor] = byAnchor[c.anchor] || []).push(c);
+    if (c.unresolved) { unresolved.push(c); continue; }
+    if (c.block_id && blockIds.has(c.block_id)) {
+      (byBlockId[c.block_id] = byBlockId[c.block_id] || []).push(c);
+      continue;
+    }
+    if (c.anchor && anchors.has(c.anchor)) {
+      (byAnchor[c.anchor] = byAnchor[c.anchor] || []).push(c);
+      continue;
+    }
+    if (!c.block_id && !c.anchor && !c.quote) { pageLevel.push(c); continue; }
+    unresolved.push(c);
   }
 
   // Pre-mark verdict-row status from the most recent verdict comment for that
@@ -698,9 +745,12 @@ async function loadThreadsIntoDOM() {
       statusEl.textContent = `✓ ${v.verdict}`;
     }
   });
-  document.querySelectorAll('.block-wrap').forEach(el => {
+  let renderedNonDeleted = 0;
+  blockElements.forEach(el => {
+    const blockId = el.dataset.blockId;
     const anchor = el.dataset.anchor;
-    const list = (byAnchor[anchor] || []).filter(c => !c.deleted || c.author === 'mike');
+    const list = [...(byBlockId[blockId] || []), ...(byAnchor[anchor] || [])]
+      .filter(c => !c.deleted || c.author === 'mike');
     const threadEl = el.querySelector('.comment-thread');
     threadEl.innerHTML = '';
     if (list.length) {
@@ -712,6 +762,7 @@ async function loadThreadsIntoDOM() {
         el.appendChild(pill);
       }
       pill.textContent = list.filter(c => !c.deleted).length || list.length;
+      renderedNonDeleted += list.filter(c => !c.deleted).length;
       list.sort((a,b) => a.timestamp.localeCompare(b.timestamp))
           .forEach(c => threadEl.appendChild(renderCommentItem(c)));
     } else {
@@ -724,6 +775,32 @@ async function loadThreadsIntoDOM() {
   pageThread.innerHTML = '';
   pageLevel.sort((a,b) => a.timestamp.localeCompare(b.timestamp))
             .forEach(c => pageThread.appendChild(renderCommentItem(c)));
+
+  const unresolvedSection = document.getElementById('unresolved-marks');
+  const unresolvedList = document.getElementById('unresolved-thread-list');
+  const unresolvedVisible = unresolved.filter(c => !c.deleted || c.author === 'mike');
+  unresolvedList.innerHTML = '';
+  unresolvedVisible.sort((a,b) => a.timestamp.localeCompare(b.timestamp)).forEach(c => {
+    const wrap = document.createElement('div');
+    wrap.className = 'unresolved-item';
+    const path = Array.isArray(c.heading_path) ? c.heading_path.join(' › ') : '';
+    wrap.innerHTML = `<div class="unresolved-location">${escapeHtml(path || 'Original location unavailable')}</div>`
+      + `<blockquote class="unresolved-quote">${escapeHtml(c.quote || c.snapshot || '(no source quote)')}</blockquote>`;
+    wrap.appendChild(renderCommentItem(c));
+    unresolvedList.appendChild(wrap);
+  });
+  const unresolvedCount = unresolved.filter(c => !c.deleted).length;
+  document.getElementById('unresolved-count').textContent = unresolvedCount;
+  unresolvedSection.hidden = unresolvedVisible.length === 0;
+
+  const nonDeleted = comments.filter(c => !c.deleted).length;
+  const hidden = comments.filter(c => !c.deleted && isCursorDispatched(c)).length;
+  const pageCount = pageLevel.filter(c => !c.deleted).length;
+  if (renderedNonDeleted + pageCount + unresolvedCount + hidden !== nonDeleted) {
+    console.error('mark render invariant failed', {
+      renderedNonDeleted, pageCount, unresolvedCount, hidden, nonDeleted
+    });
+  }
 
   updateCursorSentBanner(sentRecCount);
 }
@@ -765,12 +842,25 @@ function updateCursorSentBanner(sentRecCount) {
   }
 }
 
-async function postComment({anchor, snapshot, text, threadId, type, proposed, row_id, verdict}) {
+function blockPayload(el) {
+  if (!el) return {block_id: null, from: null, to: null, quote: null, block_text_sha: null};
+  return {
+    block_id: el.dataset.blockId,
+    from: 0,
+    to: null,
+    quote: b64ToUtf8(el.dataset.normText),
+    block_text_sha: el.dataset.blockSha,
+  };
+}
+
+async function postComment({anchor, snapshot, text, threadId, type, proposed, row_id, verdict,
+                            block_id, from, to, quote, block_text_sha}) {
   const res = await fetch(`${API_BASE}/api/comments`, {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({ page: ROUTE, anchor, snapshot, text, thread_id: threadId || null,
-                            type: type || 'comment', proposed, row_id, verdict })
+                            type: type || 'comment', proposed, row_id, verdict,
+                            block_id, from, to, quote, block_text_sha })
   });
   if (!res.ok) throw new Error('post failed: ' + res.status);
   const created = await res.json();
@@ -841,7 +931,7 @@ function enterEditMode(el, body) {
     if (commit && after.trim() !== before.trim()) {
       await postComment({
         anchor: el.dataset.anchor, snapshot: before, proposed: after,
-        text: 'Suggested edit', type: 'edit',
+        text: 'Suggested edit', type: 'edit', ...blockPayload(el),
       });
       toast('Edit proposed — saved as a comment.');
       loadThreadsIntoDOM();
@@ -893,7 +983,8 @@ function wireBlockAffordances() {
     const save = async () => {
       const text = ta.value.trim();
       if (!text) return;
-      await postComment({ anchor: el.dataset.anchor, snapshot: el.dataset.snapshot, text });
+      await postComment({ anchor: el.dataset.anchor, snapshot: el.dataset.snapshot, text,
+                          ...blockPayload(el) });
       ta.value = '';
       box.classList.remove('open');
       toast('Comment saved.');
@@ -913,7 +1004,8 @@ function wireBlockAffordances() {
     const save = async () => {
       const text = ta.value.trim();
       if (!text) return;
-      await postComment({ anchor: null, snapshot: '(page-level)', text });
+      await postComment({ anchor: null, snapshot: '(page-level)', text,
+                          block_id: null, from: null, to: null, quote: null, block_text_sha: null });
       ta.value = '';
       toast('Comment saved.');
       loadThreadsIntoDOM();
@@ -1005,7 +1097,8 @@ function wireVerdictButtons() {
       const statusEl = btn.closest('.verdict-row').querySelector('.verdict-status');
       btn.disabled = true;
       try {
-        await postComment({ anchor, snapshot, text: `Verdict: ${verdict}`, type: 'verdict', row_id: rowId, verdict });
+        await postComment({ anchor, snapshot, text: `Verdict: ${verdict}`, type: 'verdict', row_id: rowId, verdict,
+                            ...blockPayload(wrap) });
       } catch (e) {
         toast('Verdict post failed: ' + e.message);
         btn.disabled = false;
@@ -1046,7 +1139,8 @@ function wireReviewButtons() {
           text: `Review: ${verdict}`,
           type: 'verdict',
           row_id: rowId,
-          verdict
+          verdict,
+          ...blockPayload(wrap)
         });
       } catch (e) {
         toast('Review post failed: ' + e.message);
@@ -1173,6 +1267,8 @@ def wq_status_chip(block):
 def render_block_html(block, route_path, status_chip=None):
     kind = block['kind']
     anchor = block['anchor']
+    block_id = _html_attr_escape(block['id'])
+    block_sha = _html_attr_escape(blockmap.block_text_sha(block))
     snapshot = _html_attr_escape(block['snapshot'])
     inner = block['html']
     # Raw markdown source, base64'd, so the client can swap rendered HTML for an
@@ -1181,6 +1277,7 @@ def render_block_html(block, route_path, status_chip=None):
     # string-escaping edge cases in doc text (backticks, quotes, newlines).
     import base64 as _b64
     source_b64 = _b64.b64encode(block['text'].encode('utf-8')).decode('ascii')
+    norm_b64 = _b64.b64encode(blockmap.norm(block['text']).encode('utf-8')).decode('ascii')
     # code/table/film blocks are excluded from click-to-edit — their raw source has
     # internal structure (fences, pipes, JSON) that's easy to corrupt via a flat
     # textarea edit and low-value to inline-edit anyway; they still get the comment
@@ -1197,7 +1294,7 @@ def render_block_html(block, route_path, status_chip=None):
             inner = '<p>' + chip_html + inner[len('<p>'):]
         else:
             inner = chip_html + inner
-    return f'''<div class="block-wrap{edit_cls}" data-anchor="{anchor}" data-snapshot="{snapshot}" data-kind="{kind}" data-source="{source_b64}">
+    return f'''<div class="block-wrap{edit_cls}" data-block-id="{block_id}" data-block-sha="{block_sha}" data-norm-text="{norm_b64}" data-anchor="{anchor}" data-snapshot="{snapshot}" data-kind="{kind}" data-source="{source_b64}">
   <button class="comment-affordance" title="Comment on this block (Enter)">+</button>
   <div class="block-body"{' tabindex="0"' if editable else ''}>{inner}</div>
   <div class="comment-box">
@@ -1213,14 +1310,113 @@ def _html_attr_escape(s):
     return (s.replace('&', '&amp;').replace('"', '&quot;').replace('<', '&lt;').replace('>', '&gt;'))
 
 
+def reconcile_parsed_page(route_path, workspace, src_bytes, blocks):
+    """Attach durable ids and reconcile sidecar rows under cross-process locks."""
+    map_path = block_map_path(route_path, workspace)
+    comments_path = sidecar_path(route_path, workspace)
+    with blockmap.file_lock(map_path):
+        with blockmap.file_lock(comments_path):
+            old_map = blockmap.load_map(map_path)
+            comments = _read_comments_unlocked(comments_path)
+            new_map, updated_comments, report = blockmap.reconcile(
+                old_map, src_bytes, blocks, comments
+            )
+            if report.get('changed') or old_map is None:
+                blockmap.save_map(map_path, new_map)
+            if updated_comments != comments:
+                _write_all_comments_unlocked(comments_path, updated_comments)
+
+    render_records = new_map.get('blocks') or []
+    if len(render_records) != len(blocks):
+        render_records = [
+            {'id': 'transient_' + hashlib.sha256(
+                src_bytes + str(index).encode('ascii')
+            ).hexdigest()[:24], 'text': blockmap.norm(block['text'])}
+            for index, block in enumerate(blocks)
+        ]
+    for block, record in zip(blocks, render_records):
+        block['id'] = record['id']
+        block['norm_text'] = record['text']
+    return new_map, report
+
+
+def current_page_blocks(route_path, workspace=DEFAULT_WORKSPACE):
+    fs_path = resolve_page(route_path, workspace)
+    with open(fs_path, 'rb') as handle:
+        src_bytes = handle.read()
+    _title, blocks = parse_markdown(src_bytes.decode('utf-8'))
+    mapping, report = reconcile_parsed_page(route_path, workspace, src_bytes, blocks)
+    return src_bytes, blocks, mapping, report
+
+
+class BindingConflict(Exception):
+    pass
+
+
+def validated_binding(route_path, workspace, candidate):
+    """Validate client/thread anchoring against the current parse.
+
+    A stale id is accepted only when the carried quote resolves exactly and
+    uniquely.  The returned fields are safe to persist as a schema-v2 mark.
+    """
+    src_bytes, blocks, mapping, report = current_page_blocks(route_path, workspace)
+    has_location = any(candidate.get(key) is not None
+                       for key in ('block_id', 'anchor', 'quote'))
+    if not has_location:
+        return {
+            'schema': 2, 'block_id': None, 'from': None, 'to': None,
+            'quote': None, 'origin_quote': None, 'block_text_sha': None,
+            'heading_path': None, 'source_sha': blockmap.source_sha256(src_bytes),
+            'unresolved': False,
+        }
+    if report.get('blocked'):
+        raise BindingConflict('source parse is temporarily unsafe: ' + report['blocked'])
+
+    old_by_id = {}
+    for row in list(mapping.get('blocks') or []) + list(mapping.get('retired') or []):
+        if row.get('id'):
+            old_by_id[row['id']] = row
+    outcome = blockmap.resolve(candidate, blocks, old_by_id)
+    if outcome['status'] != 'bound':
+        raise BindingConflict(outcome['reason'])
+    block = outcome['block']
+    start, end = outcome['from'], outcome['to']
+    text = blockmap.norm(block['text'])
+    quote = text if end is None else text[start:end]
+    supplied_id = candidate.get('block_id')
+    fields = {
+        'schema': 2,
+        'block_id': block['id'],
+        'from': start,
+        'to': end,
+        'quote': quote,
+        'origin_quote': candidate.get('origin_quote') or quote,
+        'block_text_sha': blockmap.block_text_sha(block),
+        'heading_path': list(block.get('heading_path') or []),
+        'source_sha': blockmap.source_sha256(src_bytes),
+        'unresolved': False,
+        'quote_verified_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+    }
+    if supplied_id and supplied_id != block['id']:
+        fields['reanchored'] = True
+    if candidate.get('from') is not None and candidate.get('to') is not None:
+        if (candidate.get('from'), candidate.get('to')) != (start, end):
+            fields['offsets_repaired'] = True
+    return fields
+
+
 def render_page(route_path, workspace=DEFAULT_WORKSPACE):
     ws = get_workspace(workspace)
     url_prefix = workspace_url_prefix(workspace)
     fs_path = resolve_page(route_path, workspace)
-    with open(fs_path, 'r', encoding='utf-8') as f:
-        src = f.read()
+    with open(fs_path, 'rb') as f:
+        src_bytes = f.read()
+    src = src_bytes.decode('utf-8')
     resolver = make_link_resolver(fs_path, route_path, workspace)
     title, blocks = parse_markdown(src, link_resolver=resolver)
+    _new_map, reconcile_report = reconcile_parsed_page(
+        route_path, workspace, src_bytes, blocks
+    )
     title = title or route_path
 
     badges_on = route_path in (ws.get('status_badges') or [])
@@ -1273,6 +1469,11 @@ def render_page(route_path, workspace=DEFAULT_WORKSPACE):
     {'<button id="regenerate-board">Regenerate board</button>' if is_board_or_portfolio else ''}
   </div>
   {blocks_html}
+  <section class="unresolved-marks" id="unresolved-marks" hidden>
+    <h2>Unresolved marks (<span id="unresolved-count">0</span>)</h2>
+    <p class="unresolved-explainer">Their source text moved or disappeared. Nothing was discarded.</p>
+    <div id="unresolved-thread-list"></div>
+  </section>
   <div class="page-discussion">
     <h2>Page discussion</h2>
     <div id="page-thread-list"></div>
@@ -1624,6 +1825,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == '/api/comments':
             page = qs.get('page', [''])[0]
             try:
+                if page:
+                    current_page_blocks(page, workspace)
                 self._send_json(read_comments(page, workspace))
             except NotFoundError:
                 self._send_json({'error': 'unknown workspace'}, status=404)
@@ -1685,9 +1888,12 @@ class Handler(BaseHTTPRequestHandler):
                     self._send_json({'error': 'page and text required'}, status=400)
                     return
             try:
-                resolve_page(page, workspace)
+                binding = validated_binding(page, workspace, data)
             except NotFoundError:
                 self._send_json({'error': 'unknown page'}, status=404)
+                return
+            except BindingConflict as exc:
+                self._send_json({'error': str(exc), 'unresolved': True}, status=409)
                 return
             comment_id = str(uuid.uuid4())
             thread_id = data.get('thread_id') or comment_id
@@ -1703,6 +1909,7 @@ class Handler(BaseHTTPRequestHandler):
                 'status': 'queued',
                 'thread_id': thread_id,
                 'deleted': False,
+                **binding,
             }
             if ctype == 'edit':
                 comment['proposed'] = data.get('proposed')
@@ -1821,10 +2028,28 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({'error': 'unknown page'}, status=404)
                 return
             reply_id = str(uuid.uuid4())
-            # anchor/snapshot copied from the first comment in the thread, if found
+            # Re-resolve the thread root against the current parse.  A reply never
+            # blindly inherits a stale anchor.
             existing = [c for c in read_comments(page, workspace) if c.get('thread_id') == thread_id]
-            anchor = existing[0]['anchor'] if existing else None
-            snapshot = existing[0]['snapshot'] if existing else ''
+            root = existing[0] if existing else {}
+            anchor = root.get('anchor')
+            snapshot = root.get('snapshot', '')
+            try:
+                binding = validated_binding(page, workspace, root)
+            except BindingConflict as exc:
+                binding = {
+                    'schema': 2,
+                    'block_id': root.get('block_id'),
+                    'from': root.get('from'),
+                    'to': root.get('to'),
+                    'quote': root.get('quote') or root.get('snapshot'),
+                    'origin_quote': root.get('origin_quote') or root.get('quote') or root.get('snapshot'),
+                    'block_text_sha': root.get('block_text_sha'),
+                    'heading_path': root.get('heading_path'),
+                    'source_sha': root.get('source_sha'),
+                    'unresolved': True,
+                    'unresolved_reason': str(exc),
+                }
             comment = {
                 'id': reply_id,
                 'page': page,
@@ -1837,6 +2062,7 @@ class Handler(BaseHTTPRequestHandler):
                 'status': data.get('status', 'seen'),
                 'thread_id': thread_id,
                 'deleted': False,
+                **binding,
             }
             append_comment(page, comment, workspace)
             self._send_json(comment, status=201)

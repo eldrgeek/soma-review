@@ -615,6 +615,35 @@ new tab on legends-membership.netlify.app → 3-step cross-page product tour,
 zero page errors. Evidence: `_estate/evidence/quinn-tours/DEMO-*.png`;
 receipts: `_estate/completions/2026-07-03-demo-tour-verdict-flow.md`.
 
+## Anchoring v2: stable block identities + preserved unresolved marks (2026-09-01)
+
+Comments no longer depend on renderer-order anchors. `v2/blockmap.py` maintains one
+`<page>.blocks.json` identity ledger beside each JSONL sidecar. Rendered blocks expose an
+opaque `data-block-id`; a mark stores that id plus code-point offsets, the exact normalized
+quote, and the block-text hash. Reconciliation keeps identities through ordinary edits and
+moves, remaps offsets, and verifies the quote before rendering. If verification cannot be
+proved, the mark is retained with `unresolved: true` and shown in the page's **Unresolved
+marks** section. Never attach an uncertain mark to a merely nearby block.
+
+Storage operations share stable `.lock` files and use atomic replacement for read-modify-write
+paths. Comment creation validates bindings server-side: a stale id with one unique exact quote
+is repaired; an absent or ambiguous quote returns HTTP 409 and writes nothing. Dispatch omits
+unresolved marks and identifies attached marks by opaque id, heading path, and exact quote.
+
+Migration is `python3 v2/migrate_to_v2.py --dry-run` followed, with the launchd service stopped,
+by `python3 v2/migrate_to_v2.py`. It is idempotent and takes an exclusive pristine backup of each
+sidecar as `<name>.jsonl.pre-v2.<utc>.bak`. The 2026-09-01 live migration preserved all 49 rows:
+16 bound by existing anchor, 6 recovered from a unique snapshot prefix, 13 retained unresolved,
+and 14 page-level rows unchanged. Eleven block maps and eleven backups were created.
+
+Rollback: stop `com.mikewolf.soma-review`, restore each `.pre-v2.*.bak`, remove the corresponding
+`.blocks.json` files, revert the anchoring code, and restart. Restored v1 anchors may themselves
+be stale if source markdown changed after the backup.
+
+Known limit: `_estate/BOARD.md` is regenerated from scratch. Content matching cannot guarantee
+identity for rows that disappear or change substantially; those marks remain visible and may
+reattach when their exact text returns. Generator-emitted semantic ids are the future fix.
+
 ## Authorship
 
 v2 built 2026-07-02 by Dee (Claude Sonnet 5, engineering-lead/COO role) per Mike's spec
@@ -630,3 +659,8 @@ autolink + nested-placeholder unstash bug + non-.md link handling), edit-as-comm
 against the live `estate` workspace's morning review doc plus all 3 new workspaces, using
 Playwright against a local test-port instance of the server (see verification evidence in the
 dispatching session's report).
+
+Anchoring v2 implemented and migrated 2026-09-01 by Codex (GPT-5.6), continuing the design and
+measured migration plan developed by Mike with Claude earlier that day. Verification covered
+the pure matcher/remapper tests, API binding behavior, idempotent copied-data migration, the live
+49-row migration, service health, and the rendered unresolved-marks surface.

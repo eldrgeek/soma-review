@@ -10,10 +10,11 @@ the answer inline the next time he reloads the page.
 
 1. Read the sidecar comment file for this page:
    `{sidecar_path}`
-   Each line is one JSON comment object: `id`, `page`, `anchor` (heading-path + block index +
-   text snapshot — may be null for page-level comments), `snapshot` (first ~80 chars of the
-   commented block, for context if the source doc has since changed), `author`, `text`,
-   `timestamp`, `status`, `thread_id`.
+   Each line is one JSON comment object. Block marks carry an opaque `block_id` (never parse
+   or derive meaning from it), `heading_path`, exact `quote`, Unicode-codepoint `from`/`to`
+   offsets (`to: null` means the whole block), plus legacy `anchor`/`snapshot` fields during
+   transition. The `quote` is the authority: locate it exactly and report **detached** when it
+   occurs zero times or **ambiguous** when it occurs more than once. Never guess from a bare id.
 
 2. Read the source document itself for full context:
    `{page_fs_path}`

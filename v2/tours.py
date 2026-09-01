@@ -31,6 +31,7 @@ import os
 import re
 
 from mdblocks import parse_markdown
+import blockmap
 
 COMPLETIONS_DIR = os.path.expanduser('~/Projects/_estate/completions')
 # Estate workspace sidecars (tours are estate-only; see tour_page_assets guard).
@@ -92,6 +93,30 @@ def _first_sentences(text, limit=280):
     return (cut[:dot + 1] if dot > 40 else cut.rstrip() + '…')
 
 
+def _attach_block_ids(route, src_bytes, blocks):
+    """Read-only stable-id lookup. Page rendering owns reconciliation/minting."""
+    path = os.path.join(FEEDBACK_DIR, route.replace('/', '_') + '.blocks.json')
+    try:
+        mapping = blockmap.load_map(path)
+    except (OSError, ValueError):
+        mapping = None
+    records = (mapping or {}).get('blocks') or []
+    if ((mapping or {}).get('source_sha256') != blockmap.source_sha256(src_bytes)
+            or len(records) != len(blocks)):
+        return
+    for block, record in zip(blocks, records):
+        if blockmap.fingerprint(block) == blockmap.fingerprint(record):
+            block['id'] = record['id']
+
+
+def _target(block):
+    if block.get('id'):
+        return '[data-block-id="%s"]' % block['id']
+    # Transition fallback for completion pages that have never been rendered
+    # and therefore do not have a block map yet.
+    return '[data-anchor="%s"]' % block['anchor']
+
+
 def build_tour_for_file(name):
     """Parse one completion page -> a soma-guide walkthrough dict, or None if
     the file is unreadable/empty. Steps:
@@ -101,16 +126,18 @@ def build_tour_for_file(name):
     """
     fs_path = os.path.join(COMPLETIONS_DIR, name)
     try:
-        with open(fs_path, 'r', encoding='utf-8') as f:
-            src = f.read()
+        with open(fs_path, 'rb') as f:
+            src_bytes = f.read()
     except OSError:
         return None
+    src = src_bytes.decode('utf-8')
     title, blocks = parse_markdown(src)
     if not blocks:
         return None
     title = title or name
 
     route = COMPLETIONS_ROUTE_PREFIX + name
+    _attach_block_ids(route, src_bytes, blocks)
     page = '/page/' + route  # default-workspace URL form (estate is unprefixed)
 
     # -- locate the pieces ---------------------------------------------------
@@ -171,7 +198,7 @@ def build_tour_for_file(name):
     # -- assemble steps --------------------------------------------------------
     steps = [{
         'id': 's1-what',
-        'target': '[data-anchor="%s"]' % first_anchor,
+        'target': _target(blocks[0]),
         'page': page,
         'label': 'What was done',
         'narration': 'Here’s what got done: %s' % (summary or title),
@@ -187,7 +214,7 @@ def build_tour_for_file(name):
                              'Every claim above should trace to something here.' % lbl)
         steps.append({
             'id': 's2-receipts',
-            'target': '[data-anchor="%s"]' % receipts_anchor,
+            'target': _target(next(b for b in blocks if b['anchor'] == receipts_anchor)),
             'page': page,
             'label': lbl,
             'narration': rec_narration,
@@ -199,7 +226,7 @@ def build_tour_for_file(name):
         # THERE (registered in that site's guide config).
         steps.append({
             'id': 's3-demo',
-            'target': '[data-anchor="%s"]' % demo_anchor,
+            'target': _target(next(b for b in blocks if b['anchor'] == demo_anchor)),
             'page': page,
             'label': 'Live demo',
             'narration': 'Now the demo — the highlighted link opens the actual product page '
@@ -210,7 +237,7 @@ def build_tour_for_file(name):
     elif live_anchor and live_url:
         steps.append({
             'id': 's3-live',
-            'target': '[data-anchor="%s"]' % live_anchor,
+            'target': _target(next(b for b in blocks if b['anchor'] == live_anchor)),
             'page': page,
             'label': 'See it live',
             'narration': 'And it’s live — the highlighted link opens the real thing in a new tab. '
@@ -220,7 +247,7 @@ def build_tour_for_file(name):
     else:
         steps.append({
             'id': 's3-wrap',
-            'target': '[data-anchor="%s"]' % blocks[-1]['anchor'],
+            'target': _target(blocks[-1]),
             'page': page,
             'label': 'Wrap-up',
             'narration': 'No live URL on this one — it’s local or infrastructure work. '
@@ -233,7 +260,7 @@ def build_tour_for_file(name):
     # the tour is on a step whose id is 's9-verdict' (see sg-verdict-bar).
     steps.append({
         'id': 's9-verdict',
-        'target': '[data-anchor="%s"]' % blocks[-1]['anchor'],
+        'target': _target(blocks[-1]),
         'page': page,
         'label': 'Your verdict',
         'narration': 'Your call. Approve it and it comes off the review list, or recommend '

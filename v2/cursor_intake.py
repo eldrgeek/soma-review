@@ -34,6 +34,8 @@ def _pending_items(comments):
             continue
         if c.get('cursor_dispatched'):
             continue
+        if c.get('unresolved'):
+            continue
         ctype = c.get('type', 'comment')
         status = c.get('status', 'queued')
         verdict = c.get('verdict')
@@ -68,7 +70,9 @@ def refresh_staged_manifest(route_path, comments, workspace_url_prefix=''):
         for c in agrees:
             row = c.get('row_id') or c.get('id', '?')
             snap = (c.get('snapshot') or '').strip()
-            lines.append(f'- `{row}` — {snap[:120]}')
+            block_id = c.get('block_id') or 'page-level'
+            quote = (c.get('quote') or snap).strip()
+            lines.append(f'- `{row}` · opaque `{block_id}` — {quote[:120]}')
     with open(path, 'w', encoding='utf-8') as f:
         f.write('\n'.join(lines) + '\n')
     return path
@@ -102,14 +106,21 @@ def file_intake_card(route_path, comments, persist_comments, workspace_url_prefi
             body.append(f'### `{row}`')
             if snap:
                 body.append(snap)
+            body.append(f'- Opaque block id: `{c.get("block_id") or "page-level"}`')
+            body.append(f'- Heading: `{" › ".join(c.get("heading_path") or []) or "page-level"}`')
+            body.append(f'- Exact quote: {json.dumps(c.get("quote"), ensure_ascii=False)}')
             body.append('')
     if comments_open:
         body.append('## Open comments')
         body.append('')
         for c in comments_open:
-            anchor = c.get('anchor') or 'page-level'
+            block_id = c.get('block_id') or 'page-level'
             text = (c.get('text') or '').strip()
-            body.append(f'- **{anchor}** ({c.get("author", "?")}): {text}')
+            heading = ' › '.join(c.get('heading_path') or []) or 'page-level'
+            quote = json.dumps(c.get('quote'), ensure_ascii=False)
+            body.append(f'- **`{block_id}`** ({c.get("author", "?")}): {text}')
+            body.append(f'  - Heading: `{heading}`')
+            body.append(f'  - Exact quote: {quote}')
         body.append('')
 
     body.append('## Instructions for Grok (Cursor)')

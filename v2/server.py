@@ -577,6 +577,17 @@ body.mark-layer {
   }
 }
 body.mark-layer .sidebar { background:var(--ml-panel); border-color:var(--ml-rule); }
+/* Inline code, tables, quotes and rules inherit the v1 dark palette above; on the
+   light paper that rendered every code span as an unreadable dark bar (found
+   2026-09-02 on the scheduled-jobs review, 100+ spans). Re-theme them with the
+   mark-layer tokens so both colour schemes stay legible. */
+body.mark-layer code { background:var(--ml-panel); color:var(--ml-ink); }
+body.mark-layer pre code { background:var(--ml-panel); }
+body.mark-layer th, body.mark-layer td { border-color:var(--ml-rule); }
+body.mark-layer th { background:var(--ml-panel); }
+body.mark-layer blockquote { border-left-color:var(--ml-rule); color:var(--ml-graphite); }
+body.mark-layer hr { border-top-color:var(--ml-rule); }
+body.mark-layer .block-wrap:hover { background:var(--ml-read); }
 body.mark-layer .main {
   max-width:47rem; padding:3.25rem 1.5rem 12rem;
   font-family:Spectral,Georgia,serif; font-size:17px; line-height:1.65;

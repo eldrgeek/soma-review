@@ -2008,6 +2008,15 @@ body.v3-view.v3-terms-on a.term-link{color:#a3c9ff;text-decoration:underline dot
 .v3-fold-toggle{background:none;border:0;color:#8a8f98;cursor:pointer;font-size:11px;padding:0 4px 0 0;}
 .v3-mark-row.v3-folded{opacity:.75;}
 .v3-back-chip{display:none;order:-1;}
+/* Inline edit/replace-mark diffs (Mike's rule, 2026-09-03: "Wordsmithing
+   shows as additions and deletions" IN THE TEXT, like Playmaker). Real
+   <del>/<ins> elements, not span-only, so the diff is real document
+   structure, not decoration — see v3PaintInlineDiffs() in V3_JS. Scoped
+   under body.v3-view so classic pages (which never gain the
+   v3-inline-diff class) are byte-identical. */
+body.v3-view .block-body.v3-inline-diff{cursor:pointer;}
+body.v3-view .v3-inline-diff del{background:#4a1f24;color:#f0a3ab;text-decoration:line-through;padding:0 2px;border-radius:2px;}
+body.v3-view .v3-inline-diff ins{background:#1f4a2a;color:#9cf0ac;text-decoration:none;padding:0 2px;border-radius:2px;}
 """
 
 V3_JS = r"""
@@ -2039,6 +2048,42 @@ V3_JS = r"""
     return c.type || 'comment';
   }
   function escapeHtml(s){ return (s||'').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch])); }
+  // Word-level diff for INLINE in-body rendering of open edit/replace marks
+  // (Mike's rule, 2026-09-03: "Wordsmithing shows as additions and deletions"
+  // IN THE TEXT, like Playmaker — not just inside the mark's own dialog).
+  // Deliberately a separate local copy of the LCS diff in PAGE_JS's
+  // wordDiff/renderDiffHtml (same algorithm) rather than a shared function:
+  // PAGE_JS ships unmodified on every page including classic, and this v3-only
+  // v3RenderDiffHtml emits real <del>/<ins> elements (not the classic
+  // sidebar's <span class="diff-del/ins">) so v3-view's document text reads
+  // as literal struck/added content — see v3PaintInlineDiffs() below.
+  function v3WordDiff(before, after){
+    const a = (before||'').split(/(\s+)/);
+    const b = (after||'').split(/(\s+)/);
+    const dp = Array.from({length: a.length+1}, () => new Array(b.length+1).fill(0));
+    for (let i = a.length-1; i>=0; i--) {
+      for (let j = b.length-1; j>=0; j--) {
+        dp[i][j] = a[i]===b[j] ? dp[i+1][j+1]+1 : Math.max(dp[i+1][j], dp[i][j+1]);
+      }
+    }
+    let i=0, j=0, out=[];
+    while (i<a.length && j<b.length) {
+      if (a[i]===b[j]) { out.push({t:'eq', v:a[i]}); i++; j++; }
+      else if (dp[i+1][j] >= dp[i][j+1]) { out.push({t:'del', v:a[i]}); i++; }
+      else { out.push({t:'ins', v:b[j]}); j++; }
+    }
+    while (i<a.length) { out.push({t:'del', v:a[i]}); i++; }
+    while (j<b.length) { out.push({t:'ins', v:b[j]}); j++; }
+    return out;
+  }
+  function v3RenderDiffHtml(before, after){
+    return v3WordDiff(before, after).map(p => {
+      const esc = escapeHtml(p.v);
+      if (p.t === 'del') return `<del>${esc}</del>`;
+      if (p.t === 'ins') return `<ins>${esc}</ins>`;
+      return esc;
+    }).join('');
+  }
   // Pointers render as real links (task spec item 2ii): a minimal
   // `[label](url)` -> `<a>` pass, applied to already-escaped text (so it must
   // run on the escaped string and re-open only the `()[]` sequences it
@@ -2224,6 +2269,68 @@ V3_JS = r"""
     });
   }
 
+  // --- Inline edit/replace-mark diffs (task, 2026-09-03): every OPEN
+  // edit/replace mark renders as struck/added text directly in its block's
+  // body — not just inside the mark's own dialog. Resolving (Accept/Reject
+  // via openDialog's extraActions below) clears the inline diff for the rest
+  // of THIS session; the underlying .md is never touched, so a fresh load
+  // always starts from the real base text plus whatever marks are still
+  // open — the DOM is the decision record, not the file.
+  function v3PaintInlineDiffs(){
+    const byBlock = {};
+    allRows.forEach(m => {
+      if (!m.block_id || m.resolved) return;
+      if (m.kind !== 'edit' && m.kind !== 'replace') return;
+      (byBlock[m.block_id] = byBlock[m.block_id] || []).push(m);
+    });
+    document.querySelectorAll('.block-wrap[data-block-id]').forEach(el => {
+      const body = el.querySelector('.block-body');
+      if (!body) return;
+      const marks = byBlock[el.dataset.blockId];
+      if (marks && marks.length) {
+        // Most-recently-created open edit/replace mark wins if more than one
+        // targets the same block — real corpus (mdp-proposal.md) never has
+        // this, but the tie-break keeps the surface sane if it ever does.
+        const mark = marks.slice().sort((a,b) => (a.timestamp||'').localeCompare(b.timestamp||'')).pop();
+        if (!body.dataset.v3OrigBody) {
+          try { body.dataset.v3OrigBody = btoa(unescape(encodeURIComponent(body.innerHTML))); } catch(_) {}
+        }
+        body.innerHTML = v3RenderDiffHtml(mark.snapshot || '', mark.proposed || '');
+        body.classList.add('v3-inline-diff');
+        body.dataset.v3MarkId = mark.id;
+      } else if (body.classList.contains('v3-inline-diff')) {
+        if (body.dataset.v3OrigBody) {
+          try { body.innerHTML = decodeURIComponent(escape(atob(body.dataset.v3OrigBody))); } catch(_) {}
+          delete body.dataset.v3OrigBody;
+        }
+        body.classList.remove('v3-inline-diff');
+        delete body.dataset.v3MarkId;
+      }
+    });
+  }
+
+  // Clicking an inline diff opens that mark's dialog instead of entering
+  // click-to-edit mode (wireEditableBlocks in PAGE_JS, shared with classic).
+  // Registered on the block-wrap (an ANCESTOR of .block-body) in the CAPTURE
+  // phase so it runs before the body's own bubble-phase click-to-edit
+  // listener, regardless of script load order; wired once per block-wrap,
+  // reads current diff state live so it needs no re-wiring on refresh.
+  function v3WireInlineDiffClicks(){
+    document.querySelectorAll('.block-wrap[data-block-id]').forEach(el => {
+      if (el.dataset.v3DiffClickWired) return;
+      el.dataset.v3DiffClickWired = '1';
+      el.addEventListener('click', (e) => {
+        const body = el.querySelector('.block-body');
+        if (!body || !body.classList.contains('v3-inline-diff')) return;
+        if (!body.contains(e.target)) return; // let other affordances (pill, etc.) behave normally
+        e.preventDefault();
+        e.stopPropagation();
+        const mark = allRows.find(r => r.id === body.dataset.v3MarkId);
+        if (mark) openDialog(mark);
+      }, true);
+    });
+  }
+
   // --- One-action return (task spec item 3, Mike 2026-09-03: "Terms should
   // have a way to go back to where you were with one click or one key or one
   // action"). Generalized to every in-page jump (term row, mark row's "Go to
@@ -2402,7 +2509,7 @@ V3_JS = r"""
     await fetch(`${API_BASE}/api/comments/status`, {method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({page: ROUTE, id: m.id, status})});
     await fetchMarks();
-    paintBlockIndicators(); updateCountBadge(); if (panelOpen) renderPanel();
+    paintBlockIndicators(); v3PaintInlineDiffs(); updateCountBadge(); if (panelOpen) renderPanel();
   }
 
   // Answers to decision/note cards are plain replies into the mark's own
@@ -2444,6 +2551,17 @@ V3_JS = r"""
       extraActions = `<button class="primary" data-v3-agree>Agree</button>
         <button data-v3-agree-unpack>Agree and unpack</button>
         <button data-v3-not-yet>Not yet</button>`;
+    }
+    // Edit/replace marks opened from their inline diff (v3PaintInlineDiffs):
+    // Accept applies the change (resolves the mark, so the block shows plain
+    // proposed text going forward this session), Reject resolves it the
+    // other way (block reverts to base text), Edit re-opens the block's own
+    // click-to-edit textarea (enterEditMode, PAGE_JS, shared with classic) so
+    // Mike can revise the proposal further before deciding.
+    if ((m.kind === 'edit' || m.kind === 'replace') && !m.resolved) {
+      extraActions = `<button class="primary" data-v3-accept>Accept</button>
+        <button data-v3-reject-edit>Reject</button>
+        <button data-v3-edit-more>Edit</button>`;
     }
     const replies = repliesFor(m).sort((a,b) => (a.timestamp||'').localeCompare(b.timestamp||''));
     const historyHtml = replies.length ? `<div class="v3-history"><div class="v3-terms-heading">History</div>` +
@@ -2502,6 +2620,21 @@ V3_JS = r"""
       // distinguished only by the reply text the harvest reads.
       await postAnswer(m, 'Agree and unpack — flagged for depth-two expansion next round', 'done');
       backdrop.remove();
+    });
+    backdrop.querySelector('[data-v3-accept]')?.addEventListener('click', async () => {
+      await postAnswer(m, 'Accept', 'done');
+      backdrop.remove();
+    });
+    backdrop.querySelector('[data-v3-reject-edit]')?.addEventListener('click', async () => {
+      await postAnswer(m, 'Reject', 'done');
+      backdrop.remove();
+    });
+    backdrop.querySelector('[data-v3-edit-more]')?.addEventListener('click', () => {
+      backdrop.remove();
+      jumpToBlock(m.block_id);
+      const wrap = document.querySelector(`.block-wrap[data-block-id="${CSS.escape(m.block_id)}"]`);
+      const body = wrap && wrap.querySelector('.block-body');
+      if (wrap && body && typeof enterEditMode === 'function') enterEditMode(wrap, body);
     });
   }
 
@@ -2601,12 +2734,17 @@ V3_JS = r"""
     initReadTracking();
     await fetchMarks();
     paintBlockIndicators();
+    v3PaintInlineDiffs();
+    v3WireInlineDiffClicks();
     updateCountBadge();
     wirePointerTooltips();
     // Re-decorate whenever the existing comment plumbing reloads threads
     // (new comment/edit saved, reply posted) so the panel/badge/gutter stay live.
+    // This is also how a Mike-typed edit (enterEditMode -> postComment,
+    // PAGE_JS) picks up its own inline diff: postComment fires
+    // soma-comment-saved on save, same as any other mark.
     document.addEventListener('soma-comment-saved', async () => {
-      await fetchMarks(); paintBlockIndicators(); updateCountBadge(); wirePointerTooltips(); if (panelOpen) renderPanel();
+      await fetchMarks(); paintBlockIndicators(); v3PaintInlineDiffs(); v3WireInlineDiffClicks(); updateCountBadge(); wirePointerTooltips(); if (panelOpen) renderPanel();
     });
   });
 })();

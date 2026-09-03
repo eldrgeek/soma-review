@@ -223,6 +223,31 @@ _LEXICON_HEADING_RE = re.compile(r'^###\s+(.+?)\s*\xb7\s*(.*)$')
 _AUTO_LEXICON_MARKER_RE = re.compile(r'[ \t]*<!--\s*auto-lexicon\s*-->[ \t]*\n?')
 _FRONT_MATTER_RE = re.compile(r'\A---[ \t]*\n(.*?)\n---[ \t]*\n', re.S)
 _FRONT_MATTER_FLAG_RE = re.compile(r'^\s*auto-lexicon\s*:\s*(true|yes|on)\s*$', re.I | re.M)
+_LEADING_FRONT_MATTER_RE = re.compile(
+    r'\A\s*(?:<!--.*?-->\s*)*---[ \t]*\n(.*?)\n---[ \t]*\n', re.S
+)
+
+
+def strip_front_matter(src):
+    """Remove a leading YAML-ish front-matter block (`---\\nkey: value\\n---\\n`)
+    from markdown before block parsing, regardless of a leading HTML comment
+    before it (e.g. the `<!-- auto-lexicon -->` opt-in marker, or any other
+    comment). Front matter across the estate is metadata for THIS app
+    (`server.py::compute_level` / `compute_default_view` read `level:`/
+    `view:` keys) — it was never meant to render as document text. Before
+    this, any page with a leading front-matter block rendered it as a literal
+    `<hr>`/paragraph/`<hr>` sandwich in the body (the mdp-proposal.md leak,
+    found 2026-09-03: `level: "meta: how MDP works" view: "v3"` showing under
+    the title). Call this AFTER `strip_auto_lexicon_marker` so its own
+    flag-scoped front-matter handling still runs first; this catches whatever
+    front matter remains (plain front matter with no auto-lexicon
+    association at all, or front matter that only had its marker comment
+    stripped). A doc with no leading front-matter block is returned
+    byte-identical."""
+    m = _LEADING_FRONT_MATTER_RE.match(src)
+    if m:
+        return src[m.end():]
+    return src
 
 
 def strip_auto_lexicon_marker(src):
@@ -679,6 +704,7 @@ def parse_markdown(src, link_resolver=None, terms_out=None, lexicon=None):
     """
     src = unicodedata.normalize('NFC', src)
     auto_lexicon_flag, src = strip_auto_lexicon_marker(src)
+    src = strip_front_matter(src)
     lines = src.split('\n')
     blocks = []
     heading_stack = []  # list of (level, text)

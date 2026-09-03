@@ -298,6 +298,88 @@ class ViewFrontmatterDefaultTests(unittest.TestCase):
         self.assertIn('window.__V3_VIEW__ = false', html)
 
 
+class FrontMatterBodyLeakTests(unittest.TestCase):
+    """Front matter is metadata for compute_level/compute_default_view, not
+    document text — it must never render as a literal block in the page
+    body. Found 2026-09-03: mdp-proposal.md (`<!-- auto-lexicon -->` then a
+    `---\nlevel: ...\nview: ...\n---` block) showed `level: "meta: how MDP
+    works" view: "v3"` as a paragraph under the title, because only the
+    auto-lexicon *marker comment* was stripped, not the front-matter block
+    itself. mdblocks.strip_front_matter() fixes this for parse_markdown
+    directly; these tests exercise both that unit and the full render_page
+    path so a future regression is caught either way."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = self.tmp.name
+        os.makedirs(os.path.join(self.root, 'docs'))
+        self.doc = os.path.join(self.root, 'docs', 'page.md')
+        self.config = os.path.join(self.root, 'workspaces.json')
+        with open(self.config, 'w', encoding='utf-8') as handle:
+            json.dump({
+                'estate': {
+                    'label': 'Test', 'roots': [['docs', 'docs']],
+                    'nav': [], 'home': 'docs/page.md', 'feedback_dir': 'feedback',
+                    'nightly': False, 'tours': False,
+                }
+            }, handle)
+        self.old_root = server.PROJECTS_ROOT
+        self.old_config = server.WORKSPACES_CONFIG
+        server.PROJECTS_ROOT = self.root
+        server.WORKSPACES_CONFIG = self.config
+
+    def tearDown(self):
+        server.PROJECTS_ROOT = self.old_root
+        server.WORKSPACES_CONFIG = self.old_config
+        self.tmp.cleanup()
+
+    def write_doc(self, text):
+        with open(self.doc, 'w', encoding='utf-8') as handle:
+            handle.write(text)
+
+    def test_strip_front_matter_unit(self):
+        src = '---\nlevel: object\n---\n# Doc\n\ntext\n'
+        self.assertEqual('# Doc\n\ntext\n', mdblocks.strip_front_matter(src))
+
+    def test_strip_front_matter_noop_without_block(self):
+        src = '# Doc\n\ntext\n'
+        self.assertEqual(src, mdblocks.strip_front_matter(src))
+
+    def test_parse_markdown_never_renders_leading_frontmatter(self):
+        # mdp-proposal.md's exact shape: leading auto-lexicon comment, then a
+        # multi-key YAML front-matter block.
+        doc = (
+            '<!-- auto-lexicon -->\n'
+            '---\n'
+            'level: "meta: how MDP works"\n'
+            'view: "v3"\n'
+            '---\n'
+            "# Mike's MDP proposal\n\n"
+            'MDP is a means for multiple minds to align on a common underlying model.\n'
+        )
+        title, blocks = mdblocks.parse_markdown(doc)
+        self.assertEqual("Mike's MDP proposal", title)
+        full_html = '\n'.join(b['html'] for b in blocks)
+        self.assertNotIn('level:', full_html)
+        self.assertNotIn('view:', full_html)
+        kinds = [b['kind'] for b in blocks]
+        self.assertNotIn('hr', kinds)  # no stray <hr> sandwich either
+
+    def test_render_page_body_excludes_frontmatter(self):
+        self.write_doc(
+            '<!-- auto-lexicon -->\n'
+            '---\n'
+            'level: "meta: how MDP works"\n'
+            'view: "v3"\n'
+            '---\n'
+            '# Title\n\n'
+            'Body text.\n'
+        )
+        html = server.render_page('docs/page.md', view='classic')
+        self.assertNotIn('level:', html)
+        self.assertNotIn('"meta: how MDP works"', html)
+
+
 class DecisionAndReplaceMarkKindTests(unittest.TestCase):
     """`decision` mark_kind and `replace`-flagged edit marks (Playmaker-model
     rebuild, task spec items 2iv/2i/7, 2026-09-03): server-side storage only
@@ -375,6 +457,38 @@ class DecisionAndReplaceMarkKindTests(unittest.TestCase):
         saved = server.read_comments('docs/page.md')[0]
         self.assertTrue(saved['replace'])
         self.assertEqual('edit', saved['type'])
+
+
+class InlineDiffMarksScopeTests(unittest.TestCase):
+    """Inline rendering of open edit/replace marks (Mike's rule, 2026-09-03:
+    'Wordsmithing shows as additions and deletions' IN THE TEXT, like
+    Playmaker) is v3-only client-side JS (v3PaintInlineDiffs/v3WireInlineDiffClicks
+    in V3_JS, .v3-inline-diff CSS in V3_CSS) — actual del/ins-in-body behavior
+    is verified live via Playwright (see the dispatching session's report),
+    not re-verified here. These tests pin the scope boundary: PAGE_JS (shipped
+    unmodified on every page, classic included) carries none of this, so a
+    classic page can never gain a real <del>/<ins> from a v3-only code path."""
+
+    def test_inline_diff_functions_are_v3_only(self):
+        self.assertIn('v3PaintInlineDiffs', server.V3_JS)
+        self.assertIn('v3WireInlineDiffClicks', server.V3_JS)
+        self.assertIn('v3RenderDiffHtml', server.V3_JS)
+        self.assertNotIn('v3PaintInlineDiffs', server.PAGE_JS)
+        self.assertNotIn('v3WireInlineDiffClicks', server.PAGE_JS)
+
+    def test_inline_diff_css_is_v3_only_scoped(self):
+        self.assertIn('v3-inline-diff', server.V3_CSS)
+        self.assertIn('body.v3-view .v3-inline-diff del', server.V3_CSS)
+        self.assertIn('body.v3-view .v3-inline-diff ins', server.V3_CSS)
+        self.assertNotIn('v3-inline-diff', server.PAGE_CSS)
+
+    def test_page_js_byte_identical_across_this_change(self):
+        # PAGE_JS is embedded verbatim on every page regardless of view — if
+        # FIX 1's inline-diff work had touched it, every classic page's bytes
+        # would change. It didn't: no v3-prefixed helper leaked in here.
+        for token in ('v3PaintInlineDiffs', 'v3WireInlineDiffClicks',
+                      'v3RenderDiffHtml', 'v3WordDiff', 'v3-inline-diff'):
+            self.assertNotIn(token, server.PAGE_JS)
 
 
 if __name__ == '__main__':

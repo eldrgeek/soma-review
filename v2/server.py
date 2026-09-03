@@ -1996,6 +1996,18 @@ body.v3-view .sidebar.v3-sidebar-closed + .v3-sidebar-toggle-open{display:block;
    classic (no body.v3-view) is untouched. */
 body.v3-view a.term-link{color:inherit;text-decoration:none;cursor:text;}
 body.v3-view.v3-terms-on a.term-link{color:#a3c9ff;text-decoration:underline dotted;cursor:help;}
+/* Decision cards (task spec item 2iv), note-card fold, pointer links, and the
+   one-action "back" chip (2026-09-03 rebuild, see mdp-proposal.md). */
+.v3-alt{border:1px solid #2a2d34;border-radius:8px;padding:10px;margin:8px 0;background:#181b21;}
+.v3-alt-default{border-color:#2f6feb;}
+.v3-alt-label{font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:#8a8f98;margin-bottom:4px;}
+.v3-alt-text{font-size:13px;color:#e6e6e6;margin-bottom:8px;}
+.v3-history{margin-top:10px;border-top:1px solid #2a2d34;padding-top:6px;}
+.v3-history-row{font-size:12px;color:#c8ccd2;padding:3px 0;}
+.v3-pointer-link{color:#a3c9ff;text-decoration:underline dotted;}
+.v3-fold-toggle{background:none;border:0;color:#8a8f98;cursor:pointer;font-size:11px;padding:0 4px 0 0;}
+.v3-mark-row.v3-folded{opacity:.75;}
+.v3-back-chip{display:none;order:-1;}
 """
 
 V3_JS = r"""
@@ -2012,14 +2024,42 @@ V3_JS = r"""
     note:{label:'Note', glyph:'✎'},
     ack:{label:'Ack', glyph:'•'},
     ruling:{label:'Ruling', glyph:'§'},
-    verdict:{label:'Verdict', glyph:'§'}
+    verdict:{label:'Verdict', glyph:'§'},
+    decision:{label:'Decision', glyph:'§'},
+    replace:{label:'Replace', glyph:'⇄'}
   };
+  // A `replace` mark is stored as `type:"edit"` (so it rides the existing
+  // snapshot/proposed diff machinery — see `renderDiffHtml` in PAGE_JS, shared
+  // scope) plus `replace:true` for panel labeling only (Mike, 2026-09-03: "I
+  // would like a card that replaces my statement with your restatement").
   function kindOf(c){
     if (c.type === 'mark') return c.mark_kind || 'note';
     if (c.type === 'verdict') return 'verdict';
+    if (c.type === 'edit') return c.replace ? 'replace' : 'edit';
     return c.type || 'comment';
   }
   function escapeHtml(s){ return (s||'').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch])); }
+  // Pointers render as real links (task spec item 2ii): a minimal
+  // `[label](url)` -> `<a>` pass, applied to already-escaped text (so it must
+  // run on the escaped string and re-open only the `()[]` sequences it
+  // matches itself — safe because escapeHtml never produces literal `[`/`]`).
+  function mdLinkify(escaped){
+    // Supports an optional title `[label](href "first line of target")` —
+    // pointers "carry the first line of their target beside them" (task spec
+    // item 10): for cross-file pointers the note text is authored with that
+    // title inline (no fetch possible from a note); for in-page `#anchor`
+    // pointers `wirePointerTooltips()` fills it in live from the live DOM.
+    return (escaped || '').replace(/\[([^\]]+)\]\(([^)\s"]+)(?:\s+&quot;([^&]*)&quot;)?\)/g, (_, label, href, title) => {
+      const external = /^https?:\/\//.test(href);
+      const t = title ? ` title="${title}"` : '';
+      return `<a href="${href}"${external ? ' target="_blank" rel="noopener"' : ''} class="v3-pointer-link"${t}>${label}</a>`;
+    });
+  }
+  function isReplyRow(m){ return !!(m.thread_id && m.thread_id !== m.id); }
+  function repliesFor(m, rows){
+    const tid = m.thread_id || m.id;
+    return (rows || allRows).filter(r => r.id !== m.id && (r.thread_id === tid));
+  }
 
   let allRows = [];
   let activeFilters = new Set(Object.keys(KIND_META));
@@ -2135,12 +2175,25 @@ V3_JS = r"""
 
   function decorate(rows){
     const shas = currentShaMap();
-    return rows.filter(c => !c.deleted).map(c => {
+    const decorated = rows.filter(c => !c.deleted).map(c => {
       const kind = kindOf(c);
       const resolved = c.status === 'done';
       const stale = !!(c.block_id && c.block_text_sha && shas[c.block_id] && shas[c.block_id] !== c.block_text_sha);
       return Object.assign({}, c, {kind, resolved, stale});
     });
+    // Fold (task spec item 5, Mike 2026-09-03: "an agreed restate card
+    // COLLAPSES to one line ... apply generally: once a mark is agreed, it
+    // folds"). A note/restate/decision card is "agreed" once its thread has a
+    // reply whose text starts with Agree/Ratify (the answer-button copy below
+    // writes exactly that prefix) — cheap, robust to the free-text reply
+    // model this API already uses instead of a new structured "answer" field.
+    decorated.forEach(m => {
+      if (isReplyRow(m)) return;
+      if (!(m.kind === 'note' || m.kind === 'restate' || m.kind === 'decision')) return;
+      const replies = repliesFor(m, decorated);
+      m.folded = replies.some(r => /^(agree|ratify)/i.test(r.text || ''));
+    });
+    return decorated;
   }
 
   async function fetchMarks(){
@@ -2171,6 +2224,74 @@ V3_JS = r"""
     });
   }
 
+  // --- One-action return (task spec item 3, Mike 2026-09-03: "Terms should
+  // have a way to go back to where you were with one click or one key or one
+  // action"). Generalized to every in-page jump (term row, mark row's "Go to
+  // block", any `#anchor` pointer link a note/decision card renders) — not
+  // terms-only, since the same disorientation applies to any jump. `Escape`
+  // and the header "← back" chip are the two one-action returns; either pops
+  // the same stack, so they're interchangeable, never additive.
+  const backStack = [];
+  function showBackChip(){
+    let chip = document.getElementById('v3-back-chip');
+    if (!chip) {
+      chip = document.createElement('button');
+      chip.id = 'v3-back-chip';
+      chip.className = 'v3-marks-btn v3-back-chip';
+      chip.title = 'Back to where you were (or press Escape)';
+      chip.textContent = '← back';
+      chip.addEventListener('click', goBack);
+      const header = document.querySelector('.v3-header');
+      if (header) header.insertBefore(chip, header.firstChild);
+    }
+    chip.style.display = 'inline-block';
+  }
+  function hideBackChip(){
+    const chip = document.getElementById('v3-back-chip');
+    if (chip) chip.style.display = 'none';
+  }
+  function goBack(){
+    const pos = backStack.pop();
+    if (pos != null) window.scrollTo({top: pos, behavior:'smooth'});
+    if (!backStack.length) hideBackChip();
+  }
+  function jumpToBlock(blockId){
+    if (!blockId) return;
+    const el = document.querySelector(`.block-wrap[data-block-id="${CSS.escape(blockId)}"]`);
+    if (!el) return;
+    backStack.push(window.scrollY);
+    showBackChip();
+    el.scrollIntoView({block:'center', behavior:'smooth'});
+  }
+  function jumpToAnchor(id){
+    const target = document.getElementById(id) || document.querySelector(`.block-wrap[data-block-id="${CSS.escape(id)}"]`);
+    if (!target) return false;
+    backStack.push(window.scrollY);
+    showBackChip();
+    target.scrollIntoView({block:'center', behavior:'smooth'});
+    return true;
+  }
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && backStack.length) { e.preventDefault(); goBack(); }
+  });
+  document.addEventListener('click', (e) => {
+    const a = e.target.closest('a[href^="#"]');
+    if (!a) return;
+    const id = decodeURIComponent(a.getAttribute('href').slice(1));
+    if (jumpToAnchor(id)) e.preventDefault();
+  });
+  function wirePointerTooltips(){
+    document.querySelectorAll('a.term-link, a.v3-pointer-link[href^="#"]').forEach(a => {
+      if (a.title) return;
+      const id = decodeURIComponent(a.getAttribute('href').slice(1));
+      const target = document.getElementById(id) || document.querySelector(`.block-wrap[data-block-id="${CSS.escape(id)}"]`);
+      if (!target) return;
+      const raw = target.dataset && target.dataset.normText ? decodeNormText(target) : (target.textContent || '');
+      const sentence = firstSentenceOf(raw.trim());
+      if (sentence) a.title = sentence;
+    });
+  }
+
   function updateCountBadge(){
     const btn = document.getElementById('v3-marks-btn');
     if (!btn) return;
@@ -2178,10 +2299,16 @@ V3_JS = r"""
     btn.querySelector('.v3-marks-count').textContent = open;
   }
 
+  const expandedFold = new Set();
+
   function renderPanel(){
     const list = document.getElementById('v3-mark-list');
     if (!list) return;
-    const rows = allRows.filter(m => activeFilters.has(m.kind));
+    // Replies (thread_id set but not the root id — decision answers, note
+    // agree/not-yet responses) are history attached to their root mark's
+    // dialog, not separate top-level rows in the list (spec: decisions are
+    // "separately marked" per-block, not per-answer).
+    const rows = allRows.filter(m => activeFilters.has(m.kind) && !isReplyRow(m));
     const terms = termsOn ? collectTermOccurrences() : [];
     if (!rows.length && !terms.length) {
       list.innerHTML = '<div class="v3-panel-empty">No marks of the selected type(s).</div>';
@@ -2192,10 +2319,13 @@ V3_JS = r"""
       const meta = KIND_META[m.kind] || KIND_META.note;
       const status = m.stale ? 'stale' : (m.resolved ? 'resolved' : 'open');
       const quote = m.quote || m.snapshot || m.text || '(page-level)';
-      return `<div class="v3-mark-row" data-mark-id="${m.id}">
-        <div class="v3-mr-top"><span class="v3-mr-kind">${meta.glyph} ${meta.label}</span>
+      const folded = m.folded && !expandedFold.has(m.id);
+      const chevron = m.folded ? `<button class="v3-fold-toggle" data-fold-id="${m.id}">${folded ? '▸' : '▾'}</button>` : '';
+      const quoteHtml = folded ? '' : `<div class="v3-mr-quote">${mdLinkify(escapeHtml(quote))}</div>`;
+      return `<div class="v3-mark-row${folded ? ' v3-folded' : ''}" data-mark-id="${m.id}">
+        <div class="v3-mr-top">${chevron}<span class="v3-mr-kind">${meta.glyph} ${meta.label}</span>
           <span class="v3-mr-status ${status}">${status}</span></div>
-        <div class="v3-mr-quote">${escapeHtml(quote)}</div>
+        ${quoteHtml}
       </div>`;
     }).join('');
     let termsHtml = '';
@@ -2208,17 +2338,22 @@ V3_JS = r"""
     }
     list.innerHTML = markHtml + termsHtml;
     list.querySelectorAll('.v3-mark-row').forEach(row => {
-      row.addEventListener('click', () => {
+      row.addEventListener('click', (e) => {
+        if (e.target.closest('.v3-fold-toggle')) return;
         const m = allRows.find(r => r.id === row.dataset.markId);
         if (m) openDialog(m);
       });
     });
-    list.querySelectorAll('.v3-term-row').forEach(row => {
-      row.addEventListener('click', () => {
-        const id = row.dataset.blockId;
-        const el = id ? document.querySelector(`.block-wrap[data-block-id="${CSS.escape(id)}"]`) : null;
-        if (el) el.scrollIntoView({block:'center', behavior:'smooth'});
+    list.querySelectorAll('.v3-fold-toggle').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const id = btn.dataset.foldId;
+        if (expandedFold.has(id)) expandedFold.delete(id); else expandedFold.add(id);
+        renderPanel();
       });
+    });
+    list.querySelectorAll('.v3-term-row').forEach(row => {
+      row.addEventListener('click', () => jumpToBlock(row.dataset.blockId));
     });
   }
 
@@ -2270,6 +2405,17 @@ V3_JS = r"""
     paintBlockIndicators(); updateCountBadge(); if (panelOpen) renderPanel();
   }
 
+  // Answers to decision/note cards are plain replies into the mark's own
+  // thread (existing `/api/comments/reply`, no new endpoint) — the reply text
+  // IS the recorded answer ("Ratify: A", "Agree and unpack", "Not yet"), and
+  // the root mark's own `status` (existing `/api/comments/status`) is what
+  // drives open/resolved so the panel/badge machinery needs no new field.
+  async function postAnswer(m, text, status){
+    await fetch(`${API_BASE}/api/comments/reply`, {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({page: ROUTE, thread_id: m.thread_id || m.id, text, author: 'mike', status: 'seen'})});
+    await setStatus(m, status);
+  }
+
   function openDialog(m){
     if (!m) return;
     document.querySelectorAll('.v3-dialog-backdrop').forEach(el => el.remove());
@@ -2277,17 +2423,42 @@ V3_JS = r"""
     const backdrop = document.createElement('div');
     backdrop.className = 'v3-dialog-backdrop';
     const status = m.stale ? 'stale' : (m.resolved ? 'resolved' : 'open');
-    const diff = m.type === 'edit'
-      ? `<div class="v3-dialog-quote"><del>${escapeHtml(m.snapshot||'')}</del></div><div class="v3-dialog-quote"><ins>${escapeHtml(m.proposed||'')}</ins></div>`
-      : `<div class="v3-dialog-quote">${escapeHtml(m.quote || m.snapshot || m.text || '')}</div>`;
+    let diff;
+    let extraActions = '';
+    if (m.kind === 'decision') {
+      const dmeta = m.meta || {};
+      const alts = dmeta.alternatives || [];
+      diff = `<div class="v3-dialog-quote">${mdLinkify(escapeHtml(dmeta.prompt || m.text || ''))}</div>` +
+        alts.map(a => `<div class="v3-alt${a.key === dmeta.default ? ' v3-alt-default' : ''}">
+            <div class="v3-alt-label">${escapeHtml(a.key)}${a.key === dmeta.default ? ' — recommended' : ''}</div>
+            <div class="v3-alt-text">${mdLinkify(escapeHtml(a.text || ''))}</div>
+            <button class="primary" data-v3-ratify="${escapeHtml(a.key)}">Ratify ${escapeHtml(a.key)}</button>
+          </div>`).join('');
+      extraActions = `<button data-v3-not-yet>Not yet</button><button data-v3-reject>Reject</button>`;
+    } else if (m.type === 'edit') {
+      diff = `<div class="v3-dialog-quote"><del>${escapeHtml(m.snapshot||'')}</del></div><div class="v3-dialog-quote"><ins>${mdLinkify(escapeHtml(m.proposed||''))}</ins></div>`;
+    } else {
+      diff = `<div class="v3-dialog-quote">${mdLinkify(escapeHtml(m.quote || m.snapshot || m.text || ''))}</div>`;
+    }
+    if (m.kind === 'note' || m.kind === 'restate') {
+      extraActions = `<button class="primary" data-v3-agree>Agree</button>
+        <button data-v3-agree-unpack>Agree and unpack</button>
+        <button data-v3-not-yet>Not yet</button>`;
+    }
+    const replies = repliesFor(m).sort((a,b) => (a.timestamp||'').localeCompare(b.timestamp||''));
+    const historyHtml = replies.length ? `<div class="v3-history"><div class="v3-terms-heading">History</div>` +
+      replies.map(r => `<div class="v3-history-row">${escapeHtml(r.author||'mike')}: ${escapeHtml(r.text||'')}</div>`).join('') +
+      `</div>` : '';
     backdrop.innerHTML = `<div class="v3-dialog">
       <button class="v3-dialog-close" data-v3-close>&times;</button>
       <h3>${meta.glyph} ${meta.label} &middot; <span class="v3-mr-status ${status}">${status}</span></h3>
       ${diff}
-      ${m.text && m.type !== 'edit' ? `<div>${escapeHtml(m.text)}</div>` : ''}
+      ${m.text && m.type !== 'edit' && m.kind !== 'decision' ? `<div>${mdLinkify(escapeHtml(m.text))}</div>` : ''}
+      ${historyHtml}
       <div style="color:#8a8f98;font-size:11px;margin-top:6px;">${escapeHtml(m.author||'mike')} &middot; block ${escapeHtml(m.block_id||'(page-level)')}${m.stale?' &middot; source text has changed since this mark was made':''}</div>
       <div class="v3-dialog-actions">
-        ${m.resolved ? '<button data-v3-reopen>Reopen</button>' : '<button class="primary" data-v3-resolve>Resolve</button>'}
+        ${extraActions}
+        ${!extraActions ? (m.resolved ? '<button data-v3-reopen>Reopen</button>' : '<button class="primary" data-v3-resolve>Resolve</button>') : ''}
         <button data-v3-scroll>Go to block</button>
       </div>
     </div>`;
@@ -2295,8 +2466,7 @@ V3_JS = r"""
     backdrop.addEventListener('click', (e) => { if (e.target === backdrop) backdrop.remove(); });
     backdrop.querySelector('[data-v3-close]').addEventListener('click', () => backdrop.remove());
     backdrop.querySelector('[data-v3-scroll]')?.addEventListener('click', () => {
-      const el = m.block_id ? document.querySelector(`.block-wrap[data-block-id="${CSS.escape(m.block_id)}"]`) : null;
-      if (el) el.scrollIntoView({block:'center', behavior:'smooth'});
+      jumpToBlock(m.block_id);
     });
     backdrop.querySelector('[data-v3-resolve]')?.addEventListener('click', async () => {
       await setStatus(m, 'done');
@@ -2306,6 +2476,31 @@ V3_JS = r"""
     });
     backdrop.querySelector('[data-v3-reopen]')?.addEventListener('click', async () => {
       await setStatus(m, 'queued');
+      backdrop.remove();
+    });
+    backdrop.querySelectorAll('[data-v3-ratify]').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        await postAnswer(m, `Ratify: Alternative ${btn.dataset.v3Ratify}`, 'done');
+        backdrop.remove();
+      });
+    });
+    backdrop.querySelector('[data-v3-not-yet]')?.addEventListener('click', async () => {
+      await postAnswer(m, 'Not yet', 'queued');
+      backdrop.remove();
+    });
+    backdrop.querySelector('[data-v3-reject]')?.addEventListener('click', async () => {
+      await postAnswer(m, 'Reject', 'done');
+      backdrop.remove();
+    });
+    backdrop.querySelector('[data-v3-agree]')?.addEventListener('click', async () => {
+      await postAnswer(m, 'Agree', 'done');
+      backdrop.remove();
+    });
+    backdrop.querySelector('[data-v3-agree-unpack]')?.addEventListener('click', async () => {
+      // "Agree and unpack" (task spec item 1): records assent AND flags the
+      // card for a depth-two expansion next round — same answer mechanism,
+      // distinguished only by the reply text the harvest reads.
+      await postAnswer(m, 'Agree and unpack — flagged for depth-two expansion next round', 'done');
       backdrop.remove();
     });
   }
@@ -2407,10 +2602,11 @@ V3_JS = r"""
     await fetchMarks();
     paintBlockIndicators();
     updateCountBadge();
+    wirePointerTooltips();
     // Re-decorate whenever the existing comment plumbing reloads threads
     // (new comment/edit saved, reply posted) so the panel/badge/gutter stay live.
     document.addEventListener('soma-comment-saved', async () => {
-      await fetchMarks(); paintBlockIndicators(); updateCountBadge(); if (panelOpen) renderPanel();
+      await fetchMarks(); paintBlockIndicators(); updateCountBadge(); wirePointerTooltips(); if (panelOpen) renderPanel();
     });
   });
 })();
@@ -2751,8 +2947,23 @@ def validated_binding(route_path, workspace, candidate):
     return fields
 
 
-_LEVEL_FRONTMATTER_RE = re.compile(r'^---\s*\n(.*?)\n---\s*\n', re.S)
+_LEVEL_FRONTMATTER_RE = re.compile(r'^\s*(?:<!--.*?-->\s*)*---\s*\n(.*?)\n---\s*\n', re.S)
 _LEVEL_KEY_RE = re.compile(r'^level:\s*(.+?)\s*$', re.M)
+_VIEW_KEY_RE = re.compile(r'^view:\s*(.+?)\s*$', re.M)
+
+
+def compute_default_view(src):
+    """Front-matter `view: v3` (task spec item 14, 2026-09-03) forces a page
+    to open in the v3 mark layer even with no `?view=` query param — used by
+    `mdp-proposal.md` so Mike never lands on classic and has to remember the
+    toggle. An explicit `?view=` in the URL always wins over this default;
+    see `do_GET`."""
+    m = _LEVEL_FRONTMATTER_RE.match(src)
+    if m:
+        vm = _VIEW_KEY_RE.search(m.group(1))
+        if vm and vm.group(1).strip('"\'') == 'v3':
+            return 'v3'
+    return 'classic'
 
 
 def compute_level(src, route_path):
@@ -2790,13 +3001,19 @@ def render_view_toggle(view, route_path, workspace):
 
 
 def render_page(route_path, workspace=DEFAULT_WORKSPACE, view='classic'):
-    view = 'v3' if view == 'v3' else 'classic'
     ws = get_workspace(workspace)
     url_prefix = workspace_url_prefix(workspace)
     fs_path = resolve_page(route_path, workspace)
     with open(fs_path, 'rb') as f:
         src_bytes = f.read()
     src = src_bytes.decode('utf-8')
+    # `view=None` means "no explicit ?view= on the URL" — fall back to the
+    # page's own front-matter default (compute_default_view), else classic.
+    # An explicit view (including `?view=classic` overriding a v3-default
+    # page) always wins.
+    if view is None:
+        view = compute_default_view(src)
+    view = 'v3' if view == 'v3' else 'classic'
     resolver = make_link_resolver(fs_path, route_path, workspace)
     terms_out = {}
     lexicon = get_lexicon_index()
@@ -3290,7 +3507,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if path.startswith('/page/'):
             route_path = path[len('/page/'):]
-            view = qs.get('view', ['classic'])[0]
+            view = qs.get('view', [None])[0]
             try:
                 self._send_html(render_page(route_path, workspace, view=view))
             except NotFoundError:
@@ -3394,7 +3611,8 @@ class Handler(BaseHTTPRequestHandler):
                 # Same sidecar, same `type: mark` envelope, distinguished by
                 # `mark_kind == 'reader-signal'` + a required `signal` field.
                 if mark_kind not in ('agree', 'clarify', 'rewrite', 'strike',
-                                     'note', 'ack', 'ruling', 'reader-signal'):
+                                     'note', 'ack', 'ruling', 'reader-signal',
+                                     'decision'):
                     self._send_json({'error': 'invalid mark_kind'}, status=400)
                     return
                 if not page:
@@ -3469,9 +3687,18 @@ class Handler(BaseHTTPRequestHandler):
             }
             if ctype == 'edit':
                 comment['proposed'] = data.get('proposed')
+                if data.get('replace'):
+                    comment['replace'] = True
             if ctype == 'mark':
                 comment['mark_kind'] = mark_kind
                 comment['strength'] = strength
+                # Generic structured payload for kinds whose panel/dialog rendering
+                # needs more than plain text (e.g. `decision`'s alternatives +
+                # recommended default). Passed through opaque; the client owns the
+                # shape (`{prompt, alternatives:[{key,text}], default}` for
+                # decision marks — see V3_JS `KIND_META.decision` handling).
+                if isinstance(data.get('meta'), dict):
+                    comment['meta'] = data.get('meta')
                 if data.get('scope') in ('section', 'page'):
                     comment['scope'] = data.get('scope')
                 if data.get('reason'):

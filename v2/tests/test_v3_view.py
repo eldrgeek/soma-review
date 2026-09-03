@@ -239,5 +239,143 @@ class EditMarkAndStaleTests(unittest.TestCase):
         self.assertEqual('queued', server.read_comments('docs/page.md')[0]['status'])
 
 
+class ViewFrontmatterDefaultTests(unittest.TestCase):
+    """Front-matter `view: v3` (task spec item 14, 2026-09-03: `mdp-proposal.md`
+    rebuild) forces a page open in the mark layer with no `?view=` on the URL.
+    An explicit `?view=` always wins over the front-matter default."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = self.tmp.name
+        os.makedirs(os.path.join(self.root, 'docs'))
+        self.doc = os.path.join(self.root, 'docs', 'page.md')
+        self.config = os.path.join(self.root, 'workspaces.json')
+        with open(self.config, 'w', encoding='utf-8') as handle:
+            json.dump({
+                'estate': {
+                    'label': 'Test', 'roots': [['docs', 'docs']],
+                    'nav': [], 'home': 'docs/page.md', 'feedback_dir': 'feedback',
+                    'nightly': False, 'tours': False,
+                }
+            }, handle)
+        self.old_root = server.PROJECTS_ROOT
+        self.old_config = server.WORKSPACES_CONFIG
+        server.PROJECTS_ROOT = self.root
+        server.WORKSPACES_CONFIG = self.config
+
+    def tearDown(self):
+        server.PROJECTS_ROOT = self.old_root
+        server.WORKSPACES_CONFIG = self.old_config
+        self.tmp.cleanup()
+
+    def write_doc(self, text):
+        with open(self.doc, 'w', encoding='utf-8') as handle:
+            handle.write(text)
+
+    def test_compute_default_view_reads_frontmatter(self):
+        self.assertEqual('v3', server.compute_default_view('---\nview: "v3"\n---\nBody.\n'))
+        self.assertEqual('classic', server.compute_default_view('---\nlevel: object\n---\nBody.\n'))
+        self.assertEqual('classic', server.compute_default_view('No frontmatter at all.\n'))
+
+    def test_compute_default_view_tolerates_leading_comment(self):
+        # mdp-proposal.md's real shape: `<!-- auto-lexicon -->` before the
+        # `---` frontmatter block.
+        self.assertEqual('v3', server.compute_default_view('<!-- auto-lexicon -->\n---\nview: "v3"\n---\nBody.\n'))
+
+    def test_no_view_param_uses_frontmatter_default(self):
+        self.write_doc('---\nview: "v3"\n---\n# Title\n\nBody text.\n')
+        html = server.render_page('docs/page.md', view=None)
+        self.assertIn('window.__V3_VIEW__ = true', html)
+
+    def test_explicit_view_param_overrides_frontmatter_default(self):
+        self.write_doc('---\nview: "v3"\n---\n# Title\n\nBody text.\n')
+        html = server.render_page('docs/page.md', view='classic')
+        self.assertIn('window.__V3_VIEW__ = false', html)
+
+    def test_no_frontmatter_and_no_param_stays_classic(self):
+        self.write_doc('# Title\n\nBody text.\n')
+        html = server.render_page('docs/page.md', view=None)
+        self.assertIn('window.__V3_VIEW__ = false', html)
+
+
+class DecisionAndReplaceMarkKindTests(unittest.TestCase):
+    """`decision` mark_kind and `replace`-flagged edit marks (Playmaker-model
+    rebuild, task spec items 2iv/2i/7, 2026-09-03): server-side storage only
+    (V3_JS rendering is covered by the live Playwright pass in the dispatch
+    report, not re-verified here — no headless browser in this test file)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = self.tmp.name
+        os.makedirs(os.path.join(self.root, 'docs'))
+        self.doc = os.path.join(self.root, 'docs', 'page.md')
+        self.config = os.path.join(self.root, 'workspaces.json')
+        with open(self.config, 'w', encoding='utf-8') as handle:
+            json.dump({
+                'estate': {
+                    'label': 'Test', 'roots': [['docs', 'docs']],
+                    'nav': [], 'home': 'docs/page.md', 'feedback_dir': 'feedback',
+                    'nightly': False, 'tours': False,
+                }
+            }, handle)
+        self.old_root = server.PROJECTS_ROOT
+        self.old_config = server.WORKSPACES_CONFIG
+        server.PROJECTS_ROOT = self.root
+        server.WORKSPACES_CONFIG = self.config
+
+    def tearDown(self):
+        server.PROJECTS_ROOT = self.old_root
+        server.WORKSPACES_CONFIG = self.old_config
+        self.tmp.cleanup()
+
+    def write_doc(self, text):
+        with open(self.doc, 'w', encoding='utf-8') as handle:
+            handle.write(text)
+
+    def test_decision_mark_round_trips_with_meta_payload(self):
+        self.write_doc('# Title\n\nA sentence with two readings.\n')
+        server.render_page('docs/page.md', view='v3')
+        mapping = blockmap.load_map(server.block_map_path('docs/page.md'))
+        target = mapping['blocks'][1]
+        binding = server.validated_binding('docs/page.md', 'estate', {
+            'block_id': target['id'], 'quote': 'A sentence with two readings.',
+        })
+        row = {
+            'id': 'd1', 'page': 'docs/page.md', 'type': 'mark', 'mark_kind': 'decision',
+            'anchor': None, 'snapshot': '', 'author': 'claude',
+            'text': 'Decision prompt', 'timestamp': '2026-09-03T00:00:00Z',
+            'status': 'queued', 'thread_id': 'd1', 'deleted': False,
+            'meta': {'prompt': 'Pick one', 'alternatives': [
+                {'key': 'A', 'text': 'First reading'}, {'key': 'B', 'text': 'Second reading'},
+            ], 'default': 'A'},
+            **binding,
+        }
+        server.append_comment('docs/page.md', row)
+        saved = server.read_comments('docs/page.md')[0]
+        self.assertEqual('decision', saved['mark_kind'])
+        self.assertEqual('A', saved['meta']['default'])
+        self.assertEqual(2, len(saved['meta']['alternatives']))
+
+    def test_replace_flagged_edit_round_trips(self):
+        self.write_doc('# Title\n\nOriginal claim.\n')
+        server.render_page('docs/page.md', view='v3')
+        mapping = blockmap.load_map(server.block_map_path('docs/page.md'))
+        target = mapping['blocks'][1]
+        binding = server.validated_binding('docs/page.md', 'estate', {
+            'block_id': target['id'], 'quote': 'Original claim.',
+        })
+        row = {
+            'id': 'r1', 'page': 'docs/page.md', 'type': 'edit',
+            'anchor': None, 'snapshot': 'Original claim.',
+            'proposed': 'Restated claim.', 'author': 'claude', 'replace': True,
+            'text': '(proposed edit)', 'timestamp': '2026-09-03T00:00:00Z',
+            'status': 'queued', 'thread_id': 'r1', 'deleted': False, **binding,
+        }
+        server.append_comment('docs/page.md', row)
+        saved = server.read_comments('docs/page.md')[0]
+        self.assertTrue(saved['replace'])
+        self.assertEqual('edit', saved['type'])
+
+
 if __name__ == '__main__':
     unittest.main()

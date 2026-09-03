@@ -1983,6 +1983,19 @@ body.v3-view .sidebar.v3-sidebar-closed + .v3-sidebar-toggle-open{display:block;
 .block-wrap.v3-has-marks{border-left:3px solid #e0b463;}
 .block-wrap.v3-has-marks.v3-all-resolved{border-left-color:#63e089;}
 .block-wrap.v3-has-marks .comment-count-pill{cursor:pointer;}
+.v3-giveup-btn{margin-left:4px;}
+.v3-done-btn{display:block;margin:28px 0 20px;}
+.v3-done-btn:disabled,.v3-giveup-btn:disabled{opacity:.6;cursor:default;}
+.v3-terms-heading{padding:10px 10px 4px;font-size:11px;color:#8a8f98;text-transform:uppercase;letter-spacing:.04em;border-top:1px solid #23262d;margin-top:6px;}
+.v3-term-row{padding:9px 10px;margin:4px 0;border-radius:8px;border:1px solid #23262d;cursor:pointer;background:#1a1c22;}
+.v3-term-row:hover{border-color:#2f6feb;}
+/* Term-link visual is a v3-only, filter-gated affordance (spec item 3): off
+   by default, hover/tooltip capability (wired in PAGE_JS, shared with
+   classic) never depends on this class toggle. Higher specificity than the
+   shared `a.term-link` rule in PAGE_CSS, so it wins without !important and
+   classic (no body.v3-view) is untouched. */
+body.v3-view a.term-link{color:inherit;text-decoration:none;cursor:text;}
+body.v3-view.v3-terms-on a.term-link{color:#a3c9ff;text-decoration:underline dotted;cursor:help;}
 """
 
 V3_JS = r"""
@@ -2011,6 +2024,108 @@ V3_JS = r"""
   let allRows = [];
   let activeFilters = new Set(Object.keys(KIND_META));
   let panelOpen = false;
+  let termsOn = false;
+
+  // --- Read-state tracking (2026-09-03 spec item 1/2): per-block reading
+  // progress, client-tracked as the reader scrolls. States advance
+  // unreached -> skipped (entered viewport, left before 1.5s) -> read
+  // (dwelled >=1.5s) -> interacted (a mark exists on the block — distinct
+  // from "read" per Mike: "I can also skip over ... needs to be distinguished
+  // from reading"). Feeds `last_read_block` and `read_states` on the
+  // give-up/done reader-signal marks below.
+  const blockStates = {};
+  let blockEls = [];
+  let deepestReadIndex = -1;
+  let readObserver = null;
+  const readTimers = new Map();
+
+  function bumpDeepest(id){
+    const idx = blockEls.findIndex(el => el.dataset.blockId === id);
+    if (idx > deepestReadIndex) deepestReadIndex = idx;
+  }
+
+  function initReadTracking(){
+    blockEls = Array.from(document.querySelectorAll('.block-wrap[data-block-id]'));
+    blockEls.forEach(el => { blockStates[el.dataset.blockId] = blockStates[el.dataset.blockId] || 'unreached'; });
+    if (!('IntersectionObserver' in window)) return;
+    readObserver = new IntersectionObserver((entries) => {
+      entries.forEach(entry => {
+        const id = entry.target.dataset.blockId;
+        if (entry.isIntersecting) {
+          if (blockStates[id] === 'unreached') blockStates[id] = 'skipped';
+          if (!readTimers.has(id)) {
+            const t = setTimeout(() => {
+              readTimers.delete(id);
+              if (blockStates[id] !== 'interacted') blockStates[id] = 'read';
+              bumpDeepest(id);
+            }, 1500);
+            readTimers.set(id, t);
+          }
+        } else {
+          const t = readTimers.get(id);
+          if (t) { clearTimeout(t); readTimers.delete(id); }
+        }
+      });
+    }, {threshold: 0.5});
+    blockEls.forEach(el => readObserver.observe(el));
+  }
+
+  function markInteractedFromRows(){
+    allRows.forEach(m => {
+      if (m.block_id && blockStates[m.block_id] !== undefined) {
+        blockStates[m.block_id] = 'interacted';
+        bumpDeepest(m.block_id);
+      }
+    });
+  }
+
+  function deepestReadBlockId(){
+    return (deepestReadIndex >= 0 && blockEls[deepestReadIndex]) ? blockEls[deepestReadIndex].dataset.blockId : null;
+  }
+
+  function currentReadStates(){
+    const out = {};
+    blockEls.forEach(el => { out[el.dataset.blockId] = blockStates[el.dataset.blockId] || 'unreached'; });
+    return out;
+  }
+
+  async function sendReaderSignal(signal, btn){
+    if (!btn || btn.dataset.recorded === '1') return;
+    btn.dataset.recorded = '1';
+    const payload = {
+      page: ROUTE, type: 'mark', mark_kind: 'reader-signal', signal,
+      last_read_block: deepestReadBlockId(),
+    };
+    if (signal === 'done') payload.read_states = currentReadStates();
+    try {
+      await fetch(`${API_BASE}/api/comments`, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+      btn.textContent = 'Recorded';
+      btn.disabled = true;
+    } catch(_) {
+      btn.dataset.recorded = '';
+    }
+  }
+
+  // --- Terms filter (spec item 3): off by default. ON makes term-links
+  // visually marked (CSS class toggle, no DOM change) and lists every
+  // occurrence in the panel so a reader can walk the document term by term.
+  function decodeNormText(el){
+    try { return atob((el && el.dataset.normText) || ''); } catch(_) { return ''; }
+  }
+  function firstSentenceOf(text){
+    const m = text.match(/^[\s\S]*?[.!?](?=\s|$)/);
+    return (m ? m[0] : text).trim().slice(0, 200);
+  }
+  function collectTermOccurrences(){
+    return Array.from(document.querySelectorAll('a.term-link')).map(a => {
+      const wrap = a.closest('.block-wrap[data-block-id]');
+      return {
+        term: a.textContent,
+        blockId: wrap ? wrap.dataset.blockId : null,
+        firstSentence: firstSentenceOf(decodeNormText(wrap)),
+      };
+    });
+  }
 
   function currentShaMap(){
     const map = {};
@@ -2030,7 +2145,11 @@ V3_JS = r"""
 
   async function fetchMarks(){
     const res = await fetch(`${API_BASE}/api/comments?page=${encodeURIComponent(ROUTE)}`);
-    allRows = decorate(await res.json());
+    const raw = await res.json();
+    // Reader-signal marks (give-up/done) are page-level telemetry, not review
+    // marks — keep them out of the marks panel/badge/gutter entirely.
+    allRows = decorate(raw.filter(c => !(c.type === 'mark' && c.mark_kind === 'reader-signal')));
+    markInteractedFromRows();
     return allRows;
   }
 
@@ -2063,9 +2182,13 @@ V3_JS = r"""
     const list = document.getElementById('v3-mark-list');
     if (!list) return;
     const rows = allRows.filter(m => activeFilters.has(m.kind));
-    if (!rows.length) { list.innerHTML = '<div class="v3-panel-empty">No marks of the selected type(s).</div>'; return; }
+    const terms = termsOn ? collectTermOccurrences() : [];
+    if (!rows.length && !terms.length) {
+      list.innerHTML = '<div class="v3-panel-empty">No marks of the selected type(s).</div>';
+      return;
+    }
     rows.sort((a,b) => (a.timestamp||'').localeCompare(b.timestamp||''));
-    list.innerHTML = rows.map(m => {
+    let markHtml = rows.map(m => {
       const meta = KIND_META[m.kind] || KIND_META.note;
       const status = m.stale ? 'stale' : (m.resolved ? 'resolved' : 'open');
       const quote = m.quote || m.snapshot || m.text || '(page-level)';
@@ -2075,10 +2198,26 @@ V3_JS = r"""
         <div class="v3-mr-quote">${escapeHtml(quote)}</div>
       </div>`;
     }).join('');
+    let termsHtml = '';
+    if (termsOn) {
+      termsHtml = `<div class="v3-terms-heading">Terms &middot; ${terms.length} occurrence${terms.length===1?'':'s'}</div>` +
+        (terms.length ? terms.map(t => `<div class="v3-term-row" data-block-id="${escapeHtml(t.blockId||'')}">
+          <div class="v3-mr-top"><span class="v3-mr-kind">${escapeHtml(t.term)}</span></div>
+          <div class="v3-mr-quote">${escapeHtml(t.firstSentence)}</div>
+        </div>`).join('') : '<div class="v3-panel-empty">No terms on this page.</div>');
+    }
+    list.innerHTML = markHtml + termsHtml;
     list.querySelectorAll('.v3-mark-row').forEach(row => {
       row.addEventListener('click', () => {
         const m = allRows.find(r => r.id === row.dataset.markId);
         if (m) openDialog(m);
+      });
+    });
+    list.querySelectorAll('.v3-term-row').forEach(row => {
+      row.addEventListener('click', () => {
+        const id = row.dataset.blockId;
+        const el = id ? document.querySelector(`.block-wrap[data-block-id="${CSS.escape(id)}"]`) : null;
+        if (el) el.scrollIntoView({block:'center', behavior:'smooth'});
       });
     });
   }
@@ -2086,16 +2225,25 @@ V3_JS = r"""
   function renderFilters(){
     const row = document.getElementById('v3-filter-row');
     if (!row) return;
-    row.innerHTML = Object.keys(KIND_META).map(k =>
+    const kindChips = Object.keys(KIND_META).map(k =>
       `<button class="v3-filter-chip${activeFilters.has(k)?' active':''}" data-kind="${k}">${KIND_META[k].label}</button>`
     ).join('');
-    row.querySelectorAll('.v3-filter-chip').forEach(chip => {
+    row.innerHTML = kindChips +
+      `<button class="v3-filter-chip${termsOn?' active':''}" id="v3-terms-chip" data-terms-toggle>Terms</button>`;
+    row.querySelectorAll('.v3-filter-chip[data-kind]').forEach(chip => {
       chip.addEventListener('click', () => {
         const k = chip.dataset.kind;
         if (activeFilters.has(k)) activeFilters.delete(k); else activeFilters.add(k);
         chip.classList.toggle('active');
         renderPanel();
       });
+    });
+    const termsChip = row.querySelector('#v3-terms-chip');
+    termsChip.addEventListener('click', () => {
+      termsOn = !termsOn;
+      document.body.classList.toggle('v3-terms-on', termsOn);
+      termsChip.classList.toggle('active', termsOn);
+      renderPanel();
     });
   }
 
@@ -2217,9 +2365,11 @@ V3_JS = r"""
     const isObject = level === 'object';
     header.innerHTML = `<span class="v3-level-pill${isObject?' is-object':''}">${escapeHtml(level)}</span>
       <h1>${escapeHtml(document.title.replace(/ .. soma-review$/, ''))}</h1>
-      <button class="v3-marks-btn" id="v3-marks-btn">Marks<span class="v3-marks-count">0</span></button>`;
+      <button class="v3-marks-btn" id="v3-marks-btn">Marks<span class="v3-marks-count">0</span></button>
+      <button class="v3-marks-btn v3-giveup-btn" id="v3-giveup-btn" title="Tell the origin where the document lost you">I've given up</button>`;
     main.insertBefore(header, main.firstChild);
     header.querySelector('#v3-marks-btn').addEventListener('click', () => panelOpen ? closePanel() : openPanel());
+    header.querySelector('#v3-giveup-btn').addEventListener('click', (e) => sendReaderSignal('gave-up', e.currentTarget));
   }
 
   function wirePanel(){
@@ -2233,11 +2383,27 @@ V3_JS = r"""
     panel.querySelector('#v3-panel-close').addEventListener('click', closePanel);
   }
 
+  function wireEndOfDoc(){
+    // End-of-document "I'm done" (spec item 1) — inserted client-side right
+    // before the page-discussion section, which every workspace page renders
+    // unconditionally, so this never depends on doc content/length.
+    const anchor = document.querySelector('.page-discussion') || document.getElementById('unresolved-marks');
+    if (!anchor || !anchor.parentNode) return;
+    const btn = document.createElement('button');
+    btn.className = 'v3-marks-btn v3-done-btn';
+    btn.id = 'v3-done-btn';
+    btn.textContent = "I'm done";
+    anchor.parentNode.insertBefore(btn, anchor);
+    btn.addEventListener('click', (e) => sendReaderSignal('done', e.currentTarget));
+  }
+
   document.addEventListener('DOMContentLoaded', async () => {
     document.body.classList.add('v3-view');
     wireSidebar();
     wireHeader();
     wirePanel();
+    wireEndOfDoc();
+    initReadTracking();
     await fetchMarks();
     paintBlockIndicators();
     updateCountBadge();
@@ -3160,6 +3326,41 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({'error': 'unknown workspace'}, status=404)
             return
 
+        if path == '/api/read-state':
+            # Harvest-facing read of the latest reader-signal ('done' or
+            # 'gave-up') mark for a page — the deepest reached block plus the
+            # full per-block read/skip/interact map (2026-09-03 spec item 4).
+            page = qs.get('page', [''])[0]
+            if not page:
+                self._send_json({'error': 'page required'}, status=400)
+                return
+            try:
+                signals = [
+                    c for c in read_comments(page, workspace)
+                    if not c.get('deleted') and c.get('type') == 'mark'
+                    and c.get('mark_kind') == 'reader-signal'
+                ]
+            except NotFoundError:
+                self._send_json({'error': 'unknown workspace'}, status=404)
+                return
+            if not signals:
+                self._send_json({'found': False})
+                return
+            # Tie-break on append order (JSONL sidecar order), not just the
+            # second-resolution timestamp — two signals in the same second
+            # (e.g. a quick gave-up followed immediately by done) must still
+            # resolve to whichever was actually written last.
+            latest = max(enumerate(signals), key=lambda pair: (pair[1].get('timestamp') or '', pair[0]))[1]
+            self._send_json({
+                'found': True,
+                'signal': latest.get('signal'),
+                'last_read_block': latest.get('last_read_block'),
+                'read_states': latest.get('read_states') or {},
+                'timestamp': latest.get('timestamp'),
+                'author': latest.get('author'),
+            })
+            return
+
         if path == '/api/workspaces':
             workspaces = load_workspaces()
             self._send_json({
@@ -3188,14 +3389,26 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if ctype == 'mark':
                 mark_kind = data.get('mark_kind')
+                # `reader-signal` is not one of the Playmaker-model K kinds — it is
+                # the v3 "I've given up" / "I'm done" pair (Mike, 2026-09-03).
+                # Same sidecar, same `type: mark` envelope, distinguished by
+                # `mark_kind == 'reader-signal'` + a required `signal` field.
                 if mark_kind not in ('agree', 'clarify', 'rewrite', 'strike',
-                                     'note', 'ack', 'ruling'):
+                                     'note', 'ack', 'ruling', 'reader-signal'):
                     self._send_json({'error': 'invalid mark_kind'}, status=400)
                     return
                 if not page:
                     self._send_json({'error': 'page required for mark'}, status=400)
                     return
-                text = (data.get('text') or '').strip() or mark_kind.title()
+                if mark_kind == 'reader-signal':
+                    reader_signal = data.get('signal')
+                    if reader_signal not in ('gave-up', 'done'):
+                        self._send_json({'error': 'invalid signal'}, status=400)
+                        return
+                text = (data.get('text') or '').strip() or (
+                    f'Reader signal: {data.get("signal")}' if mark_kind == 'reader-signal'
+                    else mark_kind.title()
+                )
                 try:
                     strength = max(0.5, min(3.0, float(data.get('strength', 1))))
                 except (TypeError, ValueError):
@@ -3267,6 +3480,23 @@ class Handler(BaseHTTPRequestHandler):
                     comment['proposed'] = data.get('proposed')
                 if data.get('sent_because'):
                     comment['sent_because'] = str(data.get('sent_because'))
+                if mark_kind == 'reader-signal':
+                    # Spec literal field names (`kind`, `signal`) alongside the
+                    # schema's existing `mark_kind`, so a reader can query either
+                    # vocabulary. `last_read_block` = deepest block id the v3
+                    # client had marked >=1.5s-dwell 'read' (or 'interacted') at
+                    # click time; `read_states` (only meaningful for 'done') is
+                    # the full per-block {unreached|skipped|read|interacted} map
+                    # the client tracked while scrolling — lets the harvest and
+                    # bracketed-assent rule distinguish read from skipped.
+                    comment['kind'] = 'reader-signal'
+                    comment['signal'] = reader_signal
+                    comment['last_read_block'] = data.get('last_read_block')
+                    read_states = data.get('read_states')
+                    if reader_signal == 'done' and isinstance(read_states, dict):
+                        comment['read_states'] = {
+                            str(k): str(v) for k, v in read_states.items()
+                        }
             if ctype == 'verdict':
                 comment['verdict'] = data.get('verdict')
                 comment['row_id'] = row_id

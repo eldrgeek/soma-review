@@ -21,7 +21,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, unquote
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from mdblocks import parse_markdown, render_inline  # noqa: E402
+from mdblocks import (  # noqa: E402
+    parse_markdown, render_inline, build_lexicon_index, strip_auto_lexicon_marker,
+    _esc, _esc_attr, _first_sentence,
+)
 import blockmap  # noqa: E402
 import tours as tour_engine  # noqa: E402  (Quinn tours of completed jobs — see tours.py)
 import cursor_intake  # noqa: E402  (Grok/Cursor intake — see SOMA/cursor-intake/README.md)
@@ -31,6 +34,7 @@ DISPATCH_PROMPT_TEMPLATE = os.path.join(os.path.dirname(os.path.abspath(__file__
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static')
 WORKSPACES_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'workspaces.json')
 PUBLIC_FILMS_PATH = os.path.join(PROJECTS_ROOT, '_estate', 'public-films.json')
+LEXICON_MD_PATH = os.path.join(PROJECTS_ROOT, 'soma-lexicon', 'SOMA-LEXICON.md')
 
 # Nightly worktree reports get their own synthetic route: nightly/<worktree-name>
 NIGHTLY_PREFIX = 'nightly'
@@ -166,6 +170,44 @@ def fs_path_to_route(fs_path, workspace=DEFAULT_WORKSPACE):
             rel = os.path.relpath(fs_path, r)
             return f'{p}/{rel}'
     return None
+
+
+_LEXICON_CACHE = {'mtime': None, 'index': None}
+
+
+def get_lexicon_index():
+    """Load + parse the SOMA Lexicon, cached by mtime so an edit to the source
+    file is picked up on the next request without a server restart (same
+    "reload fresh, no restart needed" contract as workspaces.json)."""
+    try:
+        mtime = os.path.getmtime(LEXICON_MD_PATH)
+    except OSError:
+        return {'by_slug': {}, 'by_alias': {}}
+    if _LEXICON_CACHE['mtime'] != mtime:
+        with open(LEXICON_MD_PATH, 'r', encoding='utf-8') as f:
+            text = f.read()
+        _LEXICON_CACHE['index'] = build_lexicon_index(text)
+        _LEXICON_CACHE['mtime'] = mtime
+    return _LEXICON_CACHE['index']
+
+
+def lexicon_entry_popover_html(entry, url_prefix, lexicon_route):
+    """Popover content for a lexicon-backed term-link: gloss in bold, then the
+    first sentence of "What we mean.", then a "full entry" link to the real
+    lexicon page — only if that page is whitelisted (resolvable) in the
+    current workspace; otherwise the bold gloss + sentence still render, just
+    without the deep link."""
+    gloss_html = f'<p><strong>{_esc(entry["gloss"])}</strong></p>'
+    sentence_html = f'<p>{_esc(entry["first_sentence"])}</p>'
+    link_html = ''
+    if lexicon_route:
+        href = f'{url_prefix}/page/{lexicon_route}#{entry["anchor"]}'
+        link_html = (
+            f'<p class="term-popover-full">'
+            f'<a href="{_esc_attr(href)}" class="internal-link" target="_blank" rel="noopener">full entry &rarr;</a>'
+            f'</p>'
+        )
+    return gloss_html + sentence_html + link_html
 
 
 def resolve_raw(route_path, workspace=DEFAULT_WORKSPACE):
@@ -1993,8 +2035,14 @@ def list_item_ranges(text):
     return ranges
 
 
-def mark_layer_inner(block, link_resolver=None, terms=None):
-    """Render prose as sentence-addressable spans without disturbing rich blocks."""
+def mark_layer_inner(block, link_resolver=None, terms=None, lexicon=None, auto_lexicon=False):
+    """Render prose as sentence-addressable spans without disturbing rich blocks.
+
+    Each sentence is a separate render_inline() call, but auto-lexicon linking's
+    "first occurrence" rule is scoped to the whole BLOCK (paragraph), not the
+    sentence — a single `auto_seen` set is created once here and threaded into
+    every sentence's render_inline() call so occurrence-tracking spans the block.
+    """
     kind = block['kind']
     if kind == 'list':
         block['mark_layer_list_units'] = [
@@ -2005,24 +2053,31 @@ def mark_layer_inner(block, link_resolver=None, terms=None):
     if kind not in ('paragraph', 'blockquote'):
         return block['html'], False
     pieces = []
+    auto_seen = set()
     for start, end, quote in sentence_ranges(block['text']):
         quote_b64 = __import__('base64').b64encode(quote.encode('utf-8')).decode('ascii')
         pieces.append(
             f'<span class="mark-sentence" data-from="{start}" data-to="{end}" '
-            f'data-quote="{quote_b64}">{render_inline(quote, link_resolver, terms=terms)}</span>'
+            f'data-quote="{quote_b64}">'
+            f'{render_inline(quote, link_resolver, terms=terms, lexicon=lexicon, auto_lexicon=auto_lexicon, auto_seen=auto_seen)}'
+            f'</span>'
         )
     content = ' '.join(pieces)
     tag = 'blockquote' if kind == 'blockquote' else 'p'
     return f'<{tag}>{content}</{tag}>', True
 
 
-def render_block_html(block, route_path, status_chip=None, link_resolver=None, terms=None):
+def render_block_html(block, route_path, status_chip=None, link_resolver=None, terms=None,
+                       lexicon=None, auto_lexicon=False):
     kind = block['kind']
     anchor = block['anchor']
     block_id = _html_attr_escape(block['id'])
     block_sha = _html_attr_escape(blockmap.block_text_sha(block))
     snapshot = _html_attr_escape(block['snapshot'])
-    inner, has_sentence_units = mark_layer_inner(block, link_resolver, terms=terms)
+    inner, has_sentence_units = mark_layer_inner(
+        block, link_resolver, terms=terms, lexicon=lexicon,
+        auto_lexicon=auto_lexicon and kind != 'heading',
+    )
     # Raw markdown source, base64'd, so the client can swap rendered HTML for an
     # editable <textarea> pre-filled with the exact source text (edit-as-comment,
     # see v2/CLAUDE.md "CM6 vs contenteditable" note). Base64 sidesteps any HTML/JS
@@ -2178,13 +2233,9 @@ def render_page(route_path, workspace=DEFAULT_WORKSPACE):
     src = src_bytes.decode('utf-8')
     resolver = make_link_resolver(fs_path, route_path, workspace)
     terms_out = {}
-    title, blocks = parse_markdown(src, link_resolver=resolver, terms_out=terms_out)
-    # Slim map for the hover-popover JS: slug -> rendered definition html (which may
-    # itself contain nested .term-link anchors — recursion handled by mdblocks.py's
-    # extract_terms()/render_inline(), this is just the transport to the client).
-    term_defs_json = json.dumps({
-        slug: {'term': v['term'], 'html': v['html']} for slug, v in terms_out.items()
-    })
+    lexicon = get_lexicon_index()
+    auto_lexicon_page, _ = strip_auto_lexicon_marker(src)
+    title, blocks = parse_markdown(src, link_resolver=resolver, terms_out=terms_out, lexicon=lexicon)
     _new_map, reconcile_report = reconcile_parsed_page(
         route_path, workspace, src_bytes, blocks
     )
@@ -2224,8 +2275,32 @@ def render_page(route_path, workspace=DEFAULT_WORKSPACE):
             status_chip=(wq_status_chip(b) if badges_on else None),
             link_resolver=resolver,
             terms=terms_out,
+            lexicon=lexicon,
+            auto_lexicon=auto_lexicon_page,
         )
         for b in blocks)
+
+    # Slim map for the hover-popover JS: slug -> rendered definition html (which may
+    # itself contain nested .term-link anchors — recursion handled by mdblocks.py's
+    # extract_terms()/render_inline(), this is just the transport to the client).
+    # Lexicon entries are namespaced `lex-<slug>` (never collides with a page-local
+    # slug) and only included if this page actually rendered a term-link to them —
+    # built AFTER blocks_html so a page with zero lexicon references embeds an
+    # empty lexicon slice, same as before this feature existed (byte-identical
+    # __TERM_DEFS__ for every unflagged, lexicon-free page).
+    term_defs = {slug: {'term': v['term'], 'html': v['html']} for slug, v in terms_out.items()}
+    referenced_lex_slugs = set(re.findall(r'data-term-slug="lex-([a-z0-9-]+)"', blocks_html))
+    if referenced_lex_slugs:
+        lexicon_route = fs_path_to_route(LEXICON_MD_PATH, workspace) if os.path.isfile(LEXICON_MD_PATH) else None
+        for slug in referenced_lex_slugs:
+            entry = lexicon['by_slug'].get(slug)
+            if entry:
+                term_defs[f'lex-{slug}'] = {
+                    'term': entry['term'],
+                    'html': lexicon_entry_popover_html(entry, url_prefix, lexicon_route),
+                }
+    term_defs_json = json.dumps(term_defs)
+
     # trailing newline keeps flagged-page head formatting tidy; empty string on
     # non-flagged pages keeps their rendered HTML byte-identical to pre-feature.
     chip_head = f'<style>{STATUS_CHIP_CSS}</style>\n' if badges_on else ''

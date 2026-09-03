@@ -156,7 +156,145 @@ def _first_sentence(text):
     return m.group(1) if m else plain
 
 
-def extract_terms(src, link_resolver=None):
+_LEXICON_HEADING_RE = re.compile(r'^###\s+(.+?)\s*\xb7\s*(.*)$')
+_AUTO_LEXICON_MARKER_RE = re.compile(r'[ \t]*<!--\s*auto-lexicon\s*-->[ \t]*\n?')
+_FRONT_MATTER_RE = re.compile(r'\A---[ \t]*\n(.*?)\n---[ \t]*\n', re.S)
+_FRONT_MATTER_FLAG_RE = re.compile(r'^\s*auto-lexicon\s*:\s*(true|yes|on)\s*$', re.I | re.M)
+
+
+def strip_auto_lexicon_marker(src):
+    """Detect the per-page auto-lexicon opt-in and remove the marker from the
+    rendered source so it never shows up as visible text (same treatment normal
+    markdown renderers give front matter).
+
+    Two forms, either enables it: a front-matter block containing `auto-lexicon:
+    true` (stripped only when that key is present, so an ordinary `---` divider
+    at the top of a doc is never touched), or an `<!-- auto-lexicon -->` HTML
+    comment anywhere in the document (stripped in place).
+
+    Returns (auto_lexicon: bool, cleaned_src). A doc with neither marker returns
+    (False, src) UNCHANGED — this is what keeps every pre-existing page
+    byte-identical: the opt-in is off by default and costs nothing until used.
+    """
+    auto = False
+    fm = _FRONT_MATTER_RE.match(src)
+    if fm and _FRONT_MATTER_FLAG_RE.search(fm.group(1)):
+        auto = True
+        src = src[fm.end():]
+    if _AUTO_LEXICON_MARKER_RE.search(src):
+        auto = True
+        src = _AUTO_LEXICON_MARKER_RE.sub('', src, count=1)
+    return auto, src
+
+
+def build_lexicon_index(md_text):
+    """Parse the SOMA Lexicon's markdown into a lookup index.
+
+    Entries are `### Term · gloss` headings followed eventually by a
+    `**What we mean.**` paragraph (some entries have a `**Plain reading.**`
+    paragraph first — skipped, not the definition). Aliases: when the heading's
+    TERM segment (the part before `·`) lists multiple names separated by
+    ` / ` (e.g. `Pulse / Pulse Core`, `SCS / SAIS`, `$ARR / DARR`), each name is
+    a separate alias for the same entry, all resolving to one slug (the first
+    alias, slugified).
+
+    Returns {'by_slug': {slug: entry}, 'by_alias': {alias_lower: slug}} where
+    entry = {'term', 'slug', 'gloss', 'first_sentence', 'aliases', 'anchor'}.
+    `anchor` is the id the real rendered lexicon page gives this heading
+    (slugify() of the FULL heading text, matching parse_markdown's own
+    heading-id scheme) — used for the "full entry" deep link, distinct from
+    `slug` (identifier keyed off the primary alias only, used for lookup).
+    """
+    lines = md_text.split('\n')
+    n = len(lines)
+    by_slug = {}
+    by_alias = {}
+    i = 0
+    while i < n:
+        m = _LEXICON_HEADING_RE.match(lines[i].strip())
+        if not m:
+            i += 1
+            continue
+        term_part, gloss = m.group(1).strip(), m.group(2).strip()
+        anchor = slugify(f'{term_part} \xb7 {gloss}')
+        aliases = [a.strip() for a in term_part.split(' / ') if a.strip()]
+        if not aliases:
+            i += 1
+            continue
+        primary = aliases[0]
+        slug = slugify(primary)
+        # Find the "What we mean." paragraph: scan forward until the next
+        # heading, collecting paragraph text, and take the first one that
+        # starts with that marker (skips a leading "Plain reading." aside).
+        i += 1
+        def_raw = ''
+        para = []
+        while i < n and not re.match(r'^#{1,6}\s+', lines[i].strip()):
+            stripped = lines[i].strip()
+            if stripped == '':
+                joined = ' '.join(para).strip()
+                if joined.lower().startswith('**what we mean.**'):
+                    def_raw = joined[len('**what we mean.**'):].strip()
+                    break
+                para = []
+            else:
+                para.append(stripped)
+            i += 1
+        else:
+            joined = ' '.join(para).strip()
+            if joined.lower().startswith('**what we mean.**'):
+                def_raw = joined[len('**what we mean.**'):].strip()
+        if not def_raw:
+            def_raw = gloss  # fallback: no "What we mean." paragraph found
+        entry = {
+            'term': primary, 'slug': slug, 'gloss': gloss,
+            'first_sentence': _first_sentence(def_raw), 'aliases': aliases,
+            'anchor': anchor,
+        }
+        by_slug[slug] = entry
+        for alias in aliases:
+            by_alias[alias.lower()] = slug
+        # continue outer scan from wherever the inner walk left off (don't
+        # re-advance past a heading line we need the outer loop to see)
+    return {'by_slug': by_slug, 'by_alias': by_alias}
+
+
+def _lookup_lexicon(key, lexicon):
+    """Resolve `key` (a slug, an alias, or free text) against a lexicon index.
+    Tries, in order: exact slug, lowercase alias, slugify(key)."""
+    if not lexicon or not key:
+        return None
+    key = key.strip()
+    if not key:
+        return None
+    if key in lexicon['by_slug']:
+        return lexicon['by_slug'][key]
+    alias_slug = lexicon['by_alias'].get(key.lower())
+    if alias_slug:
+        return lexicon['by_slug'][alias_slug]
+    guess = slugify(key)
+    if guess in lexicon['by_slug']:
+        return lexicon['by_slug'][guess]
+    return None
+
+
+def _find_lexicon_by_label(label, lexicon):
+    """Same fuzzy label match as _find_term_by_label(), against the lexicon's
+    alias set instead of a page-local terms table."""
+    if not lexicon or not label:
+        return None
+    label_l = label.strip().lower()
+    if not label_l:
+        return None
+    if label_l in lexicon['by_alias']:
+        return lexicon['by_slug'][lexicon['by_alias'][label_l]]
+    for alias_l, slug in lexicon['by_alias'].items():
+        if label_l in alias_l or alias_l in label_l:
+            return lexicon['by_slug'][slug]
+    return None
+
+
+def extract_terms(src, link_resolver=None, lexicon=None):
     """Scan raw markdown for a "Terms" heading (any level, exact text match,
     case-insensitive) and the bullet-list definitions under it, of the form
     `**term** — definition`. Returns {slug: {'term', 'slug', 'def_raw',
@@ -208,7 +346,7 @@ def extract_terms(src, link_resolver=None):
     # definition resolve correctly).
     for entry in terms.values():
         entry['first_sentence'] = _first_sentence(entry['def_raw'])
-        entry['html'] = render_inline(entry['def_raw'], link_resolver, terms=terms)
+        entry['html'] = render_inline(entry['def_raw'], link_resolver, terms=terms, lexicon=lexicon)
     return terms
 
 
@@ -232,13 +370,35 @@ def _find_term_by_label(label, terms):
     return None
 
 
-def render_inline(text, link_resolver=None, terms=None):
+def render_inline(text, link_resolver=None, terms=None, lexicon=None, auto_lexicon=False, auto_seen=None):
     """Render inline markdown (links, bold, italic, code) to HTML.
     link_resolver(href) -> href_out, is_internal
     `terms`, if given, is the {slug: {...}} table from extract_terms(); links whose
     target resolves to `#terms` (matched by label) or `#term-<slug>` (matched by
     slug) render as `.term-link`s carrying `data-def`/`data-term-slug` for the
     hover-popover JS, plus a plain `title` fallback for non-JS hover.
+
+    `lexicon`, if given, is a {'by_slug', 'by_alias'} index from
+    build_lexicon_index() — the SOMA Lexicon fallback. It resolves three things
+    a page's own `terms` table can't: (1) a `#terms`/`#term-<slug>` link the
+    page-local table has no entry for, (2) the lightweight `lexicon:<term>` href
+    scheme, (3) a `#lex-<slug>` anchor. Page-local terms always win when both
+    would match. Lexicon term-links are namespaced `lex-<slug>` in
+    `data-term-slug` (vs. a bare `<slug>` for page-local terms) so the two
+    tables never collide in the client's `__TERM_DEFS__` map.
+
+    `auto_lexicon`, if true (and `lexicon` given), additionally wraps the FIRST
+    occurrence of each lexicon term found in this call's plain text as a
+    term-link — this is the opt-in automatic-linking mode (see
+    strip_auto_lexicon_marker()). Caller is responsible for never passing
+    auto_lexicon=True for headings or Terms-section content (this function has
+    no notion of "which block/section is this").
+
+    `auto_seen`, if given, is a `set()` the caller owns and reuses across
+    multiple render_inline() calls that together make up one logical paragraph
+    (e.g. the Mark Layer's one-call-per-sentence rendering) -- without it,
+    "first occurrence" would reset per call instead of per paragraph. Pass the
+    SAME set instance across those calls; this function only ever adds to it.
     """
     # Protect inline code spans first so we don't mangle markup inside them.
     placeholders = []
@@ -274,24 +434,44 @@ def render_inline(text, link_resolver=None, terms=None):
     def link_sub(m):
         label, href = m.group(1), m.group(2)
         label_html = _esc(label)
-        href_out, cls, extra = _resolve(href)
+        is_lexicon_scheme = href.startswith('lexicon:')
+        href_out, cls, extra = ('#lex-pending', 'internal-link', '') if is_lexicon_scheme else _resolve(href)
         term_entry = None
-        if terms:
-            frag = None
+        frag = None
+        if not is_lexicon_scheme:
             if '#' in href_out:
                 frag = href_out.rsplit('#', 1)[1].lower()
             elif '#' in href:
                 frag = href.rsplit('#', 1)[1].lower()
+        if terms:
             if frag == 'terms':
                 term_entry = _find_term_by_label(label, terms)
             elif frag and frag.startswith('term-'):
                 term_entry = terms.get(frag[len('term-'):])
+        lex_entry = None
+        if term_entry is None and lexicon:
+            if is_lexicon_scheme:
+                key = href[len('lexicon:'):]
+                lex_entry = _lookup_lexicon(key, lexicon) or _find_lexicon_by_label(label, lexicon)
+            elif frag == 'terms':
+                lex_entry = _find_lexicon_by_label(label, lexicon)
+            elif frag and frag.startswith('term-'):
+                lex_entry = _lookup_lexicon(frag[len('term-'):], lexicon)
+            elif frag and frag.startswith('lex-'):
+                lex_entry = _lookup_lexicon(frag[len('lex-'):], lexicon)
         if term_entry:
             # Always an in-page fragment jump — never target=_blank even if the
             # generic resolver would have called this an external link.
             def_esc = _esc_attr(term_entry['first_sentence'])
             return stash(
                 f'<a href="{_esc(href_out)}" class="term-link" data-term-slug="{_esc_attr(term_entry["slug"])}"'
+                f' data-def="{def_esc}" title="{def_esc}">{label_html}</a>'
+            )
+        if lex_entry:
+            def_esc = _esc_attr(lex_entry['first_sentence'])
+            return stash(
+                f'<a href="#lex-{_esc_attr(lex_entry["slug"])}" class="term-link"'
+                f' data-term-slug="lex-{_esc_attr(lex_entry["slug"])}"'
                 f' data-def="{def_esc}" title="{def_esc}">{label_html}</a>'
             )
         return stash(f'<a href="{_esc(href_out)}" class="{cls}"{extra}>{label_html}</a>')
@@ -337,6 +517,60 @@ def render_inline(text, link_resolver=None, terms=None):
 
     text = _BARE_URL_RE.sub(bare_url_sub, text)
 
+    # Opt-in automatic lexicon linking: wrap the FIRST occurrence of each
+    # lexicon term still present as plain text (code spans, existing links, and
+    # bare URLs are already stashed to \x00N\x00 placeholders above, so this
+    # regex can never reach inside them). Multi-word aliases match case-
+    # insensitively; single-word aliases (capitalized coinages like SOMA,
+    # Yeshie, Pulse) match case-sensitively, so lowercase everyday uses of the
+    # same word are left alone.
+    if auto_lexicon and lexicon and lexicon.get('by_alias'):
+        all_aliases = sorted(
+            {alias for slug, entry in lexicon['by_slug'].items() for alias in entry['aliases']},
+            key=len, reverse=True,
+        )
+        if all_aliases:
+            parts = []
+            for alias in all_aliases:
+                esc = re.escape(alias)
+                if ' ' in alias:
+                    parts.append(f'(?i:\\b{esc}\\b)')
+                else:
+                    parts.append(f'\\b{esc}\\b')
+            auto_re = re.compile('|'.join(parts))
+            seen_slugs = auto_seen if auto_seen is not None else set()
+
+            def auto_sub(m):
+                matched = m.group(0)
+                # Page-local Terms still win, same rule as the explicit
+                # #terms/#term-<slug> fallback above: if this page defines its
+                # own meaning for the matched word, link to that instead of
+                # the lexicon's.
+                local_entry = _find_term_by_label(matched, terms) if terms else None
+                if local_entry:
+                    seen_key = f'local:{local_entry["slug"]}'
+                    if seen_key in seen_slugs:
+                        return matched
+                    seen_slugs.add(seen_key)
+                    def_esc = _esc_attr(local_entry['first_sentence'])
+                    return stash(
+                        f'<a href="#term-{_esc_attr(local_entry["slug"])}" class="term-link"'
+                        f' data-term-slug="{_esc_attr(local_entry["slug"])}"'
+                        f' data-def="{def_esc}" title="{def_esc}">{_esc(matched)}</a>'
+                    )
+                entry = _lookup_lexicon(matched, lexicon)
+                if entry is None or entry['slug'] in seen_slugs:
+                    return matched
+                seen_slugs.add(entry['slug'])
+                def_esc = _esc_attr(entry['first_sentence'])
+                return stash(
+                    f'<a href="#lex-{_esc_attr(entry["slug"])}" class="term-link"'
+                    f' data-term-slug="lex-{_esc_attr(entry["slug"])}"'
+                    f' data-def="{def_esc}" title="{def_esc}">{_esc(matched)}</a>'
+                )
+
+            text = auto_re.sub(auto_sub, text)
+
     # Escape whatever plain text remains (placeholders are \x00N\x00 — no HTML-special
     # chars, so escaping is a no-op on them and safe to run after stashing).
     text = _esc(text)
@@ -362,15 +596,26 @@ def _make_anchor(heading_path, index, text):
     return f'b{index}-{h}'
 
 
-def parse_markdown(src, link_resolver=None, terms_out=None):
+def parse_markdown(src, link_resolver=None, terms_out=None, lexicon=None):
     """Return (title, blocks) where blocks is a list of dicts (see module docstring).
 
     `terms_out`, if passed a dict, is populated with the page's {slug: {term, html,
     first_sentence}} terms table (see extract_terms()) — used by server.py to embed a
     JSON map for the hover-popover JS. Optional and backward-compatible: existing
     callers that only unpack `(title, blocks)` are unaffected.
+
+    `lexicon`, if given, is the SOMA Lexicon index from build_lexicon_index(). It is
+    always available as a fallback for `#terms`/`#term-<slug>`/`lexicon:<term>`/
+    `#lex-<slug>` links regardless of the auto-lexicon opt-in below — that opt-in
+    only controls the SEPARATE automatic-first-occurrence-linking behavior.
+    Automatic linking additionally requires the page to opt in via a front-matter
+    `auto-lexicon: true` flag or an `<!-- auto-lexicon -->` marker comment (see
+    strip_auto_lexicon_marker()) — default off, so no pre-existing page changes a
+    byte until it opts in. Even when opted in, headings and the page's own Terms
+    section are never auto-linked.
     """
     src = unicodedata.normalize('NFC', src)
+    auto_lexicon_flag, src = strip_auto_lexicon_marker(src)
     lines = src.split('\n')
     blocks = []
     heading_stack = []  # list of (level, text)
@@ -378,10 +623,18 @@ def parse_markdown(src, link_resolver=None, terms_out=None):
     n = len(lines)
     idx = 0
     title = None
-    terms = extract_terms(src, link_resolver)
+    terms = extract_terms(src, link_resolver, lexicon=lexicon)
     if terms_out is not None:
         terms_out.update(terms)
     used_ids = set()
+    terms_section_level = [None]  # boxed so the closure below can mutate it
+
+    def auto_lex_now():
+        """Whether the block currently being rendered may be auto-linked: opt-in
+        flag set, a lexicon is available, and we're not inside the page's own
+        Terms section. Headings never call this — they're excluded unconditionally
+        at the call site."""
+        return bool(auto_lexicon_flag and lexicon and terms_section_level[0] is None)
 
     def make_id(candidate):
         base = candidate
@@ -447,8 +700,15 @@ def parse_markdown(src, link_resolver=None, terms_out=None):
             while heading_stack and heading_stack[-1][0] >= level:
                 heading_stack.pop()
             heading_stack.append((level, text))
+            # Track whether we're inside the page's own "Terms" section (any
+            # level, exact case-insensitive match, same rule extract_terms()
+            # uses) so prose blocks below know to skip auto-linking there.
+            if text.strip().lower() == 'terms':
+                terms_section_level[0] = level
+            elif terms_section_level[0] is not None and level <= terms_section_level[0]:
+                terms_section_level[0] = None
             heading_id = make_id(slugify(text))
-            html_body = f'<h{level} id="{heading_id}">{render_inline(text, link_resolver, terms=terms)}</h{level}>'
+            html_body = f'<h{level} id="{heading_id}">{render_inline(text, link_resolver, terms=terms, lexicon=lexicon)}</h{level}>'
             blocks.append({
                 'kind': 'heading', 'level': level, 'heading_path': heading_path()[:-1],
                 'index': idx, 'text': text, 'html': html_body, 'heading_id': heading_id,
@@ -476,9 +736,16 @@ def parse_markdown(src, link_resolver=None, terms_out=None):
                 rows.append([c.strip() for c in lines[i].strip().strip('|').split('|')])
                 i += 1
             raw_lines = [line] + [f'row: {r}' for r in rows]
-            thead = ''.join(f'<th>{render_inline(c, link_resolver, terms=terms)}</th>' for c in header_cells)
+            _al = auto_lex_now()
+            thead = ''.join(
+                f'<th>{render_inline(c, link_resolver, terms=terms, lexicon=lexicon, auto_lexicon=_al)}</th>'
+                for c in header_cells
+            )
             tbody = ''.join(
-                '<tr>' + ''.join(f'<td>{render_inline(c, link_resolver, terms=terms)}</td>' for c in row) + '</tr>'
+                '<tr>' + ''.join(
+                    f'<td>{render_inline(c, link_resolver, terms=terms, lexicon=lexicon, auto_lexicon=_al)}</td>'
+                    for c in row
+                ) + '</tr>'
                 for row in rows
             )
             html_body = f'<table><thead><tr>{thead}</tr></thead><tbody>{tbody}</tbody></table>'
@@ -496,7 +763,11 @@ def parse_markdown(src, link_resolver=None, terms_out=None):
                 quote_lines.append(re.sub(r'^\s*>\s?', '', lines[i]))
                 i += 1
             raw = '\n'.join(quote_lines)
-            html_body = f'<blockquote>{render_inline(raw, link_resolver, terms=terms)}</blockquote>'
+            html_body = (
+                f'<blockquote>'
+                f'{render_inline(raw, link_resolver, terms=terms, lexicon=lexicon, auto_lexicon=auto_lex_now())}'
+                f'</blockquote>'
+            )
             blocks.append({
                 'kind': 'blockquote', 'level': None, 'heading_path': heading_path(),
                 'index': idx, 'text': raw, 'html': html_body,
@@ -512,7 +783,10 @@ def parse_markdown(src, link_resolver=None, terms_out=None):
                 item_lines.append(lines[i])
                 i += 1
             raw = '\n'.join(item_lines)
-            html_body = _render_list(item_lines, link_resolver, terms=terms, claim_id=claim_id)
+            html_body = _render_list(
+                item_lines, link_resolver, terms=terms, claim_id=claim_id,
+                lexicon=lexicon, auto_lexicon=auto_lex_now(),
+            )
             blocks.append({
                 'kind': 'list', 'level': None, 'heading_path': heading_path(),
                 'index': idx, 'text': raw, 'html': html_body,
@@ -530,7 +804,7 @@ def parse_markdown(src, link_resolver=None, terms_out=None):
             para_lines.append(lines[i].strip())
             i += 1
         raw = ' '.join(para_lines)
-        html_body = f'<p>{render_inline(raw, link_resolver, terms=terms)}</p>'
+        html_body = f'<p>{render_inline(raw, link_resolver, terms=terms, lexicon=lexicon, auto_lexicon=auto_lex_now())}</p>'
         blocks.append({
             'kind': 'paragraph', 'level': None, 'heading_path': heading_path(),
             'index': idx, 'text': raw, 'html': html_body,
@@ -545,7 +819,7 @@ def parse_markdown(src, link_resolver=None, terms_out=None):
     return title, blocks
 
 
-def _render_list(item_lines, link_resolver, terms=None, claim_id=None):
+def _render_list(item_lines, link_resolver, terms=None, claim_id=None, lexicon=None, auto_lexicon=False):
     # Simple flat rendering with indent-based nesting by leading whitespace count // 2.
     ordered = bool(re.match(r'^\s*\d+\.\s+', item_lines[0])) if item_lines else False
     tag = 'ol' if ordered else 'ul'
@@ -558,7 +832,9 @@ def _render_list(item_lines, link_resolver, terms=None, claim_id=None):
         if not m:
             # continuation line of previous item (soft wrap)
             if out and out[-1].endswith('</li>'):
-                out[-1] = out[-1][:-5] + ' ' + render_inline(line.strip(), link_resolver, terms=terms) + '</li>'
+                out[-1] = out[-1][:-5] + ' ' + render_inline(
+                    line.strip(), link_resolver, terms=terms, lexicon=lexicon, auto_lexicon=auto_lexicon,
+                ) + '</li>'
             continue
         indent, marker, content = m.groups()
         indent_level = len(indent) // 2
@@ -579,7 +855,11 @@ def _render_list(item_lines, link_resolver, terms=None, claim_id=None):
         if term_m and claim_id is not None:
             term_id = claim_id(f'term-{slugify(term_m.group(1).strip())}')
             li_id_attr = f' id="{term_id}"'
-        out.append(f'<li{li_id_attr}>{render_inline(content, link_resolver, terms=terms)}</li>')
+        out.append(
+            f'<li{li_id_attr}>'
+            f'{render_inline(content, link_resolver, terms=terms, lexicon=lexicon, auto_lexicon=auto_lexicon)}'
+            f'</li>'
+        )
         prev_indent = indent_level
     while len(stack_tags) > 1:
         out.append(f'</{stack_tags.pop()}>')

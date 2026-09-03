@@ -5,7 +5,8 @@
       ["estate", "_estate"],
       ["business-ops", "business-ops"],
       ["soma", "SOMA"],
-      ["screening-room-videos", "demo-producer/out"]
+      ["screening-room-videos", "demo-producer/out"],
+      ["soma-lexicon", "soma-lexicon"]
     ],
     "nightly": true,
     "tours": true,

@@ -676,6 +676,71 @@ Known limit: `_estate/BOARD.md` is regenerated from scratch. Content matching ca
 identity for rows that disappear or change substantially; those marks remain visible and may
 reattach when their exact text returns. Generator-emitted semantic ids are the future fix.
 
+## v3 view: Playmaker-model mark layer (2026-09-03)
+
+A second page view ships alongside the classic sentence-dwell mark layer above, as a MARKED
+IMPLEMENTATION: both views exist in the running server at once, toggled by `?view=v3` in the URL
+(persisted to `localStorage['soma-review-view']` by the toggle control, which auto-redirects a
+returning v3 preference forward when a URL carries no explicit `view`). Default is classic — a
+fresh browser with no stored preference and no query param always renders classic. Both views
+read and write the SAME per-page sidecar; a mark made in either view appears in the other (D1:
+marks anchor to the block model, never to DOM position).
+
+**What v3 is, model-wise:** `render_page(route_path, workspace, view=)` sets
+`mark_layer = ... and view != 'v3'`, so v3 is literally "the dwell/keyboard mark layer switched
+off" — which means the pre-mark-layer block-comment path (`wireBlockAffordances`,
+`wireEditableBlocks`, `wireEnterOpensComment`, `loadThreadsIntoDOM`, all already in `PAGE_JS`,
+unconditionally shipped, just unreached while `__MARK_LAYER__` is true) runs instead. Every
+block is `contenteditable`-by-click already, per the existing "Edit-as-comment" section above:
+click into a block, it reads plain while focused, blur diffs it against the source and persists
+a `type: "edit"` comment (kind `edit` in v3's vocabulary) — v3 adds no new editing code, it just
+un-gates code that already existed. New, v3-only work:
+
+- **Level label** (finding 5, `mdp-as-ui-prior-art.md` Part 4): `compute_level(src, route_path)`
+  reads a leading YAML-ish front-matter `level:` field if present; else pages under
+  `SOMA/shared-cognition/` (or `soma/shared-cognition/` post-workspace-prefix) default to
+  `"meta: the mark layer"` and everything else defaults to `"object"`. Rendered as a pill in the
+  v3 header only (reading front matter never strips it from the classic render, so this cannot
+  change a classic byte).
+- **Marks panel** (`V3_JS`, right-side slide-in): fetches the existing `GET /api/comments`
+  endpoint (no new read endpoint), reuses the classic mark-layer's `K` kind vocabulary
+  (agree/clarify/rewrite/strike/note/ack/ruling — the Playmaker source/decision kinds that pass
+  already ported from `playmaker/public/mark-layer.html`) plus `comment`/`edit`/`verdict` for the
+  kinds unique to the always-editable v3 surface. Filter chips per kind, status pill
+  open/resolved/**stale** per row, click a row (or the `.comment-count-pill` on a marked block —
+  clicking the block body itself stays reserved for entering edit mode) opens a dialog. Resolve
+  (`POST /api/comments/status {status:"done"}`) advances to the next open mark in the filtered,
+  timestamp-ordered list (PM law); Reopen sets `status:"queued"`.
+- **Stale detection** (finding 1): every comment already carries `block_id` + `block_text_sha`
+  (set by `validated_binding()` for any block-anchored row, comments included, not just marks) —
+  `V3_JS`'s `decorate()` compares that stored hash against the block-wrap's live
+  `data-block-sha` and flags `stale` client-side. No new server field.
+- **Closeable, resizable sidebar**: `V3_JS::wireSidebar()` injects a close button and a drag
+  handle at runtime (DOM-only — no server-rendered markup changes), state in
+  `localStorage['soma-review-sidebar-closed'|'soma-review-sidebar-width']`.
+- **Passive `\`\`\`widget` blocks** (item 6, both hosts per
+  `SOMA/shared-cognition/marked-document-widgets.md`, written in parallel by Mike the same day):
+  `mdblocks.py::render_widget_block()` renders the fence body as raw HTML in a sandboxed iframe
+  (`srcdoc`, `sandbox="allow-scripts"` only — no `allow-same-origin`, no network egress). Fence
+  syntax follows that spec's `kind=`/`name=` attribute grammar (`parse_widget_attrs()`); bare
+  \`\`\`widget defaults to `kind=passive name=inline-html`. `demo` and `active` kinds render a
+  labeled "not yet supported" placeholder instead of crashing or silently misrendering — they are
+  the two ACTIVE/interactive kinds that spec documents as next-step work, not built here. Widget
+  CSS lives in the always-included `PAGE_CSS` (not view-gated) since a widget block is document
+  content, renderable in either view.
+
+**The only classic-page (no `?view` param) additions**, verified by `curl` diff against a
+pre-change baseline: the shared view-toggle control (`render_view_toggle()`, required in both
+views by spec item 1) plus its tiny bootstrap script, `window.__V3_VIEW__`/`__LEVEL_LABEL__`
+globals, and the widget CSS rules (needed regardless of view). Every block, comment, and the
+existing dwell mark layer are byte-identical otherwise. `v2/tests/test_v3_view.py` pins this
+scope plus the edit-mark/stale/widget mechanics; 38/38 tests pass (24 pre-existing + 14 new).
+
+**Not built (documented as next-step):** the `demo` and `active` widget kinds (`proposeMark`
+contract, same-origin execution, capability declaration in the panel) — see the parallel design
+spec above for the full three-kind contract both hosts (soma-review, Playmaker) are meant to
+share once built.
+
 ## Authorship
 
 v2 built 2026-07-02 by Dee (Claude Sonnet 5, engineering-lead/COO role) per Mike's spec
@@ -696,3 +761,18 @@ Anchoring v2 implemented and migrated 2026-09-01 by Codex (GPT-5.6), continuing 
 measured migration plan developed by Mike with Claude earlier that day. Verification covered
 the pure matcher/remapper tests, API binding behavior, idempotent copied-data migration, the live
 49-row migration, service health, and the rendered unresolved-marks surface.
+
+v3 view (Playmaker-model mark layer, marks panel, level label, sidebar resize/close, passive
+`\`\`\`widget` blocks) built 2026-09-03 by Dee (Claude Sonnet 5, engineering-lead/COO role) per
+Mike's spec that day: ship it as a marked implementation alongside classic, default off, toggled
+by URL param + localStorage. Verified against the live `mdp-as-ui-prior-art.md` page in a real
+browser (Claude Browser pane): edit-mark creation + diff rendering, marks-panel filter/dialog,
+Resolve status transition, level-label pill, widget iframe rendering; `curl` diff confirmed the
+classic-view byte scope described above; multi-mark Resolve-advances-to-next driven end-to-end
+(two open marks, resolving the first auto-opened the second's dialog, panel showed
+RESOLVED/OPEN correctly); sidebar close/reopen click-tested end-to-end (close hid the sidebar,
+computed width 0, "≡ Menu" affordance appeared; reopening restored it) — an initial float-based
+close-button position bug was found and fixed (`position:absolute` instead) during this pass;
+38/38 `pytest` (24 pre-existing + 14 new in `v2/tests/test_v3_view.py`). Not verified in this
+pass: the sidebar's drag-to-resize mouse interaction itself (open/close was click-tested; the
+`mousedown`/`mousemove` resize handle was exercised only by code inspection).

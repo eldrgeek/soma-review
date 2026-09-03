@@ -98,6 +98,69 @@ def render_film_block(raw_json):
     )
 
 
+_WIDGET_ATTR_RE = re.compile(r'(\w+)=(\S+)')
+
+
+def parse_widget_attrs(lang_rest):
+    """Parse the ` kind=passive name=inline-html`-shaped attribute tail after
+    the ```widget fence marker, per the three-kind contract in
+    `SOMA/shared-cognition/marked-document-widgets.md` (Mike, 2026-09-03,
+    written in parallel with this build). Bare ```widget (no attributes) is
+    kept working and defaults to kind=passive name=inline-html, so the simple
+    form this revision ships stays valid syntax once demo/active kinds land."""
+    attrs = dict(_WIDGET_ATTR_RE.findall(lang_rest or ''))
+    return {
+        'kind': attrs.get('kind', 'passive'),
+        'name': attrs.get('name', 'inline-html'),
+    }
+
+
+def render_widget_block(raw_html, kind='passive', name='inline-html'):
+    """Render a ```widget fenced block. This build implements the PASSIVE kind
+    only (Mike's spec, 2026-09-03, item 6): "completely passive and only
+    graphical" — no reads, no writes, no network. `demo` and `active` are
+    specified (see the design doc referenced above) but not built here; a
+    widget declaring either renders a clearly-labeled not-yet-supported
+    placeholder instead of silently misbehaving or crashing page render.
+
+    A passive/inline-html widget's fence body is raw HTML, sandboxed in an
+    iframe via `srcdoc` with `sandbox="allow-scripts"` only — no
+    allow-same-origin, no allow-forms, no allow-popups, no network egress —
+    so it can animate or compute for display but cannot read the parent
+    document, phone home, or navigate anything. Height defaults to a
+    reasonable card size and can be overridden with a first line
+    `<!-- height: 320 -->` in the fence body.
+    """
+    if kind != 'passive':
+        return (
+            f'<div class="widget-unsupported">Widget kind &ldquo;{_esc(kind)}&rdquo; '
+            f'(name: {_esc(name)}) is not yet supported — this build ships the '
+            f'passive kind only. See '
+            f'<code>SOMA/shared-cognition/marked-document-widgets.md</code>.</div>'
+        )
+    if name != 'inline-html':
+        return (
+            f'<div class="widget-unsupported">Widget registry lookups '
+            f'(name=&ldquo;{_esc(name)}&rdquo;) are not yet supported — only '
+            f'name=inline-html renders in this build.</div>'
+        )
+    height = 220
+    body = raw_html
+    m = re.match(r'\s*<!--\s*height:\s*(\d+)\s*-->\s*\n?', raw_html)
+    if m:
+        height = max(60, min(2000, int(m.group(1))))
+        body = raw_html[m.end():]
+    srcdoc = _esc_attr(body)
+    return (
+        f'<div class="widget-block-frame">'
+        f'<iframe class="widget-block" sandbox="allow-scripts" '
+        f'referrerpolicy="no-referrer" loading="lazy" '
+        f'style="width:100%;height:{height}px;border:0;display:block;" '
+        f'srcdoc="{srcdoc}"></iframe>'
+        f'</div>'
+    )
+
+
 _INLINE_LINK_RE = re.compile(r'\[([^\]]*)\]\(([^)]+)\)')
 _INLINE_CODE_RE = re.compile(r'`([^`]+)`')
 _BOLD_RE = re.compile(r'\*\*([^*]+)\*\*')
@@ -679,6 +742,10 @@ def parse_markdown(src, link_resolver=None, terms_out=None, lexicon=None):
             if lang == 'film':
                 html_body = render_film_block(raw)
                 kind = 'film'
+            elif lang == 'widget' or lang.startswith('widget '):
+                w_attrs = parse_widget_attrs(lang[len('widget'):])
+                html_body = render_widget_block(raw, kind=w_attrs['kind'], name=w_attrs['name'])
+                kind = 'widget'
             else:
                 html_body = f'<pre><code class="lang-{_esc(lang)}">{_esc(raw)}</code></pre>'
                 kind = 'code'

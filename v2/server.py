@@ -608,6 +608,8 @@ a.term-link:hover, a.term-link:focus { color: #cfe3ff; }
 .term-popover .term-popover-title { font-weight: 600; color: #a3c9ff; margin-bottom: 4px;
                                      font-size: 12px; text-transform: uppercase; letter-spacing: .03em; }
 .term-popover a.term-link { color: #cfe3ff; }
+.widget-block-frame{margin:12px 0;border:1px solid #2a2d34;border-radius:8px;overflow:hidden;background:#0f1115;}
+.widget-unsupported{margin:12px 0;padding:10px 14px;border:1px dashed #5a4626;border-radius:8px;background:#211b12;color:#e0b463;font-size:13px;}
 """
 
 MARK_LAYER_CSS = r"""
@@ -1890,6 +1892,365 @@ window.initMarkLayer = function initMarkLayer() {
 """
 
 
+# --- v3 view: Playmaker-model mark layer (2026-09-03) ------------------------
+# Ships alongside the classic sentence-dwell mark layer above, behind the
+# `?view=v3` / localStorage toggle rendered by render_view_toggle(). See
+# v2/CLAUDE.md "v3 view" section (added by this change) for the full design
+# note. VIEW_TOGGLE_CSS/VIEW_TOGGLE_JS are the only pieces included on every
+# page (classic included) — everything else here is embedded only when
+# view == 'v3', so classic pages pay only the toggle's cost.
+
+VIEW_TOGGLE_CSS = """
+.view-toggle{display:flex;align-items:center;gap:6px;margin:10px 0 4px;font-size:11px;}
+.view-toggle-label{color:#8a8f98;text-transform:uppercase;letter-spacing:.04em;font-size:10px;}
+.view-toggle-btn{padding:3px 8px;border-radius:5px;border:1px solid #333;color:#9aa0a8;text-decoration:none;background:#1c1f26;}
+.view-toggle-btn.active{background:#2f6feb;border-color:#2f6feb;color:#fff;}
+.view-toggle-btn:hover{border-color:#2f6feb;}
+"""
+
+VIEW_TOGGLE_JS = r"""
+(function(){
+  var KEY = 'soma-review-view';
+  document.querySelectorAll('[data-view-toggle]').forEach(function(a){
+    a.addEventListener('click', function(){
+      try { localStorage.setItem(KEY, a.dataset.viewToggle); } catch(_) {}
+    });
+  });
+  // Returning-user redirect: if this URL carries no explicit ?view= and the
+  // browser remembers a v3 preference, hop to it once. Never fires the other
+  // direction (v3 -> classic) unprompted — classic is always reachable via
+  // the explicit toggle link or ?view=classic.
+  try {
+    var url = new URL(window.location.href);
+    if (!url.searchParams.has('view') && localStorage.getItem(KEY) === 'v3') {
+      url.searchParams.set('view', 'v3');
+      window.location.replace(url.toString());
+    }
+  } catch(_) {}
+})();
+"""
+
+# Mark-kind vocabulary shown in the v3 filter list and mark rows. Reuses the
+# same kind ids already ratified for the classic mark layer's K table (agree/
+# clarify/rewrite/strike/note/ack/ruling — the Playmaker source/decision kinds
+# this whole feature is modeled on) plus the two kinds unique to the
+# non-dwell, always-editable v3 surface: `comment` (a plain block comment) and
+# `edit` (a block-level tracked change, `wireEditableBlocks()`'s contenteditable
+# diff). `verdict` covers Board/Portfolio rows. A mark made in the classic
+# dwell view lands in the same sidecar and appears here too (D1: marks anchor
+# to the model, never to DOM position).
+V3_CSS = r"""
+body.v3-view .sidebar{position:relative;transition:width .12s ease;}
+body.v3-view .sidebar.v3-sidebar-closed{width:0!important;min-width:0;padding:0;overflow:hidden;border:0;}
+.v3-sidebar-resize{position:absolute;top:0;right:-3px;width:6px;height:100%;cursor:col-resize;z-index:5;}
+.v3-sidebar-resize:hover,.v3-sidebar-resize.dragging{background:#2f6feb55;}
+.v3-sidebar-toggle-open{display:none;position:fixed;top:10px;left:10px;z-index:40;background:#1c1f26;color:#e6e6e6;border:1px solid #333;border-radius:6px;padding:4px 8px;cursor:pointer;font-size:12px;}
+body.v3-view .sidebar.v3-sidebar-closed ~ .v3-sidebar-toggle-open,
+body.v3-view .sidebar.v3-sidebar-closed + .v3-sidebar-toggle-open{display:block;}
+.v3-header{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:10px 0 14px;border-bottom:1px solid #2a2d34;margin-bottom:16px;}
+.v3-level-pill{font-size:10px;text-transform:uppercase;letter-spacing:.05em;padding:3px 8px;border-radius:20px;background:#3a2f1c;color:#e0b463;border:1px solid #5a4626;}
+.v3-level-pill.is-object{background:#1c2a3a;color:#63a0e0;border-color:#264a5a;}
+.v3-header h1{margin:0;font-size:20px;flex:1 1 auto;}
+.v3-marks-btn{background:#1c1f26;color:#e6e6e6;border:1px solid #333;border-radius:6px;padding:6px 12px;font-size:13px;cursor:pointer;}
+.v3-marks-btn .v3-marks-count{display:inline-block;min-width:18px;padding:0 5px;margin-left:6px;border-radius:9px;background:#2f6feb;color:#fff;font-size:11px;text-align:center;}
+.v3-panel{position:fixed;top:0;right:-380px;width:360px;height:100%;background:#14161b;border-left:1px solid #2a2d34;box-shadow:-6px 0 24px rgba(0,0,0,.4);z-index:50;transition:right .18s ease;display:flex;flex-direction:column;}
+.v3-panel.open{right:0;}
+.v3-panel-head{padding:14px 16px;border-bottom:1px solid #2a2d34;display:flex;align-items:center;justify-content:space-between;}
+.v3-panel-head h2{margin:0;font-size:15px;}
+.v3-panel-close{background:none;border:0;color:#9aa0a8;font-size:18px;cursor:pointer;}
+.v3-filter-row{display:flex;flex-wrap:wrap;gap:5px;padding:10px 16px;border-bottom:1px solid #2a2d34;}
+.v3-filter-chip{font-size:11px;padding:3px 8px;border-radius:12px;border:1px solid #333;background:#1c1f26;color:#9aa0a8;cursor:pointer;}
+.v3-filter-chip.active{background:#2f6feb;border-color:#2f6feb;color:#fff;}
+.v3-mark-list{overflow-y:auto;flex:1 1 auto;padding:6px 10px;}
+.v3-mark-row{padding:9px 10px;margin:4px 0;border-radius:8px;border:1px solid #23262d;cursor:pointer;background:#1a1c22;}
+.v3-mark-row:hover{border-color:#2f6feb;}
+.v3-mark-row .v3-mr-top{display:flex;align-items:center;gap:6px;font-size:11px;color:#8a8f98;}
+.v3-mr-kind{font-weight:600;color:#e6e6e6;}
+.v3-mr-status{margin-left:auto;padding:1px 6px;border-radius:8px;font-size:10px;text-transform:uppercase;}
+.v3-mr-status.open{background:#3a2f1c;color:#e0b463;}
+.v3-mr-status.resolved{background:#1c3a24;color:#63e089;}
+.v3-mr-status.stale{background:#3a1c1c;color:#e06363;}
+.v3-mr-quote{font-size:12px;color:#c8ccd2;margin-top:4px;font-style:italic;overflow:hidden;text-overflow:ellipsis;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;}
+.v3-panel-empty{padding:20px 16px;color:#8a8f98;font-size:13px;}
+.v3-dialog-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:60;display:flex;align-items:center;justify-content:center;}
+.v3-dialog{width:460px;max-width:92vw;max-height:80vh;overflow-y:auto;background:#181b21;border:1px solid #2a2d34;border-radius:10px;padding:18px;}
+.v3-dialog h3{margin:0 0 8px;font-size:15px;}
+.v3-dialog .v3-dialog-quote{font-style:italic;color:#c8ccd2;border-left:3px solid #2f6feb;padding-left:10px;margin:8px 0;}
+.v3-dialog-actions{display:flex;gap:8px;margin-top:14px;}
+.v3-dialog-actions button{padding:6px 12px;border-radius:6px;border:1px solid #333;background:#1c1f26;color:#e6e6e6;cursor:pointer;}
+.v3-dialog-actions button.primary{background:#2f6feb;border-color:#2f6feb;}
+.v3-dialog-close{position:absolute;top:10px;right:14px;background:none;border:0;color:#9aa0a8;font-size:18px;cursor:pointer;}
+.block-wrap.v3-has-marks{border-left:3px solid #e0b463;}
+.block-wrap.v3-has-marks.v3-all-resolved{border-left-color:#63e089;}
+.block-wrap.v3-has-marks .comment-count-pill{cursor:pointer;}
+"""
+
+V3_JS = r"""
+(function(){
+  const API_BASE = window.__API_BASE__;
+  const ROUTE = window.__ROUTE__;
+  const KIND_META = {
+    comment:{label:'Comment', glyph:'💬'},
+    edit:{label:'Edit', glyph:'✎'},
+    agree:{label:'Agree', glyph:'✓'},
+    clarify:{label:'Clarify', glyph:'?'},
+    rewrite:{label:'Rewrite', glyph:'✎'},
+    strike:{label:'Strike', glyph:'✗'},
+    note:{label:'Note', glyph:'✎'},
+    ack:{label:'Ack', glyph:'•'},
+    ruling:{label:'Ruling', glyph:'§'},
+    verdict:{label:'Verdict', glyph:'§'}
+  };
+  function kindOf(c){
+    if (c.type === 'mark') return c.mark_kind || 'note';
+    if (c.type === 'verdict') return 'verdict';
+    return c.type || 'comment';
+  }
+  function escapeHtml(s){ return (s||'').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch])); }
+
+  let allRows = [];
+  let activeFilters = new Set(Object.keys(KIND_META));
+  let panelOpen = false;
+
+  function currentShaMap(){
+    const map = {};
+    document.querySelectorAll('.block-wrap[data-block-id]').forEach(el => { map[el.dataset.blockId] = el.dataset.blockSha; });
+    return map;
+  }
+
+  function decorate(rows){
+    const shas = currentShaMap();
+    return rows.filter(c => !c.deleted).map(c => {
+      const kind = kindOf(c);
+      const resolved = c.status === 'done';
+      const stale = !!(c.block_id && c.block_text_sha && shas[c.block_id] && shas[c.block_id] !== c.block_text_sha);
+      return Object.assign({}, c, {kind, resolved, stale});
+    });
+  }
+
+  async function fetchMarks(){
+    const res = await fetch(`${API_BASE}/api/comments?page=${encodeURIComponent(ROUTE)}`);
+    allRows = decorate(await res.json());
+    return allRows;
+  }
+
+  function paintBlockIndicators(){
+    const byBlock = {};
+    allRows.forEach(m => { if (m.block_id) (byBlock[m.block_id] = byBlock[m.block_id] || []).push(m); });
+    document.querySelectorAll('.block-wrap[data-block-id]').forEach(el => {
+      const marks = byBlock[el.dataset.blockId] || [];
+      el.classList.toggle('v3-has-marks', marks.length > 0);
+      el.classList.toggle('v3-all-resolved', marks.length > 0 && marks.every(m => m.resolved));
+      const pill = el.querySelector('.comment-count-pill');
+      if (pill && marks.length && !pill.dataset.v3Wired) {
+        pill.dataset.v3Wired = '1';
+        pill.addEventListener('click', (e) => {
+          e.stopPropagation();
+          openDialog(marks.filter(m => !m.resolved)[0] || marks[0]);
+        });
+      }
+    });
+  }
+
+  function updateCountBadge(){
+    const btn = document.getElementById('v3-marks-btn');
+    if (!btn) return;
+    const open = allRows.filter(m => !m.resolved).length;
+    btn.querySelector('.v3-marks-count').textContent = open;
+  }
+
+  function renderPanel(){
+    const list = document.getElementById('v3-mark-list');
+    if (!list) return;
+    const rows = allRows.filter(m => activeFilters.has(m.kind));
+    if (!rows.length) { list.innerHTML = '<div class="v3-panel-empty">No marks of the selected type(s).</div>'; return; }
+    rows.sort((a,b) => (a.timestamp||'').localeCompare(b.timestamp||''));
+    list.innerHTML = rows.map(m => {
+      const meta = KIND_META[m.kind] || KIND_META.note;
+      const status = m.stale ? 'stale' : (m.resolved ? 'resolved' : 'open');
+      const quote = m.quote || m.snapshot || m.text || '(page-level)';
+      return `<div class="v3-mark-row" data-mark-id="${m.id}">
+        <div class="v3-mr-top"><span class="v3-mr-kind">${meta.glyph} ${meta.label}</span>
+          <span class="v3-mr-status ${status}">${status}</span></div>
+        <div class="v3-mr-quote">${escapeHtml(quote)}</div>
+      </div>`;
+    }).join('');
+    list.querySelectorAll('.v3-mark-row').forEach(row => {
+      row.addEventListener('click', () => {
+        const m = allRows.find(r => r.id === row.dataset.markId);
+        if (m) openDialog(m);
+      });
+    });
+  }
+
+  function renderFilters(){
+    const row = document.getElementById('v3-filter-row');
+    if (!row) return;
+    row.innerHTML = Object.keys(KIND_META).map(k =>
+      `<button class="v3-filter-chip${activeFilters.has(k)?' active':''}" data-kind="${k}">${KIND_META[k].label}</button>`
+    ).join('');
+    row.querySelectorAll('.v3-filter-chip').forEach(chip => {
+      chip.addEventListener('click', () => {
+        const k = chip.dataset.kind;
+        if (activeFilters.has(k)) activeFilters.delete(k); else activeFilters.add(k);
+        chip.classList.toggle('active');
+        renderPanel();
+      });
+    });
+  }
+
+  function openPanel(){
+    panelOpen = true;
+    document.getElementById('v3-panel').classList.add('open');
+    renderFilters(); renderPanel();
+  }
+  function closePanel(){ panelOpen = false; document.getElementById('v3-panel').classList.remove('open'); }
+
+  function nextOpenAfter(m){
+    const ordered = allRows.filter(r => activeFilters.has(r.kind))
+      .sort((a,b) => (a.timestamp||'').localeCompare(b.timestamp||''));
+    const idx = ordered.findIndex(r => r.id === m.id);
+    for (let i = idx + 1; i < ordered.length; i++) if (!ordered[i].resolved) return ordered[i];
+    for (let i = 0; i < idx; i++) if (!ordered[i].resolved) return ordered[i];
+    return null;
+  }
+
+  async function setStatus(m, status){
+    await fetch(`${API_BASE}/api/comments/status`, {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({page: ROUTE, id: m.id, status})});
+    await fetchMarks();
+    paintBlockIndicators(); updateCountBadge(); if (panelOpen) renderPanel();
+  }
+
+  function openDialog(m){
+    if (!m) return;
+    document.querySelectorAll('.v3-dialog-backdrop').forEach(el => el.remove());
+    const meta = KIND_META[m.kind] || KIND_META.note;
+    const backdrop = document.createElement('div');
+    backdrop.className = 'v3-dialog-backdrop';
+    const status = m.stale ? 'stale' : (m.resolved ? 'resolved' : 'open');
+    const diff = m.type === 'edit'
+      ? `<div class="v3-dialog-quote"><del>${escapeHtml(m.snapshot||'')}</del></div><div class="v3-dialog-quote"><ins>${escapeHtml(m.proposed||'')}</ins></div>`
+      : `<div class="v3-dialog-quote">${escapeHtml(m.quote || m.snapshot || m.text || '')}</div>`;
+    backdrop.innerHTML = `<div class="v3-dialog">
+      <button class="v3-dialog-close" data-v3-close>&times;</button>
+      <h3>${meta.glyph} ${meta.label} &middot; <span class="v3-mr-status ${status}">${status}</span></h3>
+      ${diff}
+      ${m.text && m.type !== 'edit' ? `<div>${escapeHtml(m.text)}</div>` : ''}
+      <div style="color:#8a8f98;font-size:11px;margin-top:6px;">${escapeHtml(m.author||'mike')} &middot; block ${escapeHtml(m.block_id||'(page-level)')}${m.stale?' &middot; source text has changed since this mark was made':''}</div>
+      <div class="v3-dialog-actions">
+        ${m.resolved ? '<button data-v3-reopen>Reopen</button>' : '<button class="primary" data-v3-resolve>Resolve</button>'}
+        <button data-v3-scroll>Go to block</button>
+      </div>
+    </div>`;
+    document.body.appendChild(backdrop);
+    backdrop.addEventListener('click', (e) => { if (e.target === backdrop) backdrop.remove(); });
+    backdrop.querySelector('[data-v3-close]').addEventListener('click', () => backdrop.remove());
+    backdrop.querySelector('[data-v3-scroll]')?.addEventListener('click', () => {
+      const el = m.block_id ? document.querySelector(`.block-wrap[data-block-id="${CSS.escape(m.block_id)}"]`) : null;
+      if (el) el.scrollIntoView({block:'center', behavior:'smooth'});
+    });
+    backdrop.querySelector('[data-v3-resolve]')?.addEventListener('click', async () => {
+      await setStatus(m, 'done');
+      const next = nextOpenAfter(m);
+      backdrop.remove();
+      if (next) openDialog(allRows.find(r => r.id === next.id) || next);
+    });
+    backdrop.querySelector('[data-v3-reopen]')?.addEventListener('click', async () => {
+      await setStatus(m, 'queued');
+      backdrop.remove();
+    });
+  }
+
+  function wireSidebar(){
+    const sidebar = document.querySelector('.sidebar');
+    if (!sidebar) return;
+    const openBtn = document.createElement('button');
+    openBtn.className = 'v3-sidebar-toggle-open';
+    openBtn.textContent = '≡ Menu';
+    sidebar.insertAdjacentElement('afterend', openBtn);
+    const closeBtn = document.createElement('button');
+    closeBtn.textContent = '×';
+    closeBtn.title = 'Close sidebar';
+    closeBtn.style.cssText = 'position:absolute;top:8px;right:12px;background:none;border:0;color:#9aa0a8;cursor:pointer;font-size:16px;z-index:6;';
+    sidebar.insertBefore(closeBtn, sidebar.firstChild);
+    const resize = document.createElement('div');
+    resize.className = 'v3-sidebar-resize';
+    sidebar.appendChild(resize);
+
+    let closed = false, width = 220;
+    try {
+      closed = localStorage.getItem('soma-review-sidebar-closed') === '1';
+      width = parseInt(localStorage.getItem('soma-review-sidebar-width') || '220', 10) || 220;
+    } catch(_) {}
+    sidebar.style.width = width + 'px';
+    if (closed) sidebar.classList.add('v3-sidebar-closed');
+
+    closeBtn.addEventListener('click', () => {
+      sidebar.classList.add('v3-sidebar-closed');
+      try { localStorage.setItem('soma-review-sidebar-closed', '1'); } catch(_) {}
+    });
+    openBtn.addEventListener('click', () => {
+      sidebar.classList.remove('v3-sidebar-closed');
+      try { localStorage.setItem('soma-review-sidebar-closed', '0'); } catch(_) {}
+    });
+    let dragging = false;
+    resize.addEventListener('mousedown', (e) => { dragging = true; resize.classList.add('dragging'); e.preventDefault(); });
+    document.addEventListener('mousemove', (e) => {
+      if (!dragging) return;
+      const w = Math.max(140, Math.min(480, e.clientX));
+      sidebar.style.width = w + 'px';
+    });
+    document.addEventListener('mouseup', () => {
+      if (!dragging) return;
+      dragging = false; resize.classList.remove('dragging');
+      try { localStorage.setItem('soma-review-sidebar-width', parseInt(sidebar.style.width, 10)); } catch(_) {}
+    });
+  }
+
+  function wireHeader(){
+    const main = document.querySelector('.main');
+    if (!main) return;
+    const header = document.createElement('header');
+    header.className = 'v3-header';
+    const level = window.__LEVEL_LABEL__ || 'object';
+    const isObject = level === 'object';
+    header.innerHTML = `<span class="v3-level-pill${isObject?' is-object':''}">${escapeHtml(level)}</span>
+      <h1>${escapeHtml(document.title.replace(/ .. soma-review$/, ''))}</h1>
+      <button class="v3-marks-btn" id="v3-marks-btn">Marks<span class="v3-marks-count">0</span></button>`;
+    main.insertBefore(header, main.firstChild);
+    header.querySelector('#v3-marks-btn').addEventListener('click', () => panelOpen ? closePanel() : openPanel());
+  }
+
+  function wirePanel(){
+    const panel = document.createElement('div');
+    panel.className = 'v3-panel';
+    panel.id = 'v3-panel';
+    panel.innerHTML = `<div class="v3-panel-head"><h2>Marks</h2><button class="v3-panel-close" id="v3-panel-close">&times;</button></div>
+      <div class="v3-filter-row" id="v3-filter-row"></div>
+      <div class="v3-mark-list" id="v3-mark-list"></div>`;
+    document.body.appendChild(panel);
+    panel.querySelector('#v3-panel-close').addEventListener('click', closePanel);
+  }
+
+  document.addEventListener('DOMContentLoaded', async () => {
+    document.body.classList.add('v3-view');
+    wireSidebar();
+    wireHeader();
+    wirePanel();
+    await fetchMarks();
+    paintBlockIndicators();
+    updateCountBadge();
+    // Re-decorate whenever the existing comment plumbing reloads threads
+    // (new comment/edit saved, reply posted) so the panel/badge/gutter stay live.
+    document.addEventListener('soma-comment-saved', async () => {
+      await fetchMarks(); paintBlockIndicators(); updateCountBadge(); if (panelOpen) renderPanel();
+    });
+  });
+})();
+"""
+
+
 def render_workspace_switcher(current_workspace):
     workspaces = load_workspaces()
     opts = []
@@ -2093,7 +2454,7 @@ def render_block_html(block, route_path, status_chip=None, link_resolver=None, t
     # internal structure (fences, pipes, JSON) that's easy to corrupt via a flat
     # textarea edit and low-value to inline-edit anyway; they still get the comment
     # affordance (film comments are exactly the "notes to the videographer" mechanism).
-    editable = kind not in ('code', 'table', 'film')
+    editable = kind not in ('code', 'table', 'film', 'widget')
     edit_cls = ' edit-eligible' if editable else ''
     title_cls = (' document-title-block' if kind == 'heading' and block.get('level') == 1
                  and block.get('index') == 0 else '')
@@ -2224,7 +2585,46 @@ def validated_binding(route_path, workspace, candidate):
     return fields
 
 
-def render_page(route_path, workspace=DEFAULT_WORKSPACE):
+_LEVEL_FRONTMATTER_RE = re.compile(r'^---\s*\n(.*?)\n---\s*\n', re.S)
+_LEVEL_KEY_RE = re.compile(r'^level:\s*(.+?)\s*$', re.M)
+
+
+def compute_level(src, route_path):
+    """v3 finding 5 (mdp-as-ui-prior-art.md Part 4): every view carries a level
+    label. A page opts in explicitly via a leading YAML-ish front-matter
+    `level:` field; absent that, pages living under `SOMA/shared-cognition/`
+    default to "meta: the mark layer" (documents ABOUT the review instrument
+    itself) and everything else defaults to "object" (a document reviewed BY
+    the instrument, not one describing it). Reading front matter here never
+    strips it from the source used for block-parsing, so this cannot change a
+    single byte of classic rendering."""
+    m = _LEVEL_FRONTMATTER_RE.match(src)
+    if m:
+        km = _LEVEL_KEY_RE.search(m.group(1))
+        if km:
+            return km.group(1).strip('"\'')
+    if route_path.startswith('SOMA/shared-cognition/') or route_path.startswith('soma/shared-cognition/'):
+        return 'meta: the mark layer'
+    return 'object'
+
+
+def render_view_toggle(view, route_path, workspace):
+    """The one piece of chrome that must appear on BOTH views so Mike can flip
+    between them on the same page (spec item 1, 2026-09-03). This is the only
+    server-rendered addition to the classic (view=classic, no ?view param)
+    page — everything else new about v3 is injected client-side by V3_JS,
+    which is only embedded when view == 'v3', so it costs classic zero bytes."""
+    classic_active = ' active' if view != 'v3' else ''
+    v3_active = ' active' if view == 'v3' else ''
+    return f'''<div class="view-toggle" role="group" aria-label="Page view">
+    <span class="view-toggle-label">View</span>
+    <a class="view-toggle-btn{classic_active}" href="?view=classic" data-view-toggle="classic">Classic</a>
+    <a class="view-toggle-btn{v3_active}" href="?view=v3" data-view-toggle="v3">Mark layer</a>
+  </div>'''
+
+
+def render_page(route_path, workspace=DEFAULT_WORKSPACE, view='classic'):
+    view = 'v3' if view == 'v3' else 'classic'
     ws = get_workspace(workspace)
     url_prefix = workspace_url_prefix(workspace)
     fs_path = resolve_page(route_path, workspace)
@@ -2329,7 +2729,7 @@ def render_page(route_path, workspace=DEFAULT_WORKSPACE):
     # Tour-bearing pages keep their purpose-built Quinn review flow.  Every
     # other document uses the sentence-level mark layer by default; workspaces
     # can opt out while migrating with `"mark_layer": false`.
-    mark_layer = bool(ws.get('mark_layer', True)) and not bool(tour_body)
+    mark_layer = bool(ws.get('mark_layer', True)) and not bool(tour_body) and view != 'v3'
     body_class = ' class="mark-layer"' if mark_layer else ''
     mark_fonts = ('<link rel="preconnect" href="https://fonts.googleapis.com">\n'
                   '<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>\n'
@@ -2362,6 +2762,8 @@ def render_page(route_path, workspace=DEFAULT_WORKSPACE):
   </div>'''
         mark_dock = '<div class="ml-dock" id="mark-layer-dock"><div class="ml-dock-inner" id="mark-layer-dock-inner"></div></div>'
 
+    level_label = compute_level(src, route_path) if view == 'v3' else None
+
     html_doc = f"""<!DOCTYPE html>
 <html>
 <head>
@@ -2369,12 +2771,13 @@ def render_page(route_path, workspace=DEFAULT_WORKSPACE):
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{_html.escape(title)} — soma-review</title>
 {mark_fonts}
-<style>{PAGE_CSS}{MARK_LAYER_CSS if mark_layer else ''}</style>
+<style>{PAGE_CSS}{MARK_LAYER_CSS if mark_layer else ''}{VIEW_TOGGLE_CSS}{V3_CSS if view == 'v3' else ''}</style>
 {chip_head}{tour_head}
 </head>
 <body{body_class}>
 <nav class="sidebar">
   <a href="{url_prefix}/page/{ws['home']}" style="font-weight:700;font-size:15px;color:#e6e6e6;">soma-review</a>
+  {render_view_toggle(view, route_path, workspace)}
   {render_workspace_switcher(workspace)}
   {render_sidebar(route_path, workspace)}
 </nav>
@@ -2406,9 +2809,12 @@ def render_page(route_path, workspace=DEFAULT_WORKSPACE):
 window.__DISPATCH_TARGET__ = {json.dumps(dispatch_cfg['target'])};
 window.__DISPATCH_BUTTON__ = {json.dumps(dispatch_cfg['button'])};
 window.__MARK_LAYER__ = {json.dumps(mark_layer)}; window.__HAS_DISPATCH__ = {json.dumps(has_dispatch)};
-window.__TERM_DEFS__ = {term_defs_json};</script>
+window.__TERM_DEFS__ = {term_defs_json};
+window.__V3_VIEW__ = {json.dumps(view == 'v3')}; window.__LEVEL_LABEL__ = {json.dumps(level_label)};</script>
 <script>{PAGE_JS}</script>
 {f'<script>{MARK_LAYER_JS}</script>' if mark_layer else ''}
+<script>{VIEW_TOGGLE_JS}</script>
+{f'<script>{V3_JS}</script>' if view == 'v3' else ''}
 {tour_body}
 {mark_dock}
 </body>
@@ -2718,8 +3124,9 @@ class Handler(BaseHTTPRequestHandler):
 
         if path.startswith('/page/'):
             route_path = path[len('/page/'):]
+            view = qs.get('view', ['classic'])[0]
             try:
-                self._send_html(render_page(route_path, workspace))
+                self._send_html(render_page(route_path, workspace, view=view))
             except NotFoundError:
                 self._send_html(render_404(route_path, workspace), status=404)
             return

@@ -23,9 +23,10 @@ from urllib.parse import urlparse, parse_qs, unquote
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mdblocks import (  # noqa: E402
     parse_markdown, render_inline, build_lexicon_index, strip_auto_lexicon_marker,
-    _esc, _esc_attr, _first_sentence,
+    _esc, _esc_attr, _first_sentence, block_source_span, segment_sentences,
 )
 import blockmap  # noqa: E402
+from blockmap import norm  # noqa: E402
 import tours as tour_engine  # noqa: E402  (Quinn tours of completed jobs — see tours.py)
 import cursor_intake  # noqa: E402  (Grok/Cursor intake — see SOMA/cursor-intake/README.md)
 
@@ -1135,32 +1136,44 @@ function enterEditMode(el, body) {
   ta.style.height = Math.max(48, ta.scrollHeight) + 'px';
   ta.focus();
 
-  let settled = false;
-  const settle = async (commit) => {
-    if (settled) return;
-    settled = true;
+  let done = false;
+  // MDP mechanics item B (corrected 2026-09-03): leaving a changed sentence
+  // writes the trunk file AT ONCE (server-side, POST /api/comments type
+  // 'edit' — see do_POST) and commits; this is never a "suggested"/queued
+  // edit sitting apart from the document. A stale before-text (someone else
+  // changed this block since you started editing) refuses with 409 — caught
+  // here so the textarea's content isn't silently lost.
+  const commitChange = async (commit) => {
+    if (done) return;
+    done = true;
     const after = ta.value;
     if (commit && after.trim() !== before.trim()) {
-      await postComment({
-        anchor: el.dataset.anchor, snapshot: before, proposed: after,
-        text: 'Suggested edit', type: 'edit', ...blockPayload(el),
-      });
-      toast('Edit proposed — saved as a comment.');
-      loadThreadsIntoDOM();
+      try {
+        await postComment({
+          anchor: el.dataset.anchor, snapshot: before, proposed: after,
+          text: 'Sentence change', type: 'edit', ...blockPayload(el),
+        });
+        toast('Change applied and committed.');
+        loadThreadsIntoDOM();
+      } catch (err) {
+        alert('Change refused — this text changed on disk since you started editing. Reload and try again.');
+        done = false;
+        return;
+      }
     }
     body.innerHTML = originalHtml;
   };
 
   ta.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
-      // Cmd/Ctrl+Enter while editing text: commit the edit immediately.
+      // Cmd/Ctrl+Enter while editing text: commit the change immediately.
       e.preventDefault();
-      settle(true);
+      commitChange(true);
       return;
     }
-    if (e.key === 'Escape') { e.preventDefault(); settle(false); return; }
+    if (e.key === 'Escape') { e.preventDefault(); commitChange(false); return; }
   });
-  ta.addEventListener('blur', () => settle(true));
+  ta.addEventListener('blur', () => commitChange(true));
 }
 
 // Enter at the end of a (non-edit-mode) block, or Cmd/Enter anywhere in the block,
@@ -2008,6 +2021,16 @@ body.v3-view.v3-terms-on a.term-link{color:#a3c9ff;text-decoration:underline dot
 .v3-fold-toggle{background:none;border:0;color:#8a8f98;cursor:pointer;font-size:11px;padding:0 4px 0 0;}
 .v3-mark-row.v3-folded{opacity:.75;}
 .v3-back-chip{display:none;order:-1;}
+/* Generated Terms view (D, 2026-09-03): a page's ## Terms section body is
+   replaced at render time (server.py::render_generated_terms_section) with
+   one entry per term, definition + back-linked uses. */
+.v3-terms-generated{display:flex;flex-direction:column;gap:14px;}
+.v3-term-entry{border-top:1px solid #23262e;padding-top:10px;}
+.v3-term-entry:first-child{border-top:0;padding-top:0;}
+.v3-term-entry h4{margin:0 0 4px;font-size:14px;color:#e6e6e6;}
+.v3-term-uses{font-size:12px;color:#8a8f98;margin-top:4px;}
+.v3-term-use-link{color:#a3c9ff;text-decoration:none;margin-right:4px;}
+.v3-term-use-link:hover{text-decoration:underline;}
 /* Inline edit/replace-mark diffs (Mike's rule, 2026-09-03: "Wordsmithing
    shows as additions and deletions" IN THE TEXT, like Playmaker). Real
    <del>/<ins> elements, not span-only, so the diff is real document
@@ -2382,6 +2405,15 @@ V3_JS = r"""
     if (e.key === 'Escape' && backStack.length) { e.preventDefault(); goBack(); }
   });
   document.addEventListener('click', (e) => {
+    // Generated Terms view "used N times" back-links (D, 2026-09-03): model-
+    // anchored (block id + occurrence), handled before the generic `#anchor`
+    // delegate below since these carry a literal `href="#"` (no fragment id).
+    const useLink = e.target.closest('.v3-term-use-link');
+    if (useLink) {
+      e.preventDefault();
+      jumpToBlock(useLink.dataset.blockId);
+      return;
+    }
     const a = e.target.closest('a[href^="#"]');
     if (!a) return;
     const id = decodeURIComponent(a.getAttribute('href').slice(1));
@@ -2496,13 +2528,84 @@ V3_JS = r"""
   }
   function closePanel(){ panelOpen = false; document.getElementById('v3-panel').classList.remove('open'); }
 
-  function nextOpenAfter(m){
-    const ordered = allRows.filter(r => activeFilters.has(r.kind))
-      .sort((a,b) => (a.timestamp||'').localeCompare(b.timestamp||''));
-    const idx = ordered.findIndex(r => r.id === m.id);
+  // --- Resolve-advances-in-document-order (MDP mechanics item C, 2026-09-03):
+  // after Accept/Reject/Agree/Ratify, the NEXT open mark in document order
+  // (block position on the page, then creation order for co-located marks)
+  // has its dialog opened and is scrolled into view; at the true end, focus
+  // moves to "I'm done" instead. Document order (not filter/timestamp order,
+  // which is what the pre-existing generic Resolve button used) — cards and
+  // inline edit/replace marks share this one path.
+  function blockDomIndex(blockId){
+    if (!blockId) return Number.MAX_SAFE_INTEGER;
+    const nodes = Array.from(document.querySelectorAll('.block-wrap[data-block-id]'));
+    const idx = nodes.findIndex(el => el.dataset.blockId === blockId);
+    return idx === -1 ? Number.MAX_SAFE_INTEGER : idx;
+  }
+  function nextOpenMark(afterId){
+    const ordered = allRows.filter(r => !isReplyRow(r)).slice().sort((a, b) => {
+      const ba = blockDomIndex(a.block_id), bb = blockDomIndex(b.block_id);
+      if (ba !== bb) return ba - bb;
+      return (a.timestamp || '').localeCompare(b.timestamp || '');
+    });
+    const idx = ordered.findIndex(r => r.id === afterId);
     for (let i = idx + 1; i < ordered.length; i++) if (!ordered[i].resolved) return ordered[i];
-    for (let i = 0; i < idx; i++) if (!ordered[i].resolved) return ordered[i];
-    return null;
+    return null; // no wraparound — the end of the document ends the walk
+  }
+  function advanceAfterResolve(m){
+    const next = nextOpenMark(m.id);
+    if (next) {
+      jumpToBlock(next.block_id);
+      openDialog(allRows.find(r => r.id === next.id) || next);
+    } else {
+      document.getElementById('v3-done-btn')?.focus();
+    }
+  }
+
+  // --- Settle / Revert (items B/C, corrected 2026-09-03): an edit/replace
+  // mark's change was already written to the trunk file the moment it was
+  // created (server-side — see ctype=='edit' in do_POST). Settle just
+  // resolves the mark (no file write); Revert writes the mark's `before`
+  // text back into the trunk, committed. Both apply the server's freshly
+  // re-rendered block HTML in place (v3ApplyMergedBlockHtml keeps the
+  // existing .block-wrap/.block-body ELEMENTS so their already-bound
+  // listeners — comment affordance, click-to-edit — survive; only the
+  // wrapper's data-* attributes and the body's innerHTML are refreshed) —
+  // no full page reload. The diff-overlay bookkeeping is explicitly cleared
+  // here rather than left to v3PaintInlineDiffs' own cache-restore path:
+  // that path caches whatever the block-body showed the FIRST time a diff
+  // was painted, which under this model is already the post-change text,
+  // not genuinely "before" — trusting it after a revert would silently show
+  // the wrong sentence.
+  function v3ApplyMergedBlockHtml(wrap, html){
+    if (!wrap || !html) return;
+    const tmp = document.createElement('div');
+    tmp.innerHTML = html;
+    const fresh = tmp.firstElementChild;
+    if (!fresh) return;
+    Object.keys(fresh.dataset).forEach(k => { wrap.dataset[k] = fresh.dataset[k]; });
+    const freshBody = fresh.querySelector('.block-body');
+    const body = wrap.querySelector('.block-body');
+    if (freshBody && body) {
+      body.innerHTML = freshBody.innerHTML;
+      body.classList.remove('v3-inline-diff');
+      delete body.dataset.v3OrigBody;
+      delete body.dataset.v3MarkId;
+    }
+  }
+  async function settleOrRevertMark(m, action){
+    const res = await fetch(`${API_BASE}/api/marks/merge`, {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({page: ROUTE, id: m.id, action})});
+    let data = {};
+    try { data = await res.json(); } catch(_) {}
+    if (!res.ok) { alert(data.error || (action + ' failed')); return false; }
+    if (data.html) {
+      const wrap = document.querySelector(`.block-wrap[data-block-id="${CSS.escape(m.block_id)}"]`);
+      v3ApplyMergedBlockHtml(wrap, data.html);
+    }
+    await fetchMarks();
+    paintBlockIndicators(); v3PaintInlineDiffs(); v3WireInlineDiffClicks(); updateCountBadge();
+    if (panelOpen) renderPanel();
+    return true;
   }
 
   async function setStatus(m, status){
@@ -2553,14 +2656,15 @@ V3_JS = r"""
         <button data-v3-not-yet>Not yet</button>`;
     }
     // Edit/replace marks opened from their inline diff (v3PaintInlineDiffs):
-    // Accept applies the change (resolves the mark, so the block shows plain
-    // proposed text going forward this session), Reject resolves it the
-    // other way (block reverts to base text), Edit re-opens the block's own
-    // click-to-edit textarea (enterEditMode, PAGE_JS, shared with classic) so
-    // Mike can revise the proposal further before deciding.
+    // the trunk file already holds the proposed text (written at change
+    // time — item B). Settle resolves the mark and clears the del/ins
+    // overlay (trunk unchanged). Revert writes `before` back into the trunk
+    // (committed) and resolves the mark the other way. Edit re-opens the
+    // block's own click-to-edit textarea (enterEditMode, PAGE_JS, shared
+    // with classic) so Mike can change it again before deciding.
     if ((m.kind === 'edit' || m.kind === 'replace') && !m.resolved) {
-      extraActions = `<button class="primary" data-v3-accept>Accept</button>
-        <button data-v3-reject-edit>Reject</button>
+      extraActions = `<button class="primary" data-v3-accept>Settle</button>
+        <button data-v3-reject-edit>Revert</button>
         <button data-v3-edit-more>Edit</button>`;
     }
     const replies = repliesFor(m).sort((a,b) => (a.timestamp||'').localeCompare(b.timestamp||''));
@@ -2588,9 +2692,8 @@ V3_JS = r"""
     });
     backdrop.querySelector('[data-v3-resolve]')?.addEventListener('click', async () => {
       await setStatus(m, 'done');
-      const next = nextOpenAfter(m);
       backdrop.remove();
-      if (next) openDialog(allRows.find(r => r.id === next.id) || next);
+      advanceAfterResolve(m);
     });
     backdrop.querySelector('[data-v3-reopen]')?.addEventListener('click', async () => {
       await setStatus(m, 'queued');
@@ -2600,6 +2703,7 @@ V3_JS = r"""
       btn.addEventListener('click', async () => {
         await postAnswer(m, `Ratify: Alternative ${btn.dataset.v3Ratify}`, 'done');
         backdrop.remove();
+        advanceAfterResolve(m);
       });
     });
     backdrop.querySelector('[data-v3-not-yet]')?.addEventListener('click', async () => {
@@ -2609,10 +2713,12 @@ V3_JS = r"""
     backdrop.querySelector('[data-v3-reject]')?.addEventListener('click', async () => {
       await postAnswer(m, 'Reject', 'done');
       backdrop.remove();
+      advanceAfterResolve(m);
     });
     backdrop.querySelector('[data-v3-agree]')?.addEventListener('click', async () => {
       await postAnswer(m, 'Agree', 'done');
       backdrop.remove();
+      advanceAfterResolve(m);
     });
     backdrop.querySelector('[data-v3-agree-unpack]')?.addEventListener('click', async () => {
       // "Agree and unpack" (task spec item 1): records assent AND flags the
@@ -2620,14 +2726,21 @@ V3_JS = r"""
       // distinguished only by the reply text the harvest reads.
       await postAnswer(m, 'Agree and unpack — flagged for depth-two expansion next round', 'done');
       backdrop.remove();
+      advanceAfterResolve(m);
     });
     backdrop.querySelector('[data-v3-accept]')?.addEventListener('click', async () => {
-      await postAnswer(m, 'Accept', 'done');
+      // Settle (item B): trunk already holds the right text — resolves the
+      // mark and redraws the block without the del/ins overlay.
+      const ok = await settleOrRevertMark(m, 'settle');
       backdrop.remove();
+      if (ok) advanceAfterResolve(m);
     });
     backdrop.querySelector('[data-v3-reject-edit]')?.addEventListener('click', async () => {
-      await postAnswer(m, 'Reject', 'done');
+      // Revert (item B): writes `before` back into the trunk file,
+      // committed — see apply_sentence_revert.
+      const ok = await settleOrRevertMark(m, 'revert');
       backdrop.remove();
+      if (ok) advanceAfterResolve(m);
     });
     backdrop.querySelector('[data-v3-edit-more]')?.addEventListener('click', () => {
       backdrop.remove();
@@ -3085,6 +3198,213 @@ def validated_binding(route_path, workspace, candidate):
     return fields
 
 
+# --- Sentence-level change / settle / revert (MDP mechanics items B/C,
+# corrected by Mike 2026-09-03 evening): a mark is a branch of a SENTENCE
+# (not a block/paragraph), and an edit/replace mark is never "queued" or
+# "pending" — the moment any author (Mike typing and leaving a sentence, or
+# Claude posting an edit/replace mark) changes it, the trunk file is updated
+# AT ONCE to the new text and committed. `mark['snapshot']` (before) /
+# `mark['proposed']` (the text now actually in the trunk) together ARE the
+# open-change record; del/ins painting (v3PaintInlineDiffs, client-side,
+# unchanged by this) means "here is an open change", not "here is a pending
+# suggestion". Settle resolves the mark with no file write (the trunk
+# already holds the right text). Revert writes `before` back into the trunk,
+# committed, and resolves the mark the other way. No model inference
+# anywhere in this path: `proposed`/`snapshot` are copied verbatim, byte for
+# byte, in both directions. -------------------------------------------------
+
+class MergeConflict(Exception):
+    """Raised when the sentence/block text actually on disk no longer matches
+    what a change or revert expects — refuse loudly rather than silently
+    clobbering whatever is there now."""
+
+
+def _git_repo_root(fs_path):
+    """Return the git repo root containing fs_path, or None if it isn't
+    inside one (e.g. an ad-hoc directory with no .git — merge still writes
+    the file in that case, just skips the commit step)."""
+    try:
+        out = subprocess.run(
+            ['git', '-C', os.path.dirname(fs_path), 'rev-parse', '--show-toplevel'],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if out.returncode != 0:
+        return None
+    return out.stdout.strip() or None
+
+
+def _git_commit_file(repo_root, fs_path, message):
+    """`git add` + `git commit` the one file, trailer `Seat: dee` per estate
+    convention. Returns the new commit sha, or None if there was nothing to
+    commit (e.g. the write happened to reproduce byte-identical content) or
+    git isn't available/configured for commits in this repo — a merge that
+    changed the file on disk still counts as applied; the commit is a
+    best-effort audit trail on top of that, not the definition of success."""
+    # realpath both sides: `git rev-parse --show-toplevel` resolves symlinks
+    # (macOS /var -> /private/var is the concrete case that bit this in
+    # testing), but fs_path may still carry the symlinked form — a mismatch
+    # here makes git report the file as "outside repository".
+    rel = os.path.relpath(os.path.realpath(fs_path), os.path.realpath(repo_root))
+    try:
+        add = subprocess.run(['git', '-C', repo_root, 'add', rel],
+                              capture_output=True, text=True, timeout=10)
+        if add.returncode != 0:
+            return None, add.stderr.strip()
+        commit = subprocess.run(
+            ['git', '-C', repo_root, 'commit', '-m', message, '--trailer', 'Seat: dee'],
+            capture_output=True, text=True, timeout=10,
+        )
+        if commit.returncode != 0:
+            # "nothing to commit" is not an error — the write may have been a
+            # no-op (proposed == current text) or an earlier merge already
+            # committed the identical bytes on retry.
+            if 'nothing to commit' in (commit.stdout + commit.stderr).lower():
+                return None, None
+            return None, commit.stderr.strip()
+        sha = subprocess.run(['git', '-C', repo_root, 'rev-parse', 'HEAD'],
+                              capture_output=True, text=True, timeout=10)
+        return (sha.stdout.strip() or None), None
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return None, str(exc)
+
+
+def _locate_change_span(route_path, workspace, block_id, expected_text):
+    """Locate the exact span in the real file that currently holds
+    `expected_text` — either the WHOLE block (the common case: this doc's
+    blocks are one sentence each, and classic whole-block edit-as-comment
+    always submits the full block text) or, if `expected_text` is a strict
+    sub-sentence of a multi-sentence block, that one sentence
+    (`mdblocks.segment_sentences`, item C: "unit of editing is the
+    sentence"). Returns `(fs_path, normalized_src, start, end, block,
+    sentence_index_or_None)`. Raises MergeConflict if `expected_text` matches
+    neither the whole block nor exactly one of its sentences — the caller's
+    idea of "before" no longer corresponds to anything really on disk."""
+    fs_path = resolve_page(route_path, workspace)
+    _src_bytes, blocks, _mapping, _report = current_page_blocks(route_path, workspace)
+    block = next((b for b in blocks if b['id'] == block_id), None)
+    if block is None:
+        raise MergeConflict(f'block {block_id} no longer exists on this page')
+    with open(fs_path, 'r', encoding='utf-8') as f:
+        raw_text = f.read()
+    normalized, block_start, block_end, exact_text = block_source_span(raw_text, block)
+    if norm(exact_text) == norm(expected_text or ''):
+        return fs_path, normalized, block_start, block_end, block, None
+    spans = segment_sentences(exact_text)
+    for idx, (s, e, sent_text) in enumerate(spans):
+        if norm(sent_text) == norm(expected_text or ''):
+            return fs_path, normalized, block_start + s, block_start + e, block, idx
+    raise MergeConflict(
+        f'block {block_id} text on disk no longer matches the expected before-text — refusing change'
+    )
+
+
+def _rerender_block(route_path, workspace, fs_path, new_src, block_id, old_block):
+    """Re-render one block fresh from `new_src` (the file content just
+    written). Reconciliation (inside current_page_blocks) carries the
+    block's id forward across the text change when possible; falls back to
+    matching on the same line_start if the id genuinely changed."""
+    _src2, new_blocks, _map2, _report2 = current_page_blocks(route_path, workspace)
+    new_block = next((b for b in new_blocks if b['id'] == block_id), None)
+    if new_block is None:
+        new_block = next((b for b in new_blocks if b.get('line_start') == old_block.get('line_start')), None)
+    if new_block is None:
+        return {'block_id': block_id, 'html': None}
+    ws = get_workspace(workspace)
+    resolver = make_link_resolver(fs_path, route_path, workspace)
+    lexicon = get_lexicon_index()
+    auto_lexicon_page, _ = strip_auto_lexicon_marker(new_src)
+    terms_out = {}
+    parse_markdown(new_src, link_resolver=resolver, terms_out=terms_out, lexicon=lexicon)
+    badges_on = route_path in (ws.get('status_badges') or [])
+    html = render_block_html(
+        new_block, route_path,
+        status_chip=(wq_status_chip(new_block) if badges_on else None),
+        link_resolver=resolver, terms=terms_out, lexicon=lexicon,
+        auto_lexicon=auto_lexicon_page,
+    )
+    return {'block_id': new_block['id'], 'html': html}
+
+
+def apply_sentence_change(route_path, workspace, mark, author_label='claude'):
+    """The trunk write for a NEW open change (item B): called once, at the
+    moment a type=='edit' mark is created (POST /api/comments — see do_POST),
+    for every author alike. Writes `mark['proposed']` into the exact span
+    that currently holds `mark['snapshot']` (hash-guarded — MergeConflict if
+    the sentence/block has drifted), commits `mdp: change <id> on <page>
+    (<author>)`. The mark itself is NOT resolved by this — it stays open
+    (del/ins showing) until Settle or Revert."""
+    block_id = mark.get('block_id')
+    proposed = mark.get('proposed')
+    if not block_id:
+        raise MergeConflict('mark carries no block_id')
+    if proposed is None:
+        raise MergeConflict('mark carries no proposed text')
+    fs_path, normalized, start, end, block, sentence_index = _locate_change_span(
+        route_path, workspace, block_id, mark.get('snapshot')
+    )
+    new_src = normalized[:start] + proposed + normalized[end:]
+    with open(fs_path, 'w', encoding='utf-8') as f:
+        f.write(new_src)
+    commit_sha = None
+    repo_root = _git_repo_root(fs_path)
+    if repo_root:
+        message = f"mdp: change {mark.get('id')} on {route_path} ({author_label})"
+        commit_sha, _err = _git_commit_file(repo_root, fs_path, message)
+    result = _rerender_block(route_path, workspace, fs_path, new_src, block_id, block)
+    result['commit'] = commit_sha
+    result['sentence_index'] = sentence_index
+    return result
+
+
+def apply_sentence_settle(route_path, workspace, mark):
+    """Settle: the trunk already holds the right text (it was written at
+    change time) — no file write, no commit, only the mark is resolved. Still
+    returns a fresh re-render of the block (cheap — no write involved) so the
+    client can clear the del/ins overlay by swapping in server-authoritative
+    plain HTML rather than trusting a client-side page-load-time DOM cache
+    (which, under this model, never actually held the true "before" text)."""
+    fs_path = resolve_page(route_path, workspace)
+    with open(fs_path, 'r', encoding='utf-8') as f:
+        current_src = f.read()
+    _src_bytes, blocks, _mapping, _report = current_page_blocks(route_path, workspace)
+    block = next((b for b in blocks if b['id'] == mark.get('block_id')), None)
+    result = (_rerender_block(route_path, workspace, fs_path, current_src, mark.get('block_id'), block or {})
+              if block else {'block_id': mark.get('block_id'), 'html': None})
+    result['commit'] = None
+    return result
+
+
+def apply_sentence_revert(route_path, workspace, mark):
+    """Revert: deterministically writes `mark['snapshot']` (before) back into
+    the span that currently holds `mark['proposed']` (the open change),
+    hash-guarded the same way as a change, commits `mdp: revert <id> on
+    <page> (Mike)`, and resolves the mark (`reverted: true` — set by the
+    caller, do_POST, alongside status:'done')."""
+    block_id = mark.get('block_id')
+    before_text = mark.get('snapshot')
+    if not block_id:
+        raise MergeConflict('mark carries no block_id')
+    if before_text is None:
+        raise MergeConflict('mark carries no snapshot (before) text to revert to')
+    fs_path, normalized, start, end, block, sentence_index = _locate_change_span(
+        route_path, workspace, block_id, mark.get('proposed')
+    )
+    new_src = normalized[:start] + before_text + normalized[end:]
+    with open(fs_path, 'w', encoding='utf-8') as f:
+        f.write(new_src)
+    commit_sha = None
+    repo_root = _git_repo_root(fs_path)
+    if repo_root:
+        message = f"mdp: revert {mark.get('id')} on {route_path} (Mike)"
+        commit_sha, _err = _git_commit_file(repo_root, fs_path, message)
+    result = _rerender_block(route_path, workspace, fs_path, new_src, block_id, block)
+    result['commit'] = commit_sha
+    result['sentence_index'] = sentence_index
+    return result
+
+
 _LEVEL_FRONTMATTER_RE = re.compile(r'^\s*(?:<!--.*?-->\s*)*---\s*\n(.*?)\n---\s*\n', re.S)
 _LEVEL_KEY_RE = re.compile(r'^level:\s*(.+?)\s*$', re.M)
 _VIEW_KEY_RE = re.compile(r'^view:\s*(.+?)\s*$', re.M)
@@ -3136,6 +3456,115 @@ def render_view_toggle(view, route_path, workspace):
     <a class="view-toggle-btn{classic_active}" href="?view=classic" data-view-toggle="classic">Classic</a>
     <a class="view-toggle-btn{v3_active}" href="?view=v3" data-view-toggle="v3">Mark layer</a>
   </div>'''
+
+
+_TERM_USE_SLUG_RE = re.compile(r'data-term-slug="([a-zA-Z0-9-]+)"')
+
+
+def _replace_block_body_html(wrapped_html, new_inner_html):
+    """Swap a rendered `render_block_html()` wrapper's `.block-body` inner
+    content in place, keeping every wrapper attribute (data-block-id, anchor,
+    source, comment-box, etc.) untouched — used by the generated Terms view
+    (D, below) so the replaced block keeps its real identity for comment/
+    edit-mark binding even though its VISIBLE content is server-generated."""
+    m = re.search(r'(<div class="block-body[^>]*>)(.*)(</div>\s*<div class="comment-box">)', wrapped_html, re.S)
+    if not m:
+        return wrapped_html
+    return wrapped_html[:m.start()] + m.group(1) + new_inner_html + m.group(3) + wrapped_html[m.end():]
+
+
+def render_generated_terms_section(blocks, block_htmls, terms_out, lexicon, url_prefix, lexicon_route):
+    """v3-only (MDP mechanics, item D, 2026-09-03): a page's `## Terms` section
+    renders as a GENERATED view built from the lexicon node store — every
+    term-link on the page (page-local `terms_out` table + lexicon auto-links)
+    gets one entry with its definition and a "used N times on this page" line
+    back-linking to every use. A use's identity is `(block_id,
+    occurrence-within-block)` — model-anchored, never a text position, so it
+    survives ordinary edits the way every other mark binding does.
+
+    Never touches the `.md` file: only THIS render's HTML for the Terms
+    section's body block(s) is replaced (`_replace_block_body_html` keeps the
+    wrapper so comment/edit-mark binding on that block id is unaffected). If a
+    hand-written Terms section exists, its own entries came from `terms_out`
+    already (existing `extract_terms()` behavior — page-local overrides the
+    lexicon) and are folded into this same generated view rather than lost.
+    A page with no `## Terms` heading, or an empty one, renders unchanged
+    (`blocks`/`block_htmls` returned as-is).
+    """
+    terms_idx = next(
+        (i for i, b in enumerate(blocks)
+         if b['kind'] == 'heading' and b['text'].strip().lower() == 'terms'),
+        None,
+    )
+    if terms_idx is None:
+        return
+    heading_level = blocks[terms_idx]['level']
+    end_idx = len(blocks)
+    for j in range(terms_idx + 1, len(blocks)):
+        if blocks[j]['kind'] == 'heading' and blocks[j]['level'] <= heading_level:
+            end_idx = j
+            break
+    body_idxs = list(range(terms_idx + 1, end_idx))
+    if not body_idxs:
+        return
+
+    # Every term-link use ELSEWHERE on the page, in document order, tagged
+    # with (block_id, occurrence-index-within-that-block) — never counts the
+    # Terms section's own definitions as a "use" of themselves.
+    uses = {}
+    for idx, block in enumerate(blocks):
+        if idx == terms_idx or idx in body_idxs:
+            continue
+        counts = {}
+        for slug in _TERM_USE_SLUG_RE.findall(block_htmls[idx]):
+            occ = counts.get(slug, 0)
+            uses.setdefault(slug, []).append((block['id'], occ))
+            counts[slug] = occ + 1
+
+    all_slugs = sorted(set(terms_out.keys()) | set(uses.keys()))
+    if not all_slugs:
+        return
+
+    entries = []
+    for slug in all_slugs:
+        local = terms_out.get(slug)
+        if local:
+            term_name, def_html = local['term'], local['html']
+        else:
+            lex_slug = slug[len('lex-'):] if slug.startswith('lex-') else slug
+            lex_entry = (lexicon or {}).get('by_slug', {}).get(lex_slug)
+            if not lex_entry:
+                continue
+            term_name = lex_entry['term']
+            def_html = (lexicon_entry_popover_html(lex_entry, url_prefix, lexicon_route) if lexicon_route
+                        else f"<p>{_esc_html(lex_entry['gloss'])}</p>")
+        term_uses = uses.get(slug, [])
+        use_links = ' '.join(
+            f'<a href="#" class="v3-term-use-link" data-block-id="{_html_attr_escape(bid)}" '
+            f'data-occurrence="{occ}">[{k + 1}]</a>'
+            for k, (bid, occ) in enumerate(term_uses)
+        )
+        n = len(term_uses)
+        uses_line = (
+            f'<div class="v3-term-uses">Used {n} time{"s" if n != 1 else ""} on this page: {use_links}</div>'
+            if n else '<div class="v3-term-uses">Not used elsewhere on this page.</div>'
+        )
+        entries.append(
+            f'<div class="v3-term-entry" id="term-{_html_attr_escape(slug)}">'
+            f'<h4>{_html_attr_escape(term_name)}</h4>{def_html}{uses_line}</div>'
+        )
+    generated_html = '<div class="v3-terms-generated">' + ''.join(entries) + '</div>'
+
+    first = body_idxs[0]
+    block_htmls[first] = _replace_block_body_html(block_htmls[first], generated_html)
+    for j in body_idxs[1:]:
+        block_htmls[j] = _replace_block_body_html(
+            block_htmls[j], '<!-- absorbed into generated Terms view above -->'
+        )
+
+
+def _esc_html(s):
+    return (s or '').replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
 
 
 def render_page(route_path, workspace=DEFAULT_WORKSPACE, view='classic'):
@@ -3190,7 +3619,7 @@ def render_page(route_path, workspace=DEFAULT_WORKSPACE, view='classic'):
         )
 
     badges_on = route_path in (ws.get('status_badges') or [])
-    blocks_html = '\n'.join(
+    block_htmls = [
         render_block_html(
             b, route_path,
             status_chip=(wq_status_chip(b) if badges_on else None),
@@ -3199,7 +3628,11 @@ def render_page(route_path, workspace=DEFAULT_WORKSPACE, view='classic'):
             lexicon=lexicon,
             auto_lexicon=auto_lexicon_page,
         )
-        for b in blocks)
+        for b in blocks]
+    if view == 'v3':
+        lexicon_route = fs_path_to_route(LEXICON_MD_PATH, workspace) if os.path.isfile(LEXICON_MD_PATH) else None
+        render_generated_terms_section(blocks, block_htmls, terms_out, lexicon, url_prefix, lexicon_route)
+    blocks_html = '\n'.join(block_htmls)
 
     # Slim map for the hover-popover JS: slug -> rendered definition html (which may
     # itself contain nested .term-link anchors — recursion handled by mdblocks.py's
@@ -3739,6 +4172,7 @@ class Handler(BaseHTTPRequestHandler):
             data = self._read_json_body()
             page = data.get('page', '')
             ctype = data.get('type', 'comment')
+            response_extra_html = None
             if ctype not in ('comment', 'edit', 'verdict', 'mark'):
                 self._send_json({'error': 'invalid type'}, status=400)
                 return
@@ -3778,7 +4212,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not page or proposed is None:
                     self._send_json({'error': 'page and proposed required for edit'}, status=400)
                     return
-                text = (data.get('text') or '').strip() or '(proposed edit)'
+                text = (data.get('text') or '').strip() or '(sentence change)'
             elif ctype == 'verdict':
                 # Portfolio triage: {type: "verdict", verdict: keep|restart|cancel|later,
                 # row_id, anchor?, snapshot?}. No new storage — same JSONL sidecar, just
@@ -3827,6 +4261,27 @@ class Handler(BaseHTTPRequestHandler):
                 comment['proposed'] = data.get('proposed')
                 if data.get('replace'):
                     comment['replace'] = True
+                # Sentence-level change is applied to the trunk file AT ONCE
+                # (MDP mechanics item B, corrected by Mike 2026-09-03
+                # evening): this comment record is the OPEN-CHANGE marker
+                # (snapshot=before, proposed=now actually on disk), never a
+                # pending suggestion. A stale before-text refuses with 409
+                # and writes nothing — neither the file nor this sidecar row.
+                try:
+                    change_result = apply_sentence_change(page, workspace, comment, author_label=comment['author'])
+                except MergeConflict as exc:
+                    self._send_json({'error': str(exc)}, status=409)
+                    return
+                except NotFoundError:
+                    self._send_json({'error': 'unknown page'}, status=404)
+                    return
+                comment['commit'] = change_result.get('commit')
+                if change_result.get('sentence_index') is not None:
+                    comment['sentence_index'] = change_result['sentence_index']
+                # Not persisted to the sidecar (would bloat every row with a
+                # full block-html blob) — only returned in THIS response so
+                # postComment()'s caller can redraw reactively.
+                response_extra_html = change_result.get('html')
             if ctype == 'mark':
                 comment['mark_kind'] = mark_kind
                 comment['strength'] = strength
@@ -3880,7 +4335,10 @@ class Handler(BaseHTTPRequestHandler):
                 # card) by route_requests.py. Best-effort: a routing failure is
                 # reported in the response, never blocks the verdict itself.
                 comment['_dr'] = file_development_request(page, text, workspace)
-            self._send_json(comment, status=201)
+            response = dict(comment)
+            if response_extra_html is not None:
+                response['html'] = response_extra_html
+            self._send_json(response, status=201)
             return
 
         if path == '/api/public-film':
@@ -3909,6 +4367,64 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({'error': 'comment not found'}, status=404)
                 return
             self._send_json({'ok': True})
+            return
+
+        if path == '/api/marks/merge':
+            # Settle / Revert (MDP mechanics items B/C, corrected 2026-09-03):
+            # {page, id, action: "settle"|"revert"}. An edit/replace mark's
+            # change was ALREADY written to the trunk at creation time (see
+            # ctype == 'edit' below) — this endpoint only resolves it.
+            # Settle: no file write, trunk already correct. Revert:
+            # deterministically writes the mark's `snapshot` (before) back
+            # into the trunk, committed. Both hash-guard against the file's
+            # real current text and refuse (409) on drift.
+            data = self._read_json_body()
+            page = data.get('page', '')
+            mark_id = data.get('id', '')
+            action = data.get('action', 'settle')
+            if action not in ('settle', 'revert'):
+                self._send_json({'error': 'action must be settle or revert'}, status=400)
+                return
+            if not (page and mark_id):
+                self._send_json({'error': 'page and id required'}, status=400)
+                return
+            try:
+                resolve_page(page, workspace)
+            except NotFoundError:
+                self._send_json({'error': 'unknown page'}, status=404)
+                return
+            rows = [c for c in read_comments(page, workspace) if c.get('id') == mark_id]
+            if not rows:
+                self._send_json({'error': 'mark not found'}, status=404)
+                return
+            mark = rows[0]
+            if mark.get('type') not in ('edit',):
+                self._send_json({'error': 'only edit/replace marks can be settled or reverted'}, status=400)
+                return
+            if mark.get('status') == 'done':
+                self._send_json({'error': 'mark already resolved'}, status=409)
+                return
+            if action == 'settle':
+                result = apply_sentence_settle(page, workspace, mark)
+                update_comment(page, mark_id, {'status': 'done', 'settled': True}, workspace)
+                self._send_json({
+                    'ok': True, 'settled': True,
+                    'block_id': result['block_id'], 'html': result['html'], 'commit': result['commit'],
+                })
+                return
+            try:
+                result = apply_sentence_revert(page, workspace, mark)
+            except MergeConflict as exc:
+                self._send_json({'error': str(exc)}, status=409)
+                return
+            except NotFoundError:
+                self._send_json({'error': 'unknown page'}, status=404)
+                return
+            update_comment(page, mark_id, {'status': 'done', 'reverted': True}, workspace)
+            self._send_json({
+                'ok': True, 'reverted': True,
+                'block_id': result['block_id'], 'html': result['html'], 'commit': result['commit'],
+            })
             return
 
         if path == '/api/comments/update':

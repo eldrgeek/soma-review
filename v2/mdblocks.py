@@ -250,6 +250,116 @@ def strip_front_matter(src):
     return src
 
 
+def stripped_src_and_prefix_len(src):
+    """Mirror `parse_markdown`'s own leading-metadata stripping (NFC normalize,
+    then `strip_auto_lexicon_marker`, then `strip_front_matter`) and additionally
+    return how many leading characters of the NORMALIZED source were removed.
+
+    Used by merge-on-accept (`server.py::apply_block_merge`) to translate a
+    block's `line_start`/`line_end` (recorded against the stripped, line-split
+    source `parse_markdown` actually iterates) back into an absolute character
+    offset in the real file text, so an inline edit/replace mark can be applied
+    to the file on disk without re-deriving the block's location from its
+    rendered `text` (which for paragraphs is space-joined and has already lost
+    the original line breaks).
+
+    Assumes — as every real page does today — that all removed material sits
+    at the very front of the document; a marker or front-matter block
+    appearing only after real content is out of scope (documented limitation,
+    matches `strip_front_matter`'s own docstring: it is a *leading*-block
+    stripper).
+    """
+    normalized = unicodedata.normalize('NFC', src)
+    _, after_marker = strip_auto_lexicon_marker(normalized)
+    after_fm = strip_front_matter(after_marker)
+    prefix_len = len(normalized) - len(after_fm)
+    return normalized, after_fm, prefix_len
+
+
+_SENTENCE_ABBREVIATIONS = {
+    'e.g', 'i.e', 'etc', 'vs', 'mr', 'mrs', 'dr', 'ms', 'jr', 'sr',
+    'inc', 'ltd', 'no', 'st', 'approx', 'fig', 'vol', 'op', 'cf',
+}
+
+
+def segment_sentences(text):
+    """Split `text` into sentences on `.`/`?`/`!` followed by whitespace-or-end
+    (MDP mechanics item C, 2026-09-03: "unit of editing is the SENTENCE, not
+    the block/paragraph"). A simple rule, not a full NLP sentence-boundary
+    detector: an ending punctuation run is a boundary unless the word
+    immediately before it is a known abbreviation (`e.g.`, `i.e.`, `etc.`,
+    `Mr.`, ...) or a single capital letter (an initial, e.g. "J. Smith").
+
+    Returns a list of `(start, end, sentence_text)` character spans that
+    exactly tile `text` with no gaps or overlaps — `''.join(t for _, _, t in
+    segment_sentences(text)) == text` always holds, which is what lets caller
+    code (server.py's sentence-level change/revert) splice a replacement in
+    by character offset and trust the rest of the block is untouched.
+    """
+    if not text:
+        return []
+    n = len(text)
+    starts = [0]
+    i = 0
+    while i < n:
+        ch = text[i]
+        if ch in '.!?':
+            j = i
+            while j < n and text[j] in '.!?':
+                j += 1
+            k = i
+            # Walk back through letters AND internal periods so a multi-dot
+            # abbreviation like "e.g." is seen as one token ("e.g") rather
+            # than being checked one dot at a time (which would see "e" then
+            # "g" and miss the abbreviation on its second, real, boundary).
+            while k > 0 and (text[k - 1].isalnum() or text[k - 1] == '.'):
+                k -= 1
+            word = text[k:i].strip('.')
+            is_abbrev = (
+                word.lower() in _SENTENCE_ABBREVIATIONS
+                or (len(word) == 1 and word.isupper())
+            )
+            boundary_ok = j >= n or text[j] in ' \t\n'
+            if boundary_ok and not is_abbrev:
+                starts.append(j)
+            i = j
+            continue
+        i += 1
+    starts.append(n)
+    starts = sorted(set(s for s in starts if 0 <= s <= n))
+    spans = []
+    for a, b in zip(starts, starts[1:]):
+        if a == b:
+            continue
+        spans.append((a, b, text[a:b]))
+    return spans
+
+
+def block_source_span(raw_src, block):
+    """Locate a block's exact original source slice in `raw_src` (the real file
+    content, as read from disk) using the block's `line_start`/`line_end`
+    (0-indexed, end-exclusive, set by `parse_markdown` on every block).
+
+    Returns `(normalized_src, start_char, end_char, exact_text)` where
+    `normalized_src` is `raw_src` after NFC normalization (the coordinate
+    space `start_char`/`end_char` are in — see `stripped_src_and_prefix_len`),
+    and `exact_text` is `normalized_src[start_char:end_char]` — the block's
+    real original text INCLUDING any internal newlines (unlike the block's
+    `text` field, which is space-joined for paragraphs).
+
+    Raises KeyError if the block carries no `line_start`/`line_end` (e.g. a
+    block dict built by a caller other than `parse_markdown`).
+    """
+    line_start = block['line_start']
+    line_end = block['line_end']
+    normalized, stripped, prefix_len = stripped_src_and_prefix_len(raw_src)
+    lines = stripped.split('\n')
+    exact_text = '\n'.join(lines[line_start:line_end])
+    start_char = prefix_len + sum(len(l) + 1 for l in lines[:line_start])
+    end_char = start_char + len(exact_text)
+    return normalized, start_char, end_char, exact_text
+
+
 def strip_auto_lexicon_marker(src):
     """Detect the per-page auto-lexicon opt-in and remove the marker from the
     rendered source so it never shows up as visible text (same treatment normal
@@ -752,6 +862,15 @@ def parse_markdown(src, link_resolver=None, terms_out=None, lexicon=None):
             i += 1
             continue
 
+        # Line-span of the block about to be parsed, in terms of `lines` (the
+        # stripped/normalized source split on '\n') — recorded on every block
+        # below as `line_start`/`line_end` (end exclusive) so file-writing code
+        # (merge-on-accept, server.py) can locate and replace a block's exact
+        # original source lines without re-deriving them from the rendered
+        # `text` field (which for paragraphs is space-joined and has already
+        # lost the original line breaks).
+        blk_line_start = i
+
         # Fenced code block (special-cased 'film' language: Screening Room video
         # player block — see render_film_block(). Same fence syntax so anchor/
         # snapshot/edit-source machinery is unchanged; only the rendered HTML differs.)
@@ -776,6 +895,7 @@ def parse_markdown(src, link_resolver=None, terms_out=None, lexicon=None):
                 html_body = f'<pre><code class="lang-{_esc(lang)}">{_esc(raw)}</code></pre>'
                 kind = 'code'
             blocks.append({
+                'line_start': blk_line_start, 'line_end': i,
                 'kind': kind, 'level': None, 'heading_path': heading_path(),
                 'index': idx, 'text': raw, 'html': html_body,
             })
@@ -803,6 +923,7 @@ def parse_markdown(src, link_resolver=None, terms_out=None, lexicon=None):
             heading_id = make_id(slugify(text))
             html_body = f'<h{level} id="{heading_id}">{render_inline(text, link_resolver, terms=terms, lexicon=lexicon)}</h{level}>'
             blocks.append({
+                'line_start': blk_line_start, 'line_end': i,
                 'kind': 'heading', 'level': level, 'heading_path': heading_path()[:-1],
                 'index': idx, 'text': text, 'html': html_body, 'heading_id': heading_id,
             })
@@ -813,6 +934,7 @@ def parse_markdown(src, link_resolver=None, terms_out=None, lexicon=None):
         # Horizontal rule
         if re.match(r'^(-{3,}|\*{3,}|_{3,})$', stripped):
             blocks.append({
+                'line_start': blk_line_start, 'line_end': i,
                 'kind': 'hr', 'level': None, 'heading_path': heading_path(),
                 'index': idx, 'text': '---', 'html': '<hr/>',
             })
@@ -843,6 +965,7 @@ def parse_markdown(src, link_resolver=None, terms_out=None, lexicon=None):
             )
             html_body = f'<table><thead><tr>{thead}</tr></thead><tbody>{tbody}</tbody></table>'
             blocks.append({
+                'line_start': blk_line_start, 'line_end': i,
                 'kind': 'table', 'level': None, 'heading_path': heading_path(),
                 'index': idx, 'text': '\n'.join(raw_lines), 'html': html_body,
             })
@@ -862,6 +985,7 @@ def parse_markdown(src, link_resolver=None, terms_out=None, lexicon=None):
                 f'</blockquote>'
             )
             blocks.append({
+                'line_start': blk_line_start, 'line_end': i,
                 'kind': 'blockquote', 'level': None, 'heading_path': heading_path(),
                 'index': idx, 'text': raw, 'html': html_body,
             })
@@ -881,6 +1005,7 @@ def parse_markdown(src, link_resolver=None, terms_out=None, lexicon=None):
                 lexicon=lexicon, auto_lexicon=auto_lex_now(),
             )
             blocks.append({
+                'line_start': blk_line_start, 'line_end': i,
                 'kind': 'list', 'level': None, 'heading_path': heading_path(),
                 'index': idx, 'text': raw, 'html': html_body,
             })
@@ -899,6 +1024,7 @@ def parse_markdown(src, link_resolver=None, terms_out=None, lexicon=None):
         raw = ' '.join(para_lines)
         html_body = f'<p>{render_inline(raw, link_resolver, terms=terms, lexicon=lexicon, auto_lexicon=auto_lex_now())}</p>'
         blocks.append({
+            'line_start': blk_line_start, 'line_end': i,
             'kind': 'paragraph', 'level': None, 'heading_path': heading_path(),
             'index': idx, 'text': raw, 'html': html_body,
         })

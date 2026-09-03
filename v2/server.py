@@ -554,6 +554,18 @@ hr { border: none; border-top: 1px solid #2b3140; margin: 24px 0; }
 .film-blurb { font-size: 14px; color: #c7ccd6; margin: 4px 0 10px; }
 details.verification-group summary { cursor: pointer; color: #8a93a3; font-size: 13px;
                                       margin: 20px 0 8px; }
+html { scroll-behavior: smooth; }
+.main h1[id], .main h2[id], .main h3[id], .main h4[id], .main h5[id], .main h6[id],
+.main li[id] { scroll-margin-top: 64px; }
+a.term-link { color: #a3c9ff; text-decoration: underline dotted; cursor: help; }
+a.term-link:hover, a.term-link:focus { color: #cfe3ff; }
+.term-popover { position: absolute; z-index: 500; max-width: 340px; background: #161c27;
+                border: 1px solid #37415a; border-radius: 8px; padding: 10px 12px;
+                font-size: 13px; line-height: 1.45; color: #dbe2f0; box-shadow: 0 6px 24px rgba(0,0,0,.45);
+                pointer-events: auto; }
+.term-popover .term-popover-title { font-weight: 600; color: #a3c9ff; margin-bottom: 4px;
+                                     font-size: 12px; text-transform: uppercase; letter-spacing: .03em; }
+.term-popover a.term-link { color: #cfe3ff; }
 """
 
 MARK_LAYER_CSS = r"""
@@ -1339,7 +1351,81 @@ function wirePublicFilmToggles() {
   });
 }
 
+// --- Term tooltips: hover/tap a .term-link to see its definition inline,
+// without leaving the page. `title` attr (set server-side) covers plain
+// non-JS hover; this adds a richer popover whose content is rendered HTML
+// (mdblocks.render_inline output), so a definition that itself links to
+// another term shows its own popover on hover too (recursion via the same
+// event-delegated listener, since popovers are appended to the live DOM).
+function wireTermPopovers() {
+  const DEFS = window.__TERM_DEFS__ || {};
+  let popEl = null;
+  let hideTimer = null;
+
+  function hidePopover() {
+    if (popEl) { popEl.remove(); popEl = null; }
+  }
+
+  function scheduleHide() {
+    clearTimeout(hideTimer);
+    hideTimer = setTimeout(hidePopover, 220);
+  }
+
+  function cancelHide() {
+    clearTimeout(hideTimer);
+  }
+
+  function showPopover(anchor) {
+    const slug = anchor.dataset.termSlug;
+    const entry = DEFS[slug];
+    if (!entry) return;
+    hidePopover();
+    const pop = document.createElement('div');
+    pop.className = 'term-popover';
+    pop.innerHTML = `<div class="term-popover-title">${entry.term.replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]))}</div>${entry.html}`;
+    pop.addEventListener('mouseenter', cancelHide);
+    pop.addEventListener('mouseleave', scheduleHide);
+    document.body.appendChild(pop);
+    const r = anchor.getBoundingClientRect();
+    const top = window.scrollY + r.bottom + 6;
+    let left = window.scrollX + r.left;
+    const maxLeft = window.scrollX + document.documentElement.clientWidth - pop.offsetWidth - 12;
+    if (left > maxLeft) left = Math.max(8, maxLeft);
+    pop.style.top = top + 'px';
+    pop.style.left = left + 'px';
+    popEl = pop;
+  }
+
+  document.addEventListener('mouseover', (e) => {
+    const a = e.target.closest('a.term-link');
+    if (!a) return;
+    cancelHide();
+    showPopover(a);
+  });
+  document.addEventListener('mouseout', (e) => {
+    const a = e.target.closest('a.term-link');
+    if (!a) return;
+    scheduleHide();
+  });
+  // Tap-to-show on touch devices: first tap opens the popover and suppresses
+  // the jump-to-anchor navigation; a second tap (or tapping elsewhere) lets
+  // the click through / dismisses it.
+  document.addEventListener('click', (e) => {
+    const a = e.target.closest('a.term-link');
+    if (!a) {
+      hidePopover();
+      return;
+    }
+    if (!('ontouchstart' in window)) return; // desktop: hover already handled it, let the jump happen
+    if (popEl && a.dataset.termSlug === (popEl.dataset.forSlug || '')) return; // second tap: let it navigate
+    e.preventDefault();
+    showPopover(a);
+    popEl.dataset.forSlug = a.dataset.termSlug;
+  });
+}
+
 document.addEventListener('DOMContentLoaded', () => {
+  wireTermPopovers();
   if (window.__MARK_LAYER__ && typeof window.initMarkLayer === 'function') {
     wireVerdictButtons();
     wireReviewButtons();
@@ -1907,7 +1993,7 @@ def list_item_ranges(text):
     return ranges
 
 
-def mark_layer_inner(block, link_resolver=None):
+def mark_layer_inner(block, link_resolver=None, terms=None):
     """Render prose as sentence-addressable spans without disturbing rich blocks."""
     kind = block['kind']
     if kind == 'list':
@@ -1923,20 +2009,20 @@ def mark_layer_inner(block, link_resolver=None):
         quote_b64 = __import__('base64').b64encode(quote.encode('utf-8')).decode('ascii')
         pieces.append(
             f'<span class="mark-sentence" data-from="{start}" data-to="{end}" '
-            f'data-quote="{quote_b64}">{render_inline(quote, link_resolver)}</span>'
+            f'data-quote="{quote_b64}">{render_inline(quote, link_resolver, terms=terms)}</span>'
         )
     content = ' '.join(pieces)
     tag = 'blockquote' if kind == 'blockquote' else 'p'
     return f'<{tag}>{content}</{tag}>', True
 
 
-def render_block_html(block, route_path, status_chip=None, link_resolver=None):
+def render_block_html(block, route_path, status_chip=None, link_resolver=None, terms=None):
     kind = block['kind']
     anchor = block['anchor']
     block_id = _html_attr_escape(block['id'])
     block_sha = _html_attr_escape(blockmap.block_text_sha(block))
     snapshot = _html_attr_escape(block['snapshot'])
-    inner, has_sentence_units = mark_layer_inner(block, link_resolver)
+    inner, has_sentence_units = mark_layer_inner(block, link_resolver, terms=terms)
     # Raw markdown source, base64'd, so the client can swap rendered HTML for an
     # editable <textarea> pre-filled with the exact source text (edit-as-comment,
     # see v2/CLAUDE.md "CM6 vs contenteditable" note). Base64 sidesteps any HTML/JS
@@ -2091,7 +2177,14 @@ def render_page(route_path, workspace=DEFAULT_WORKSPACE):
         src_bytes = f.read()
     src = src_bytes.decode('utf-8')
     resolver = make_link_resolver(fs_path, route_path, workspace)
-    title, blocks = parse_markdown(src, link_resolver=resolver)
+    terms_out = {}
+    title, blocks = parse_markdown(src, link_resolver=resolver, terms_out=terms_out)
+    # Slim map for the hover-popover JS: slug -> rendered definition html (which may
+    # itself contain nested .term-link anchors — recursion handled by mdblocks.py's
+    # extract_terms()/render_inline(), this is just the transport to the client).
+    term_defs_json = json.dumps({
+        slug: {'term': v['term'], 'html': v['html']} for slug, v in terms_out.items()
+    })
     _new_map, reconcile_report = reconcile_parsed_page(
         route_path, workspace, src_bytes, blocks
     )
@@ -2130,6 +2223,7 @@ def render_page(route_path, workspace=DEFAULT_WORKSPACE):
             b, route_path,
             status_chip=(wq_status_chip(b) if badges_on else None),
             link_resolver=resolver,
+            terms=terms_out,
         )
         for b in blocks)
     # trailing newline keeps flagged-page head formatting tidy; empty string on
@@ -2236,7 +2330,8 @@ def render_page(route_path, workspace=DEFAULT_WORKSPACE):
 <script>window.__ROUTE__ = {json.dumps(route_path)}; window.__API_BASE__ = {json.dumps(url_prefix)};
 window.__DISPATCH_TARGET__ = {json.dumps(dispatch_cfg['target'])};
 window.__DISPATCH_BUTTON__ = {json.dumps(dispatch_cfg['button'])};
-window.__MARK_LAYER__ = {json.dumps(mark_layer)}; window.__HAS_DISPATCH__ = {json.dumps(has_dispatch)};</script>
+window.__MARK_LAYER__ = {json.dumps(mark_layer)}; window.__HAS_DISPATCH__ = {json.dumps(has_dispatch)};
+window.__TERM_DEFS__ = {term_defs_json};</script>
 <script>{PAGE_JS}</script>
 {f'<script>{MARK_LAYER_JS}</script>' if mark_layer else ''}
 {tour_body}

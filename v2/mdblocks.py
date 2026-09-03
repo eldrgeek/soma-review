@@ -35,6 +35,13 @@ def _esc(s):
     return _html.escape(s, quote=False)
 
 
+def _esc_attr(s):
+    """Escape for use inside a double-quoted HTML attribute (quotes included —
+    _esc() above deliberately leaves quotes alone for text-node use, but an
+    embedded `"` in an attribute value truncates it early)."""
+    return _html.escape(s, quote=True)
+
+
 def _load_public_films():
     if not os.path.isfile(PUBLIC_FILMS_PATH):
         return {}
@@ -114,9 +121,124 @@ _VERDICT_TOKEN_RE = re.compile(r'\[\[VERDICT:([a-zA-Z0-9_-]+)\]\]')
 _REVIEW_TOKEN_RE = re.compile(r'\[\[REVIEW:([a-zA-Z0-9_-]+)\]\]')
 
 
-def render_inline(text, link_resolver=None):
+def slugify(text):
+    """GitHub-style heading slug: strip markdown markup, lowercase, spaces->hyphens,
+    drop everything else that isn't a word char or hyphen. Used for heading `id`s,
+    `#term-<slug>` anchors, and their cross-reference matching — same function for
+    all three so a heading and a link to it always agree on the id."""
+    # Strip markdown-link syntax down to the label, then markup chars.
+    t = _INLINE_LINK_RE.sub(r'\1', text)
+    t = re.sub(r'[`*_]', '', t)
+    t = t.lower().strip()
+    t = re.sub(r'[^\w\s-]', '', t)
+    t = re.sub(r'[\s]+', '-', t)
+    t = re.sub(r'-+', '-', t).strip('-')
+    return t or 'section'
+
+
+_TERM_ITEM_RE = re.compile(r'^\*\*(.+?)\*\*\s*[—–-]\s*(.*)$')
+
+
+def _strip_markdown_to_text(text):
+    """Best-effort plain-text rendering of a markdown fragment for use in a `title`
+    attribute (no HTML tags allowed in title text — attributes only, no nested markup)."""
+    t = _INLINE_LINK_RE.sub(r'\1', text)
+    t = _INLINE_CODE_RE.sub(r'\1', t)
+    t = _BOLD_RE.sub(r'\1', t)
+    t = _ITALIC_RE.sub(r'\1', t)
+    t = _UNDERSCORE_ITALIC_RE.sub(r'\1', t)
+    return t.strip()
+
+
+def _first_sentence(text):
+    plain = _strip_markdown_to_text(text)
+    m = re.search(r'^(.{1,400}?[.!?])(\s|$)', plain)
+    return m.group(1) if m else plain
+
+
+def extract_terms(src, link_resolver=None):
+    """Scan raw markdown for a "Terms" heading (any level, exact text match,
+    case-insensitive) and the bullet-list definitions under it, of the form
+    `**term** — definition`. Returns {slug: {'term', 'slug', 'def_raw',
+    'first_sentence', 'html'}} keyed by slugify(term). `html` is the definition
+    rendered through render_inline with this same terms map threaded in, so a
+    definition that itself links to another term produces a nested term-link
+    (recursion) — safe because it only needs the *existence* of other slugs/terms,
+    not their own rendered html, to resolve a nested reference.
+    """
+    lines = src.split('\n')
+    n = len(lines)
+    i = 0
+    terms_level = None
+    terms = {}
+    while i < n:
+        m = re.match(r'^(#{1,6})\s+(.*)$', lines[i].strip())
+        if m and m.group(2).strip().lower() == 'terms':
+            terms_level = len(m.group(1))
+            i += 1
+            break
+        i += 1
+    if terms_level is None:
+        return {}
+
+    while i < n:
+        stripped = lines[i].strip()
+        hm = re.match(r'^(#{1,6})\s+', stripped)
+        if hm and len(hm.group(1)) <= terms_level:
+            break  # next sibling/ancestor heading ends the Terms section
+        item_m = re.match(r'^\s*([-*+])\s+(.*)$', lines[i])
+        if item_m:
+            item_lines = [item_m.group(2)]
+            i += 1
+            while i < n and lines[i].strip() != '' and not re.match(r'^\s*([-*+]|\d+\.)\s+', lines[i]) \
+                    and not re.match(r'^#{1,6}\s+', lines[i].strip()):
+                item_lines.append(lines[i].strip())
+                i += 1
+            raw = ' '.join(item_lines)
+            term_m = _TERM_ITEM_RE.match(raw)
+            if term_m:
+                term_label, def_raw = term_m.group(1).strip(), term_m.group(2).strip()
+                slug = slugify(term_label)
+                terms[slug] = {'term': term_label, 'slug': slug, 'def_raw': def_raw}
+            continue
+        i += 1
+
+    # Second pass: render each definition's html + first-sentence now that the full
+    # term/slug table exists (needed so nested `#terms`/`#term-x` links inside a
+    # definition resolve correctly).
+    for entry in terms.values():
+        entry['first_sentence'] = _first_sentence(entry['def_raw'])
+        entry['html'] = render_inline(entry['def_raw'], link_resolver, terms=terms)
+    return terms
+
+
+def _find_term_by_label(label, terms):
+    """Match a link's visible label text against the terms table. Exact match wins;
+    otherwise accept a term that contains the label or a label that contains the
+    term (case-insensitive) — e.g. link text "Path 0" matches the defined term
+    "Path 0 / Path A / Path B"."""
+    if not terms:
+        return None
+    label_l = label.strip().lower()
+    if not label_l:
+        return None
+    for entry in terms.values():
+        if entry['term'].strip().lower() == label_l:
+            return entry
+    for entry in terms.values():
+        term_l = entry['term'].strip().lower()
+        if label_l in term_l or term_l in label_l:
+            return entry
+    return None
+
+
+def render_inline(text, link_resolver=None, terms=None):
     """Render inline markdown (links, bold, italic, code) to HTML.
     link_resolver(href) -> href_out, is_internal
+    `terms`, if given, is the {slug: {...}} table from extract_terms(); links whose
+    target resolves to `#terms` (matched by label) or `#term-<slug>` (matched by
+    slug) render as `.term-link`s carrying `data-def`/`data-term-slug` for the
+    hover-popover JS, plus a plain `title` fallback for non-JS hover.
     """
     # Protect inline code spans first so we don't mangle markup inside them.
     placeholders = []
@@ -153,6 +275,25 @@ def render_inline(text, link_resolver=None):
         label, href = m.group(1), m.group(2)
         label_html = _esc(label)
         href_out, cls, extra = _resolve(href)
+        term_entry = None
+        if terms:
+            frag = None
+            if '#' in href_out:
+                frag = href_out.rsplit('#', 1)[1].lower()
+            elif '#' in href:
+                frag = href.rsplit('#', 1)[1].lower()
+            if frag == 'terms':
+                term_entry = _find_term_by_label(label, terms)
+            elif frag and frag.startswith('term-'):
+                term_entry = terms.get(frag[len('term-'):])
+        if term_entry:
+            # Always an in-page fragment jump — never target=_blank even if the
+            # generic resolver would have called this an external link.
+            def_esc = _esc_attr(term_entry['first_sentence'])
+            return stash(
+                f'<a href="{_esc(href_out)}" class="term-link" data-term-slug="{_esc_attr(term_entry["slug"])}"'
+                f' data-def="{def_esc}" title="{def_esc}">{label_html}</a>'
+            )
         return stash(f'<a href="{_esc(href_out)}" class="{cls}"{extra}>{label_html}</a>')
 
     def verdict_sub(m):
@@ -221,8 +362,14 @@ def _make_anchor(heading_path, index, text):
     return f'b{index}-{h}'
 
 
-def parse_markdown(src, link_resolver=None):
-    """Return (title, blocks) where blocks is a list of dicts (see module docstring)."""
+def parse_markdown(src, link_resolver=None, terms_out=None):
+    """Return (title, blocks) where blocks is a list of dicts (see module docstring).
+
+    `terms_out`, if passed a dict, is populated with the page's {slug: {term, html,
+    first_sentence}} terms table (see extract_terms()) — used by server.py to embed a
+    JSON map for the hover-popover JS. Optional and backward-compatible: existing
+    callers that only unpack `(title, blocks)` are unaffected.
+    """
     src = unicodedata.normalize('NFC', src)
     lines = src.split('\n')
     blocks = []
@@ -231,6 +378,26 @@ def parse_markdown(src, link_resolver=None):
     n = len(lines)
     idx = 0
     title = None
+    terms = extract_terms(src, link_resolver)
+    if terms_out is not None:
+        terms_out.update(terms)
+    used_ids = set()
+
+    def make_id(candidate):
+        base = candidate
+        n_dupe = 2
+        while candidate in used_ids:
+            candidate = f'{base}-{n_dupe}'
+            n_dupe += 1
+        used_ids.add(candidate)
+        return candidate
+
+    def claim_id(id_str):
+        """Register a fixed id (term-<slug> anchors) that must match exactly what
+        the terms table expects for `#term-<slug>` links to resolve — never
+        renamed on collision, just reserved so a later heading doesn't reuse it."""
+        used_ids.add(id_str)
+        return id_str
 
     def heading_path():
         return [t for (_, t) in heading_stack]
@@ -280,10 +447,11 @@ def parse_markdown(src, link_resolver=None):
             while heading_stack and heading_stack[-1][0] >= level:
                 heading_stack.pop()
             heading_stack.append((level, text))
-            html_body = f'<h{level}>{render_inline(text, link_resolver)}</h{level}>'
+            heading_id = make_id(slugify(text))
+            html_body = f'<h{level} id="{heading_id}">{render_inline(text, link_resolver, terms=terms)}</h{level}>'
             blocks.append({
                 'kind': 'heading', 'level': level, 'heading_path': heading_path()[:-1],
-                'index': idx, 'text': text, 'html': html_body,
+                'index': idx, 'text': text, 'html': html_body, 'heading_id': heading_id,
             })
             idx += 1
             i += 1
@@ -308,9 +476,9 @@ def parse_markdown(src, link_resolver=None):
                 rows.append([c.strip() for c in lines[i].strip().strip('|').split('|')])
                 i += 1
             raw_lines = [line] + [f'row: {r}' for r in rows]
-            thead = ''.join(f'<th>{render_inline(c, link_resolver)}</th>' for c in header_cells)
+            thead = ''.join(f'<th>{render_inline(c, link_resolver, terms=terms)}</th>' for c in header_cells)
             tbody = ''.join(
-                '<tr>' + ''.join(f'<td>{render_inline(c, link_resolver)}</td>' for c in row) + '</tr>'
+                '<tr>' + ''.join(f'<td>{render_inline(c, link_resolver, terms=terms)}</td>' for c in row) + '</tr>'
                 for row in rows
             )
             html_body = f'<table><thead><tr>{thead}</tr></thead><tbody>{tbody}</tbody></table>'
@@ -328,7 +496,7 @@ def parse_markdown(src, link_resolver=None):
                 quote_lines.append(re.sub(r'^\s*>\s?', '', lines[i]))
                 i += 1
             raw = '\n'.join(quote_lines)
-            html_body = f'<blockquote>{render_inline(raw, link_resolver)}</blockquote>'
+            html_body = f'<blockquote>{render_inline(raw, link_resolver, terms=terms)}</blockquote>'
             blocks.append({
                 'kind': 'blockquote', 'level': None, 'heading_path': heading_path(),
                 'index': idx, 'text': raw, 'html': html_body,
@@ -344,7 +512,7 @@ def parse_markdown(src, link_resolver=None):
                 item_lines.append(lines[i])
                 i += 1
             raw = '\n'.join(item_lines)
-            html_body = _render_list(item_lines, link_resolver)
+            html_body = _render_list(item_lines, link_resolver, terms=terms, claim_id=claim_id)
             blocks.append({
                 'kind': 'list', 'level': None, 'heading_path': heading_path(),
                 'index': idx, 'text': raw, 'html': html_body,
@@ -362,7 +530,7 @@ def parse_markdown(src, link_resolver=None):
             para_lines.append(lines[i].strip())
             i += 1
         raw = ' '.join(para_lines)
-        html_body = f'<p>{render_inline(raw, link_resolver)}</p>'
+        html_body = f'<p>{render_inline(raw, link_resolver, terms=terms)}</p>'
         blocks.append({
             'kind': 'paragraph', 'level': None, 'heading_path': heading_path(),
             'index': idx, 'text': raw, 'html': html_body,
@@ -377,7 +545,7 @@ def parse_markdown(src, link_resolver=None):
     return title, blocks
 
 
-def _render_list(item_lines, link_resolver):
+def _render_list(item_lines, link_resolver, terms=None, claim_id=None):
     # Simple flat rendering with indent-based nesting by leading whitespace count // 2.
     ordered = bool(re.match(r'^\s*\d+\.\s+', item_lines[0])) if item_lines else False
     tag = 'ol' if ordered else 'ul'
@@ -390,7 +558,7 @@ def _render_list(item_lines, link_resolver):
         if not m:
             # continuation line of previous item (soft wrap)
             if out and out[-1].endswith('</li>'):
-                out[-1] = out[-1][:-5] + ' ' + render_inline(line.strip(), link_resolver) + '</li>'
+                out[-1] = out[-1][:-5] + ' ' + render_inline(line.strip(), link_resolver, terms=terms) + '</li>'
             continue
         indent, marker, content = m.groups()
         indent_level = len(indent) // 2
@@ -403,7 +571,15 @@ def _render_list(item_lines, link_resolver):
             for _ in range(prev_indent - indent_level):
                 if len(stack_tags) > 1:
                     out.append(f'</{stack_tags.pop()}>')
-        out.append(f'<li>{render_inline(content, link_resolver)}</li>')
+        # A definition-list-shaped item ("**term** — definition") gets an
+        # addressable `id="term-<slug>"` so `#term-<slug>` links resolve here,
+        # same slug function extract_terms() used to build the terms table.
+        li_id_attr = ''
+        term_m = _TERM_ITEM_RE.match(content)
+        if term_m and claim_id is not None:
+            term_id = claim_id(f'term-{slugify(term_m.group(1).strip())}')
+            li_id_attr = f' id="{term_id}"'
+        out.append(f'<li{li_id_attr}>{render_inline(content, link_resolver, terms=terms)}</li>')
         prev_indent = indent_level
     while len(stack_tags) > 1:
         out.append(f'</{stack_tags.pop()}>')

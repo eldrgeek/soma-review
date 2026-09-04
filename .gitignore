@@ -3,3 +3,5 @@ node_modules/
 .netlify/
 v2/__pycache__/
 *.pyc
+v2/.ringer-counts.json
+v2/.ringer-counts.json.tmp

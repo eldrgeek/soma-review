@@ -2944,12 +2944,18 @@ def render_workspace_switcher(current_workspace):
     return f'<div class="workspace-switcher">{"".join(opts)}</div>'
 
 
-def render_sidebar(current_route, workspace=DEFAULT_WORKSPACE):
+def render_sidebar(current_route, workspace=DEFAULT_WORKSPACE, waiting_rows=None):
     ws = get_workspace(workspace)
     url_prefix = workspace_url_prefix(workspace)
     reports = discover_nightly_reports(ws.get('nightly_filter')) if ws['nightly'] else {}
     items = []
-    waiting_total = sum(r['on_mike'] for r in collect_waiting()
+    # Callers that already collected pass their rows in: /waiting used to
+    # collect once for the page and again for its own sidebar, so a warm entry
+    # landing between the two made the badge and the headline disagree inside
+    # one response — and doubled the sidecar read cost of every render.
+    _waiting_rows = collect_waiting() if waiting_rows is None else waiting_rows
+    ringer_warm_async(_ringer_warm_targets(_waiting_rows))
+    waiting_total = sum(_waiting_ask_count(r) for r in _waiting_rows
                         if not _waiting_is_stale(r['last_ts']))
     badge = (f' <span style="background:#4a3a1f;color:#f0c674;border-radius:9px;'
              f'padding:0 6px;font-size:10px;font-weight:700;">{waiting_total}</span>'
@@ -3980,6 +3986,238 @@ def _waiting_doc_title(route, workspace):
     return os.path.basename(route), True
 
 
+# --- Ringer counts on the front door ---------------------------------------
+#
+# `/waiting` counted sidecar rows only. A round whose changes live in the
+# ringer list — derived from the trunk plus git history, never from a row
+# addressed to the reader — therefore rendered as an empty inbox. On
+# 2026-09-04 that was nine changes to the protocol's own trunk page showing
+# as `0 for you` on the one surface built to tell him what was waiting.
+#
+# The count cannot be computed inline. Measured on the live estate workspace:
+# `collect_waiting()` answers in 0.30s for 17 rows; `compute_ringer_list` over
+# the same 17 costs 9.9s (one page alone, WORKQUEUE.md, is 3.0s), and
+# `render_sidebar` calls collect_waiting on EVERY page in the app. So the
+# front door reads a cache and never computes; a background thread fills what
+# is missing and the next load is right. A row with no usable cache entry says
+# "counting…" rather than "0", because a zero the machine never actually
+# checked is the exact failure this section exists to remove.
+
+RINGER_COUNT_CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  '.ringer-counts.json')
+_ringer_cache_lock = threading.Lock()
+_ringer_cache_mem = None
+_ringer_warm_lock = threading.Lock()
+_ringer_warming = False
+_ringer_git_dirs = {}
+
+
+def _ringer_git_stamp(fs_path):
+    """A stat-only stand-in for `git rev-parse HEAD`, walking up for `.git`.
+
+    The trunk half of the ringer list is derived from git history, so a commit
+    that leaves the working tree byte-identical (a merge, a rebase, a branch
+    switch) still changes the answer while the file's mtime does not.
+    `.git/logs/HEAD` moves on every one of those. Deliberately stat-only:
+    `_git_repo_root` shells out, and 17 subprocesses on every page render is
+    the cost this whole cache exists to avoid.
+
+    Known limit, stated rather than hidden: with `core.logAllRefUpdates=false`
+    there is no reflog, and the `.git/HEAD` fallback only names the current
+    branch, so on such a repo a commit that leaves the file byte-identical
+    would not invalidate the entry. Every repo this server reads has reflogs on
+    (git's default for a non-bare repo), and the failure mode is a count that
+    is late, never one that is wrong about a document that changed on disk.
+    """
+    d = os.path.dirname(fs_path or '') or '/'
+    if d in _ringer_git_dirs:
+        gitdir = _ringer_git_dirs[d]
+    else:
+        gitdir = None
+        cur = d
+        while True:
+            cand = os.path.join(cur, '.git')
+            if os.path.exists(cand):
+                gitdir = cand
+                break
+            parent = os.path.dirname(cur)
+            if parent == cur:
+                break
+            cur = parent
+        # A found repo is memoized; a miss is not. Everything else in this cache
+        # degrades toward a wasteful `unknown`, but a memoized `None` degrades
+        # toward a confident wrong number: the stamp would stay '-' forever, so
+        # git movement could never invalidate the entry.
+        if gitdir:
+            _ringer_git_dirs[d] = gitdir
+    if not gitdir:
+        return '-'
+    if os.path.isfile(gitdir):  # worktree: .git is a file pointing elsewhere
+        try:
+            with open(gitdir, 'r', encoding='utf-8') as fh:
+                gitdir = fh.read().split('gitdir:', 1)[1].strip()
+        except (OSError, IndexError):
+            return '-'
+    for name in ('logs/HEAD', 'HEAD'):
+        try:
+            st = os.stat(os.path.join(gitdir, name))
+            return f'{st.st_mtime_ns}:{st.st_size}'
+        except OSError:
+            continue
+    return '-'
+
+
+# Bumped whenever the shape of a cache entry changes, so entries written by an
+# older build are invalidated instead of silently read with a missing field.
+RINGER_CACHE_VERSION = 2
+
+
+def _ringer_fingerprint(route_path, workspace):
+    """Signature of every input compute_ringer_list reads. Stat-only."""
+    parts = [f'v{RINGER_CACHE_VERSION}']
+    try:
+        fs_path = resolve_page(route_path, workspace)
+    except Exception:  # noqa: BLE001 - a missing doc is a valid fingerprint
+        fs_path = None
+    for p in (fs_path,
+              sidecar_path(route_path, workspace),
+              block_map_path(route_path, workspace)):
+        try:
+            st = os.stat(p)
+            parts.append(f'{st.st_mtime_ns}:{st.st_size}')
+        except (OSError, TypeError, ValueError):
+            parts.append('-')
+    parts.append(_ringer_git_stamp(fs_path) if fs_path else '-')
+    return '|'.join(parts)
+
+
+def _ringer_cache_load():
+    global _ringer_cache_mem
+    with _ringer_cache_lock:
+        if _ringer_cache_mem is None:
+            try:
+                with open(RINGER_COUNT_CACHE, 'r', encoding='utf-8') as fh:
+                    data = json.load(fh)
+                _ringer_cache_mem = data if isinstance(data, dict) else {}
+            except (OSError, ValueError):
+                _ringer_cache_mem = {}
+        return dict(_ringer_cache_mem)
+
+
+def _ringer_cache_put(key, entry):
+    global _ringer_cache_mem
+    with _ringer_cache_lock:
+        if _ringer_cache_mem is None:
+            _ringer_cache_mem = {}
+        _ringer_cache_mem[key] = entry
+        snapshot = dict(_ringer_cache_mem)
+    # Per-pid tmp name: CLAUDE.md documents running a test-port instance beside
+    # the launchd service, and two writers sharing one `.tmp` can os.replace a
+    # half-written file into place — which json.load rejects, dropping the whole
+    # cache to {} and reporting every document as uncounted at once.
+    tmp = f'{RINGER_COUNT_CACHE}.tmp.{os.getpid()}'
+    try:
+        with open(tmp, 'w', encoding='utf-8') as fh:
+            json.dump(snapshot, fh)
+        os.replace(tmp, RINGER_COUNT_CACHE)
+    except OSError:
+        pass
+
+
+def ringer_count_cached(route_path, workspace=DEFAULT_WORKSPACE):
+    """Read-only. Returns (state, entry). States:
+
+      fresh    the cached count matches every input on disk.
+      stale    an older count exists and something it depends on has moved.
+      unknown  nothing has ever been counted for this document.
+      error    compute_ringer_list raised, and nothing has changed since.
+
+    `stale` exists because the invalidation signal is deliberately coarse: the
+    git component is repo HEAD, and on this estate `_estate/` has no repo of its
+    own, so every `_estate` document invalidates together each time the COO loop
+    commits — several times an hour. Collapsing that into `unknown`, and
+    `unknown` into zero, would have re-created the exact failure this section
+    was written to remove: a nine-change document rendering as an empty inbox
+    row, now wearing a grey label. A slightly old number shown as "recounting"
+    is honest; a zero the machine never checked is not.
+    """
+    key = f'{workspace}/{route_path}'
+    entry = _ringer_cache_load().get(key)
+    if not isinstance(entry, dict):
+        return 'unknown', {}
+    matches = entry.get('fingerprint') == _ringer_fingerprint(route_path, workspace)
+    if entry.get('error'):
+        return ('error', entry) if matches else ('unknown', {})
+    return ('fresh' if matches else 'stale'), entry
+
+
+def ringer_count_compute(route_path, workspace=DEFAULT_WORKSPACE):
+    """Compute and cache. Slow (0.2-3.0s); never call from a render path."""
+    key = f'{workspace}/{route_path}'
+    fp_before = _ringer_fingerprint(route_path, workspace)
+    doc_before = fp_before.split('|')[1]
+    try:
+        rl = compute_ringer_list(route_path, workspace)
+    except Exception as exc:  # noqa: BLE001
+        _ringer_cache_put(key, {'fingerprint': fp_before, 'error': str(exc)[:200],
+                                'computed_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())})
+        return
+    # compute_ringer_list is a writer: current_page_blocks -> reconcile_parsed_page
+    # saves the block map and can remap sidecar offsets, and both are fingerprint
+    # inputs. Storing the pre-compute signature therefore stored one its own side
+    # effects had already invalidated, so every document edit cost two full
+    # computes and a document under active edit could never settle on `fresh`.
+    # The signature is taken after the work, EXCEPT when the source document
+    # itself moved underneath the run — that is a real change, not a side effect,
+    # and must invalidate.
+    fp_after = _ringer_fingerprint(route_path, workspace)
+    fp = fp_before if fp_after.split('|')[1] != doc_before else fp_after
+    _ringer_cache_put(key, {
+        'fingerprint': fp,
+        'computed_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+        'total': len(rl['ringers']),
+        'swallowed': rl['swallowed'],
+        'flagged': rl['flagged'],
+        'withdrawn': rl['withdrawn'],
+        'unattributed': rl['unattributed'],
+        'first_block': next((x['block_id'] for x in rl['ringers'] if x.get('block_id')), None),
+        # Kept so the front door can subtract the overlap: a swallowed revision
+        # can also be an open row addressed to the reader (an edit by Dee, still
+        # queued, inside his bracket, that he never marked). It is one thing
+        # waiting on him, and counting it in both chips would inflate the number
+        # the whole page is judged by.
+        'ids': [x['id'] for x in rl['ringers'] if x.get('id')],
+    })
+
+
+def ringer_warm_async(routes):
+    """Fill the cache for `routes` in one background thread, oldest first.
+    One thread at a time on purpose: this competes with the reader's own page
+    loads for the same git and disk, and the page is already usable without it."""
+    global _ringer_warming
+    if not routes:
+        return False
+    with _ringer_warm_lock:
+        if _ringer_warming:
+            return False
+        _ringer_warming = True
+
+    def _run():
+        global _ringer_warming
+        try:
+            for workspace, route in routes:
+                try:
+                    ringer_count_compute(route, workspace)
+                except Exception:  # noqa: BLE001 - one bad page must not stop the pass
+                    continue
+        finally:
+            with _ringer_warm_lock:
+                _ringer_warming = False
+
+    threading.Thread(target=_run, daemon=True, name='ringer-warm').start()
+    return True
+
+
 def collect_waiting():
     """One row per document that has any sidecar, across every workspace."""
     rows = []
@@ -4011,6 +4249,11 @@ def collect_waiting():
             signals.sort(key=lambda r: r.get('timestamp') or '')
             live = [r for r in records if not r.get('deleted')]
             title, exists = _waiting_doc_title(route, slug)
+            # Cache-only: see ringer_count_cached. Never computed here — this
+            # function runs on every page render in the app.
+            ringer_state, ringer_entry = ringer_count_cached(route, slug)
+            ringer_total = (_ringer_unseen_count(ringer_entry, {r.get('id') for r in on_mike})
+                            if ringer_state in ('fresh', 'stale') else None)
             first_open = None
             for r in sorted(on_mike, key=lambda r: r.get('timestamp') or ''):
                 if r.get('block_id'):
@@ -4030,10 +4273,78 @@ def collect_waiting():
                 'first_open_block': first_open,
                 'kinds': sorted({(r.get('mark_kind') or r.get('type') or 'comment')
                                  for r in on_mike}),
+                'ringers': ringer_total,
+                'ringers_state': ringer_state,
+                'ringer_block': (ringer_entry.get('first_block')
+                                 if ringer_state in ('fresh', 'stale') else None),
+                # The reader's OWN clock. `last_ts` counts Dee's activity too,
+                # and the ringer half of a round leaves no sidecar row at all,
+                # so neither answers "is this a live round for him".
+                'reader_last_ts': max((r.get('timestamp') or '' for r in records
+                                       if _waiting_by_mike(r)), default=''),
             })
-    rows.sort(key=lambda r: (r['on_mike'] == 0, r['on_mike'] == 0 and r['on_dee'] == 0,
+    rows.sort(key=lambda r: (_waiting_ask_count(r) == 0,
+                             _waiting_ask_count(r) == 0 and r['on_dee'] == 0,
                              _waiting_sort_ts(r)), reverse=False)
     return rows
+
+
+def _ringer_unseen_count(entry, on_mike_ids):
+    """How many ringers are genuinely *unseen*: the cached total minus the ones
+    already showing in the "for you" chip. A swallowed revision can also be an
+    open row addressed to the reader — an edit by Dee, still queued, inside his
+    bracket, that he never marked — and it is one thing waiting on him, not two.
+    A pre-version-2 entry has no `ids`; it cannot claim an overlap it does not
+    know about, so it reports its total unchanged."""
+    total = entry.get('total', 0)
+    if not total:
+        return total
+    return total - len(set(entry.get('ids') or []) & set(on_mike_ids))
+
+
+def _ringer_warm_targets(rows):
+    """Which rows are worth 0.2-3.0s of background compute: the ones whose
+    count the page will actually use. A document outside a live round never
+    contributes its ringers to a total, and WORKQUEUE.md — 3.0s to count, edited
+    by agents several times an hour — would otherwise invalidate and recompute
+    forever to produce a number nothing displays. `error` is excluded too: its
+    fingerprint still matches, so recomputing it can only raise again, ahead of
+    legitimate documents in a single-threaded queue."""
+    return [(r['workspace'], r['route']) for r in rows
+            if r['ringers_state'] in ('stale', 'unknown')
+            and not _waiting_is_stale(_waiting_round_ts(r))]
+
+
+def _waiting_ask_count(row):
+    """What is actually waiting on the reader for this document: the open
+    sidecar rows addressed to him PLUS the ringer list. Those overlap: only the
+    `unattributed` half of a ringer list is derived from git with no row behind
+    it, while `swallowed`, `flagged` and `withdrawn` all come from sidecar rows
+    and can therefore be counted twice — which is what `_ringer_unseen_count`
+    subtracts. Counting the sidecar half alone is what made a nine-change round
+    render as an empty inbox on 2026-09-04.
+
+    Stale documents contribute their sidecar rows only. The trunk half of a
+    ringer list grows with every machine commit to the file, so an
+    agent-maintained document like WORKQUEUE.md carries 50 unattributed
+    commits spanning two months. That is churn, not a round, and putting it at
+    the top of the inbox would cost the page the credibility it exists for.
+    The two-week staleness rule the page already applies is the same rule."""
+    extra = 0
+    if row.get('ringers') and not _waiting_is_stale(_waiting_round_ts(row)):
+        extra = row['ringers']
+    return row['on_mike'] + extra
+
+
+def _waiting_round_ts(row):
+    """When this document last counted as a live round for the reader: the last
+    time HE marked it. `last_ts` was the wrong clock in both directions —
+    WORKQUEUE.md looks current because agents write to it hourly while his last
+    mark there is from July, and a document he ruled on last week looks current
+    on the strength of Dee's replies alone. Falls back to `last_ts` when he has
+    never marked the document, so a brand-new round is not filtered out before
+    he has had a chance to touch it."""
+    return row.get('reader_last_ts') or row['last_ts']
 
 
 def _waiting_sort_ts(row):
@@ -4091,6 +4402,8 @@ WAITING_CSS = """
 .waiting-count{font-size:11px;padding:2px 8px;border-radius:10px;}
 .waiting-count.mike{background:#3a2f1c;color:#e0b463;}
 .waiting-count.dee{background:#1c2a3a;color:#63a0e0;}
+.waiting-count.ringer{background:#3a1c33;color:#e08bd0;}
+.waiting-count.counting{background:#23262d;color:#8a8f98;}
 .waiting-count.signal{background:#1c3a24;color:#63e089;}
 .waiting-count.missing{background:#3a1c1c;color:#e06363;}
 .waiting-meta{margin-top:5px;font-size:11px;color:#8a8f98;}
@@ -4105,30 +4418,65 @@ def render_waiting(workspace=DEFAULT_WORKSPACE):
         workspace = DEFAULT_WORKSPACE
         ws = get_workspace(workspace)
     rows = collect_waiting()
-    asks = [r for r in rows if r['on_mike']]
-    replies = [r for r in rows if not r['on_mike'] and r['on_dee']]
-    settled = [r for r in rows if not r['on_mike'] and not r['on_dee']]
+    # The reader's page load is what warms the cache: the counts are for him,
+    # and a background pass that runs when nobody is looking would compute the
+    # same numbers against a document nobody is reading.
+    ringer_warm_async(_ringer_warm_targets(rows))
+    asks = [r for r in rows if _waiting_ask_count(r)]
+    replies = [r for r in rows if not _waiting_ask_count(r) and r['on_dee']]
+    settled = [r for r in rows if not _waiting_ask_count(r) and not r['on_dee']]
 
     def row_html(r):
         prefix = workspace_url_prefix(r['workspace'])
-        frag = f"#b:{r['first_open_block']}" if r['first_open_block'] else ''
+        # An open item addressed to him wins the deep link; when the only thing
+        # waiting is the ringer list, land him on the list itself rather than
+        # at the top of a document that looks unchanged.
+        if r['first_open_block']:
+            frag = f"#b:{r['first_open_block']}"
+        elif r['ringers']:
+            # A ringer derived from the trunk has no block of its own, so the
+            # list itself is the only place to land; when one does carry a
+            # block, use it.
+            frag = f"#b:{r['ringer_block']}" if r['ringer_block'] else '#ringer-list'
+        else:
+            frag = ''
         href = f"{prefix}/page/{r['route']}?view=v3{frag}"
         chips = []
         if r['on_mike']:
             chips.append(f'<span class="waiting-count mike">{r["on_mike"]} for you</span>')
+        if r['ringers']:
+            n = r['ringers']
+            recount = ' (recounting)' if r['ringers_state'] == 'stale' else ''
+            chips.append(f'<span class="waiting-count ringer" title="Changes to this document '
+                         f'that no row on the surface ever put in front of you — the agreed-model '
+                         f'12b ringer list.'
+                         + (' Something this count depends on has moved since it was taken, so a '
+                            'recount is running; the number shown is the last one taken.'
+                            if recount else '')
+                         + f'">{n} unseen change{"" if n == 1 else "s"}{recount}</span>')
+        elif _waiting_is_stale(_waiting_round_ts(r)):
+            pass
+        elif r['ringers_state'] in ('unknown', 'stale'):
+            chips.append('<span class="waiting-count counting" title="The ringer list for this '
+                         'document has not been counted since it last changed. Reload in a '
+                         'moment.">unseen: counting…</span>')
+        elif r['ringers_state'] == 'error':
+            chips.append('<span class="waiting-count missing" title="compute_ringer_list raised '
+                         'on this document, so the count is unknown, not zero.">unseen: '
+                         'unavailable</span>')
         if r['on_dee']:
             chips.append(f'<span class="waiting-count dee">{r["on_dee"]} for Dee</span>')
         if r['signal']:
             chips.append(f'<span class="waiting-count signal">{_html.escape(r["signal"])}</span>')
         if not r['exists']:
             chips.append('<span class="waiting-count missing">doc missing</span>')
-        if r['on_mike'] and _waiting_is_stale(r['last_ts']):
+        if _waiting_ask_count(r) and _waiting_is_stale(r['last_ts']):
             chips.append('<span class="waiting-count missing">stale</span>')
         kinds = ', '.join(r['kinds']) if r['kinds'] else ''
         meta = f"{_html.escape(r['route'])} · last activity {_waiting_age(r['last_ts'])}"
         if kinds:
             meta += f" · {_html.escape(kinds)}"
-        return (f'<a class="waiting-row{" is-ask" if r["on_mike"] else ""}" href="{href}">'
+        return (f'<a class="waiting-row{" is-ask" if _waiting_ask_count(r) else ""}" href="{href}">'
                 f'<div class="waiting-top">'
                 f'<span class="waiting-title">{_html.escape(r["title"])}</span>'
                 f'<span class="waiting-ws">{_html.escape(r["workspace_label"])}</span>'
@@ -4142,22 +4490,27 @@ def render_waiting(workspace=DEFAULT_WORKSPACE):
 
     url_prefix = workspace_url_prefix(workspace)
     fresh_asks = [r for r in asks if not _waiting_is_stale(r['last_ts'])]
-    total_asks = sum(r['on_mike'] for r in fresh_asks)
+    total_asks = sum(_waiting_ask_count(r) for r in fresh_asks)
+    unseen = sum(r['ringers'] or 0 for r in fresh_asks)
+    uncounted = len(_ringer_warm_targets(rows))
     return f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>Waiting on you — soma-review</title>
+<html><head><meta charset="utf-8"><title>Waiting on you — soma-review</title>{
+    '<meta http-equiv="refresh" content="12">' if uncounted else ''}
 <style>{PAGE_CSS}{WAITING_CSS}</style></head>
 <body>
 <nav class="sidebar">
   <a href="{url_prefix}/waiting" style="font-weight:700;font-size:15px;color:#e6e6e6;">soma-review</a>
   {render_workspace_switcher(workspace)}
-  {render_sidebar('', workspace)}
+  {render_sidebar('', workspace, waiting_rows=rows)}
 </nav>
 <main class="main">
   <div class="waiting-wrap">
     <h1>Waiting on you</h1>
     <p class="waiting-sub">{total_asks} open item(s) across {len(fresh_asks)} document(s) are addressed to
-    you, plus {sum(r['on_mike'] for r in asks) - total_asks} on documents nobody has touched in two weeks. Derived live from the review sidecars — nothing here is hand-maintained.
-    Each row opens the document in the mark view at the first open item.</p>
+    you &mdash; {total_asks - unseen} marked to you on the surface and {unseen} unseen change(s) the ringer list found in the documents themselves. Documents nobody has touched in two weeks are counted for their marks only; their ringer lists are trunk churn, not a round.
+    Derived live from the review sidecars and from git &mdash; nothing here is hand-maintained.
+    Each row opens the document in the mark view at the first thing waiting.{
+    f'<br><span style="color:#8a8f98;">{uncounted} document(s) are still being counted in the background; reload for their unseen totals.</span>' if uncounted else ''}</p>
     {band('Needs your ruling', asks, 'Nothing is waiting on you.')}
     {band('You ruled — waiting on Dee', replies, 'Nothing outstanding on Dee.')}
     {band('Settled', settled, 'No settled documents yet.')}

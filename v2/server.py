@@ -16,6 +16,7 @@ import sys
 import time
 import uuid
 import hashlib
+import datetime
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, unquote
@@ -2404,6 +2405,72 @@ V3_JS = r"""
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape' && backStack.length) { e.preventDefault(); goBack(); }
   });
+  // Deep link from the "Waiting on you" inbox: `#b:<block-id>` lands the reader
+  // on the block carrying the oldest open ask, not at the top of the document.
+  (function(){
+    const h = window.location.hash || '';
+    if (!h.startsWith('#b:')) return;
+    const blockId = decodeURIComponent(h.slice(3));
+    // Instant, not smooth: an incoming deep link should land, not animate past
+    // the reader. And it must keep landing: the v3 view decorates blocks after
+    // first paint (mark rails, edit chips, term links), which moves everything
+    // below by hundreds of pixels — a single jump computed at `load` measured
+    // 1193px off in testing. So re-jump until the target's position holds still
+    // for two consecutive checks, up to 3s, and give up the moment the reader
+    // scrolls or types, because from then on the position is theirs, not ours.
+    // The v3 view re-lays-out the document after first paint (mark rails, edit
+    // chips, term links, block decoration). Measured: the page was 8418px tall
+    // at `load` and 6328px once settled, so a single jump left the target
+    // 1193px above the viewport — a reader following an inbox link would land
+    // in blank space. So: re-jump on every body resize until the height holds
+    // still, and surrender the moment the reader scrolls or types, because from
+    // then on the scroll position is theirs, not ours.
+    // The v3 view keeps re-laying-out the document for seconds after first
+    // paint (mark rails, edit chips, term links, block decoration). Measured on
+    // MAC-STEWARD: 8418px tall at `load`, 6328px once settled. A single jump —
+    // or a jump that stops as soon as the height looks stable — left the target
+    // 1193px (then 507px) above the viewport, i.e. the reader following an
+    // inbox link landed in blank space. Height stability is not a reliable
+    // settle signal here because it plateaus mid-way. So: re-jump on a fixed
+    // cadence for five seconds and surrender the instant the reader scrolls or
+    // types, because from then on the scroll position is theirs, not ours.
+    // The v3 view keeps mutating the document for many seconds after `load`
+    // (mark rails, edit chips, term links, block decoration) and every mutation
+    // above the target moves it. Measured on MAC-STEWARD: 8418px tall at load,
+    // 6328px settled — a single jump landed 1193px off, a 5s fixed cadence
+    // still 507px off, because the last shrink happened after the cadence
+    // stopped. So follow the DOM instead of the clock: re-jump on any mutation
+    // (debounced), for up to 15s, and surrender the instant the reader scrolls
+    // or types, because from then on the scroll position is theirs, not ours.
+    // Landing a deep link in this view is harder than it looks: the page keeps
+    // re-laying-out for seconds after `load` (mark rails, edit chips, term
+    // links), and not every reflow comes from a DOM mutation we can observe.
+    // Measured on MAC-STEWARD: 8418px tall at load, 6328px settled. A single
+    // jump landed 1193px above the target; a 5s fixed cadence and a
+    // MutationObserver both still landed 507px off, because the last shrink
+    // came after they stopped. So pin instead of jump: every animation frame
+    // for eight seconds, re-centre the target if it has drifted more than a few
+    // pixels. Self-correcting whatever the cause of the reflow. The reader
+    // takes the position back the instant they scroll, touch, click or type.
+    let surrendered = false;
+    const surrender = () => { surrendered = true; };
+    const pin = (deadline) => {
+      if (surrendered || Date.now() > deadline) return;
+      const el = document.querySelector(`.block-wrap[data-block-id="${CSS.escape(blockId)}"]`);
+      if (el) {
+        const want = (window.innerHeight - el.getBoundingClientRect().height) / 2;
+        if (Math.abs(el.getBoundingClientRect().top - want) > 4) {
+          el.scrollIntoView({block:'center', behavior:'auto'});
+        }
+      }
+      requestAnimationFrame(() => pin(deadline));
+    };
+    window.addEventListener('load', () => {
+      ['wheel','touchstart','keydown','mousedown'].forEach(
+        ev => window.addEventListener(ev, surrender, {once:true, passive:true}));
+      pin(Date.now() + 8000);
+    });
+  })();
   document.addEventListener('click', (e) => {
     // Generated Terms view "used N times" back-links (D, 2026-09-03): model-
     // anchored (block id + occurrence), handled before the generic `#anchor`
@@ -2879,6 +2946,12 @@ def render_sidebar(current_route, workspace=DEFAULT_WORKSPACE):
     url_prefix = workspace_url_prefix(workspace)
     reports = discover_nightly_reports(ws.get('nightly_filter')) if ws['nightly'] else {}
     items = []
+    waiting_total = sum(r['on_mike'] for r in collect_waiting()
+                        if not _waiting_is_stale(r['last_ts']))
+    badge = (f' <span style="background:#4a3a1f;color:#f0c674;border-radius:9px;'
+             f'padding:0 6px;font-size:10px;font-weight:700;">{waiting_total}</span>'
+             if waiting_total else '')
+    items.append(f'<a href="{url_prefix}/waiting" style="font-weight:600;">&#9203; Waiting on you{badge}</a>')
     items.append(f'<h2>{_html.escape(ws["label"])}</h2>')
     for label, route in ws['nav']:
         cls = ' class="active"' if route == current_route else ''
@@ -3802,6 +3875,247 @@ def render_404(route_path, workspace=DEFAULT_WORKSPACE):
 </body></html>"""
 
 
+# --- "Waiting on you" inbox (2026-09-04, COO run) --------------------------
+#
+# The gap this closes: every marked document lived at its own URL and Mike had
+# to be told that URL by whoever wrote it. Docs he had already ruled on and docs
+# still holding an unanswered ask looked identical from outside. This route is
+# the one address that answers "what is waiting for me" across every workspace.
+#
+# It is derived, never authored: it reads the same comment sidecars the review
+# surface writes (`<feedback_dir>/*.jsonl`), so it cannot drift from the docs.
+# A row's true route comes from each record's own `page` field — `page_slug()`
+# is lossy (slashes become underscores) and is never reversed here.
+#
+# Counting rules (deliberate, and the reason the two columns are separate):
+#   waiting on you  = open rows NOT authored by mike   -> asks he has not answered
+#   waiting on Dee  = open rows authored by mike       -> rulings not yet acted on
+#   open            = status not 'done' and not deleted
+# `reader-signal` rows are bookkeeping (done / gave-up), never an ask; they are
+# excluded from both counts and surfaced as a chip instead.
+
+_WAITING_TERMINAL_STATUS = ('done',)
+_WAITING_MIKE_AUTHORS = ('mike', 'mw', 'mike-wolf')
+
+
+def _waiting_is_open(row):
+    if row.get('deleted'):
+        return False
+    if row.get('mark_kind') == 'reader-signal':
+        return False
+    return (row.get('status') or 'queued') not in _WAITING_TERMINAL_STATUS
+
+
+def _waiting_by_mike(row):
+    return (row.get('author') or '').strip().lower() in _WAITING_MIKE_AUTHORS
+
+
+def _waiting_doc_title(route, workspace):
+    """First markdown H1 of the doc, else its filename. Best-effort: a doc that
+    has moved or been deleted still gets a row (its marks are still real)."""
+    try:
+        fs_path = resolve_page(route, workspace)
+    except Exception:
+        return os.path.basename(route), False
+    try:
+        with open(fs_path, 'r', encoding='utf-8') as f:
+            for _ in range(80):
+                line = f.readline()
+                if not line:
+                    break
+                if line.startswith('# '):
+                    return line[2:].strip(), True
+    except OSError:
+        return os.path.basename(route), False
+    return os.path.basename(route), True
+
+
+def collect_waiting():
+    """One row per document that has any sidecar, across every workspace."""
+    rows = []
+    for slug in load_workspaces():
+        try:
+            ws = get_workspace(slug)
+        except NotFoundError:
+            continue
+        feedback_dir = ws['feedback_dir']
+        if not os.path.isdir(feedback_dir):
+            continue
+        for name in sorted(os.listdir(feedback_dir)):
+            if not name.endswith('.jsonl'):
+                continue
+            records = _read_comments_unlocked(os.path.join(feedback_dir, name))
+            if not records:
+                continue
+            route = ''
+            for rec in records:
+                if rec.get('page'):
+                    route = rec['page']
+                    break
+            if not route:
+                continue
+            on_mike = [r for r in records if _waiting_is_open(r) and not _waiting_by_mike(r)]
+            on_dee = [r for r in records if _waiting_is_open(r) and _waiting_by_mike(r)]
+            signals = [r for r in records
+                       if r.get('mark_kind') == 'reader-signal' and not r.get('deleted')]
+            signals.sort(key=lambda r: r.get('timestamp') or '')
+            live = [r for r in records if not r.get('deleted')]
+            title, exists = _waiting_doc_title(route, slug)
+            first_open = None
+            for r in sorted(on_mike, key=lambda r: r.get('timestamp') or ''):
+                if r.get('block_id'):
+                    first_open = r['block_id']
+                    break
+            rows.append({
+                'workspace': slug,
+                'workspace_label': ws['label'],
+                'route': route,
+                'title': title,
+                'exists': exists,
+                'on_mike': len(on_mike),
+                'on_dee': len(on_dee),
+                'total': len(live),
+                'last_ts': max((r.get('timestamp') or '' for r in live), default=''),
+                'signal': (signals[-1].get('signal') if signals else ''),
+                'first_open_block': first_open,
+                'kinds': sorted({(r.get('mark_kind') or r.get('type') or 'comment')
+                                 for r in on_mike}),
+            })
+    rows.sort(key=lambda r: (r['on_mike'] == 0, r['on_mike'] == 0 and r['on_dee'] == 0,
+                             _waiting_sort_ts(r)), reverse=False)
+    return rows
+
+
+def _waiting_sort_ts(row):
+    """Newest first inside each band — negate by string trick: sort ascending on
+    the inverted timestamp so the outer tuple can stay a plain ascending sort."""
+    ts = row['last_ts'] or ''
+    return ''.join(chr(0x10FFFD - ord(c)) if ord(c) < 0x10FFFD else c for c in ts)
+
+
+def _waiting_is_stale(ts, days=14):
+    """An ask nobody has touched in two weeks is reported as stale rather than
+    silently counted alongside tonight's work — a stack of dead July asks at the
+    top of the inbox is exactly the noise this page exists to remove."""
+    if not ts:
+        return True
+    try:
+        then = datetime.datetime.strptime(ts, '%Y-%m-%dT%H:%M:%SZ').replace(
+            tzinfo=datetime.timezone.utc)
+    except ValueError:
+        return False
+    return (datetime.datetime.now(datetime.timezone.utc) - then).days >= days
+
+
+def _waiting_age(ts):
+    if not ts:
+        return '—'
+    try:
+        then = datetime.datetime.strptime(ts, '%Y-%m-%dT%H:%M:%SZ').replace(
+            tzinfo=datetime.timezone.utc)
+    except ValueError:
+        return ts
+    delta = datetime.datetime.now(datetime.timezone.utc) - then
+    mins = int(delta.total_seconds() // 60)
+    if mins < 60:
+        return f'{max(mins, 0)}m ago'
+    if mins < 60 * 48:
+        return f'{mins // 60}h ago'
+    return f'{mins // (60 * 24)}d ago'
+
+
+WAITING_CSS = """
+.waiting-wrap{max-width:900px;}
+.waiting-wrap h1{font-size:22px;margin:0 0 4px;}
+.waiting-sub{color:#8a8f98;font-size:13px;margin:0 0 20px;}
+.waiting-band{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#8a8f98;
+  margin:26px 0 8px;border-top:1px solid #23262d;padding-top:12px;}
+.waiting-row{display:block;padding:12px 14px;margin:6px 0;border:1px solid #23262d;
+  border-radius:9px;background:#1a1c22;text-decoration:none;color:inherit;}
+.waiting-row:hover{border-color:#2f6feb;}
+.waiting-row.is-ask{border-left:3px solid #e0b463;}
+.waiting-top{display:flex;align-items:center;gap:8px;flex-wrap:wrap;}
+.waiting-title{font-weight:600;color:#e6e6e6;font-size:14px;flex:1 1 auto;}
+.waiting-ws{font-size:10px;text-transform:uppercase;letter-spacing:.05em;padding:2px 7px;
+  border-radius:10px;background:#1c2a3a;color:#63a0e0;border:1px solid #264a5a;}
+.waiting-count{font-size:11px;padding:2px 8px;border-radius:10px;}
+.waiting-count.mike{background:#3a2f1c;color:#e0b463;}
+.waiting-count.dee{background:#1c2a3a;color:#63a0e0;}
+.waiting-count.signal{background:#1c3a24;color:#63e089;}
+.waiting-count.missing{background:#3a1c1c;color:#e06363;}
+.waiting-meta{margin-top:5px;font-size:11px;color:#8a8f98;}
+.waiting-empty{color:#8a8f98;font-size:13px;padding:14px 0;}
+"""
+
+
+def render_waiting(workspace=DEFAULT_WORKSPACE):
+    try:
+        ws = get_workspace(workspace)
+    except NotFoundError:
+        workspace = DEFAULT_WORKSPACE
+        ws = get_workspace(workspace)
+    rows = collect_waiting()
+    asks = [r for r in rows if r['on_mike']]
+    replies = [r for r in rows if not r['on_mike'] and r['on_dee']]
+    settled = [r for r in rows if not r['on_mike'] and not r['on_dee']]
+
+    def row_html(r):
+        prefix = workspace_url_prefix(r['workspace'])
+        frag = f"#b:{r['first_open_block']}" if r['first_open_block'] else ''
+        href = f"{prefix}/page/{r['route']}?view=v3{frag}"
+        chips = []
+        if r['on_mike']:
+            chips.append(f'<span class="waiting-count mike">{r["on_mike"]} for you</span>')
+        if r['on_dee']:
+            chips.append(f'<span class="waiting-count dee">{r["on_dee"]} for Dee</span>')
+        if r['signal']:
+            chips.append(f'<span class="waiting-count signal">{_html.escape(r["signal"])}</span>')
+        if not r['exists']:
+            chips.append('<span class="waiting-count missing">doc missing</span>')
+        if r['on_mike'] and _waiting_is_stale(r['last_ts']):
+            chips.append('<span class="waiting-count missing">stale</span>')
+        kinds = ', '.join(r['kinds']) if r['kinds'] else ''
+        meta = f"{_html.escape(r['route'])} · last activity {_waiting_age(r['last_ts'])}"
+        if kinds:
+            meta += f" · {_html.escape(kinds)}"
+        return (f'<a class="waiting-row{" is-ask" if r["on_mike"] else ""}" href="{href}">'
+                f'<div class="waiting-top">'
+                f'<span class="waiting-title">{_html.escape(r["title"])}</span>'
+                f'<span class="waiting-ws">{_html.escape(r["workspace_label"])}</span>'
+                f'{"".join(chips)}</div>'
+                f'<div class="waiting-meta">{meta}</div></a>')
+
+    def band(label, items, empty):
+        body = '\n'.join(row_html(r) for r in items) if items \
+            else f'<div class="waiting-empty">{empty}</div>'
+        return f'<div class="waiting-band">{label}</div>{body}'
+
+    url_prefix = workspace_url_prefix(workspace)
+    fresh_asks = [r for r in asks if not _waiting_is_stale(r['last_ts'])]
+    total_asks = sum(r['on_mike'] for r in fresh_asks)
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Waiting on you — soma-review</title>
+<style>{PAGE_CSS}{WAITING_CSS}</style></head>
+<body>
+<nav class="sidebar">
+  <a href="{url_prefix}/waiting" style="font-weight:700;font-size:15px;color:#e6e6e6;">soma-review</a>
+  {render_workspace_switcher(workspace)}
+  {render_sidebar('', workspace)}
+</nav>
+<main class="main">
+  <div class="waiting-wrap">
+    <h1>Waiting on you</h1>
+    <p class="waiting-sub">{total_asks} open item(s) across {len(fresh_asks)} document(s) are addressed to
+    you, plus {sum(r['on_mike'] for r in asks) - total_asks} on documents nobody has touched in two weeks. Derived live from the review sidecars — nothing here is hand-maintained.
+    Each row opens the document in the mark view at the first open item.</p>
+    {band('Needs your ruling', asks, 'Nothing is waiting on you.')}
+    {band('You ruled — waiting on Dee', replies, 'Nothing outstanding on Dee.')}
+    {band('Settled', settled, 'No settled documents yet.')}
+  </div>
+</main>
+</body></html>"""
+
+
 # --- Dispatch --------------------------------------------------------------
 
 def load_dispatch_template():
@@ -4066,6 +4380,20 @@ class Handler(BaseHTTPRequestHandler):
         qs = parse_qs(parsed.query)
 
         if path == '/':
+            # Landing page is the inbox, not a workspace home doc (2026-09-04):
+            # "what is waiting for me" is the question the surface should answer
+            # first. Every workspace home stays one click away in the sidebar.
+            try:
+                get_workspace(workspace)
+            except NotFoundError:
+                self._send_html('<h1>404</h1><p>Unknown workspace.</p>', status=404)
+                return
+            self.send_response(302)
+            self.send_header('Location', f'{workspace_url_prefix(workspace)}/waiting')
+            self.end_headers()
+            return
+
+        if path == '/home':
             try:
                 ws = get_workspace(workspace)
             except NotFoundError:
@@ -4074,6 +4402,14 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(302)
             self.send_header('Location', f'{workspace_url_prefix(workspace)}/page/{ws["home"]}')
             self.end_headers()
+            return
+
+        if path == '/waiting':
+            self._send_html(render_waiting(workspace))
+            return
+
+        if path == '/api/waiting':
+            self._send_json(collect_waiting())
             return
 
         if path.startswith('/page/'):

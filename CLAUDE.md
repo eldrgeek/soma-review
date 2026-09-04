@@ -122,6 +122,42 @@ workspace. When the estate does its next morning review cycle, update `workspace
 `estate.home`/`estate.nav` to point at the new dated files (or generalize to a manifest — not
 done yet, see Gotchas).
 
+## "Waiting on you" inbox (2026-09-04) — the landing page
+
+`/waiting` (and `/w/<ws>/waiting`, plus `/api/waiting` for the same data as JSON) is a derived
+index of every document that has a comment sidecar, in every workspace. It exists because each
+marked document lived at its own URL: Mike had to be told that URL by whoever wrote the doc,
+and a document he had already ruled on looked, from outside, exactly like one holding an
+unanswered ask.
+
+`/` now redirects to `/waiting` instead of the workspace home page. The old behaviour lives at
+`/home` (still per-workspace, still `workspaces.json::<ws>.home`), and each workspace home is
+one click away in the sidebar. A "⏳ Waiting on you" link with a live count sits at the top of
+the sidebar on every page.
+
+Counting rules (`collect_waiting()`), deliberately two columns:
+- **waiting on you** — open rows NOT authored by mike: asks he has not answered.
+- **waiting on Dee** — open rows authored by mike: rulings nobody has acted on yet.
+- **open** — `status` is not `done` and the row is not deleted. `reader-signal` rows
+  (`done` / `gave-up`) are bookkeeping, never an ask; they show as a chip instead.
+- An ask nobody has touched in 14 days is chipped **stale** and excluded from the headline
+  count and the sidebar badge, so July's dead asks do not bury tonight's.
+
+A row's route comes from each record's own `page` field — `page_slug()` is lossy (slashes
+become underscores) and is never reversed. A row links to `?view=v3#b:<block-id>` of the
+oldest open ask; the v3 view has a load-time handler for that fragment (see the v3 section).
+
+Deep-link caveat, measured not assumed: the v3 view keeps re-laying-out for seconds after
+`load` (mark rails, edit chips, term links) — MAC-STEWARD is 8418px tall at `load` and 6328px
+once settled. A single jump landed 1193px above the target. The shipped handler re-centres on
+every animation frame for 8s and surrenders on the reader's first scroll/click/key. In a
+throttled headless measurement it still finished ~500px high; in a foreground browser the
+reflow completes inside that window. Treat the fragment as "lands you at the ask", not as a
+pixel guarantee.
+
+Cost: the sidebar count re-reads every sidecar on every page render (17 files today, all
+small). If the sidecar set grows much, cache it by directory mtime.
+
 ## Mark Layer review surface (2026-09-01)
 
 Ordinary document pages now use a document-first review instrument modeled on the Playmaker

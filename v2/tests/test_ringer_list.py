@@ -46,7 +46,8 @@ class RingerListTests(unittest.TestCase):
             }, handle)
         with open(self.doc, 'w', encoding='utf-8') as handle:
             handle.write('# Title\n\nAlpha one.\n\nBravo two.\n\n'
-                         'Charlie three.\n\nDelta four.\n')
+                         'Charlie three.\n\nDelta four.\n\n'
+                         'Echo five. Foxtrot six.\n')
         self.old_root = server.PROJECTS_ROOT
         self.old_config = server.WORKSPACES_CONFIG
         server.PROJECTS_ROOT = self.root
@@ -97,6 +98,14 @@ class RingerListTests(unittest.TestCase):
                            'mark_kind': kind, 'block_id': block['id'],
                            'quote': server.blockmap.norm(block['text']),
                            'author': author, 'text': 'ok'})
+
+    def _mark_sentence(self, block_index, sentence, kind='agree', author='mike'):
+        """A mark on ONE sentence of a block, the way the v3 surface posts it:
+        the quote is the sentence, not the paragraph, and the server resolves
+        it to a from/to span inside the block."""
+        return self._post({'page': 'docs/page.md', 'type': 'mark',
+                           'mark_kind': kind, 'block_id': self._blk(block_index),
+                           'quote': sentence, 'author': author, 'text': 'ok'})
 
     # --- tests -----------------------------------------------------------
     def test_no_marks_and_no_signal_means_no_bracket(self):
@@ -272,6 +281,81 @@ class RingerListTests(unittest.TestCase):
         else:
             self.fail('expected 400 without a page')
 
+
+
+    # --- sentence-level attention (2026-09-04) ---------------------------
+    #
+    # Mike marks a sentence, not a paragraph. Until this pass, any mark
+    # anywhere in a block suppressed every earlier revision anywhere in that
+    # block, so an `ack` on sentence one answered for a rewrite of sentence
+    # four and the change left the list unnamed — an under-report, the one
+    # direction this list must never fail in.
+
+    def test_mark_on_another_sentence_does_not_suppress_the_revision(self):
+        self._revision(5, 'Foxtrot six.', 'Foxtrot six, rewritten.')
+        status, _ = self._mark_sentence(5, 'Echo five.')
+        self.assertEqual(201, status)
+        ringer = server.compute_ringer_list('docs/page.md')
+        self.assertEqual(1, ringer['swallowed'],
+                         'an ack on sentence one is not attention on a rewrite '
+                         'of sentence two')
+        self.assertEqual('swallowed', ringer['ringers'][0]['why'])
+
+    def test_mark_on_the_revised_sentence_does_suppress_it(self):
+        self._revision(5, 'Foxtrot six.', 'Foxtrot six, rewritten.')
+        status, _ = self._mark_sentence(5, 'Foxtrot six, rewritten.')
+        self.assertEqual(201, status)
+        self.assertEqual(0, server.compute_ringer_list('docs/page.md')['swallowed'],
+                         'a mark whose own text carries the revision IS attention on it')
+
+    def test_whole_block_mark_still_suppresses_every_sentence(self):
+        self._revision(5, 'Foxtrot six.', 'Foxtrot six, rewritten.')
+        self._mark(5)
+        self.assertEqual(0, server.compute_ringer_list('docs/page.md')['swallowed'],
+                         'a mark on the whole paragraph covers all of it, as before')
+
+    def test_two_sentence_marks_are_both_kept(self):
+        """Collapsing a block's marks to the newest one threw away the span
+        that mattered: the earlier mark is the one that covers the revision."""
+        self._revision(5, 'Echo five.', 'Echo five, rewritten.')
+        self._mark_sentence(5, 'Echo five, rewritten.')
+        self._mark_sentence(5, 'Foxtrot six.')
+        self.assertEqual(0, server.compute_ringer_list('docs/page.md')['swallowed'])
+
+    def test_a_short_revision_matching_mid_sentence_is_not_suppressed(self):
+        """Plain substring containment under-reports: a revision whose new text
+        is short and common can appear inside an unrelated marked sentence. The
+        match must land on whole sentences or it is not attention."""
+        self.assertFalse(server._ringer_text_covers(
+            'We are Done. And moving on.', 'Done.'))
+        self.assertTrue(server._ringer_text_covers(
+            'Echo five. Foxtrot six, rewritten.', 'Foxtrot six, rewritten.'))
+        self.assertTrue(server._ringer_text_covers(
+            'Foxtrot six, rewritten.', 'Foxtrot six, rewritten.'))
+
+    def test_an_empty_span_mark_covers_nothing(self):
+        """A caret click selects no text. The binder accepts from == to and
+        stores an empty quote, so covering-on-empty would let a mark that read
+        nothing suppress every revision in its block."""
+        marks = [{'key': ('2026-09-04T10:00:00Z', 9), 'text': '', 'whole': False}]
+        self.assertFalse(server._ringer_attention_covers(
+            marks, {'proposed': 'Foxtrot six, rewritten.'},
+            ('2026-09-04T09:00:00Z', 1)))
+
+    def test_a_revision_with_no_text_is_never_assumed_seen(self):
+        marks = [{'key': ('2026-09-04T10:00:00Z', 9), 'text': 'Echo five.',
+                  'whole': False}]
+        self.assertFalse(server._ringer_attention_covers(
+            marks, {}, ('2026-09-04T09:00:00Z', 1)))
+
+    def test_whole_block_branch_is_pinned_independently(self):
+        """The whole-block escape must carry its own weight: a mark whose text
+        does NOT contain the revision still covers when it spans the block."""
+        marks = [{'key': ('2026-09-04T10:00:00Z', 9), 'text': 'nothing alike',
+                  'whole': True}]
+        self.assertTrue(server._ringer_attention_covers(
+            marks, {'proposed': 'Foxtrot six, rewritten.'},
+            ('2026-09-04T09:00:00Z', 1)))
 
 if __name__ == '__main__':
     unittest.main()

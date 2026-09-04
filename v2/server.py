@@ -4572,6 +4572,98 @@ def _ringer_is_revision(row):
     return row.get('type') == 'edit' and not row.get('deleted')
 
 
+# A mark's span. `to is None` is the schema's way of saying "the whole block"
+# (validated_binding sets quote = the entire block text in that case), so a
+# spanless mark keeps the old block-wide meaning and nothing regresses.
+def _ringer_span_text(row):
+    """The text a row actually covers, normalized, plus whether it covers the
+    whole block. Returns (text, whole)."""
+    whole = row.get('to') is None
+    quote = blockmap.norm(row.get('quote') or row.get('origin_quote') or '')
+    return quote, whole
+
+
+def _ringer_revision_texts(row):
+    """Every normalized string that identifies the text a revision touched.
+    `proposed` is what the trunk holds now, so it is what a LATER mark would
+    have quoted; `snapshot`/`quote` cover the case where a further edit landed
+    in between."""
+    out = []
+    for key in ('proposed', 'quote', 'origin_quote', 'snapshot'):
+        text = blockmap.norm(row.get(key) or '')
+        if text:
+            out.append(text)
+    return out
+
+
+def _ringer_text_covers(mark_text, rev_text):
+    """Does a marked run of text contain a revision as WHOLE sentences?
+
+    Plain substring containment under-reports: a revision whose new text is
+    short and common ("Done.", "Yes.") can appear inside an unrelated sentence
+    the reader marked, and the change he never looked at would drop off the
+    list. So the match must start where a sentence starts in the marked text
+    and end where one ends. Mid-sentence coincidence is treated as no
+    attention, which lists the change — the over-report direction, the safe
+    one.
+    """
+    if not rev_text or not mark_text:
+        return False
+    if rev_text == mark_text:
+        return True
+    ranges = sentence_ranges(mark_text)
+    starts = {start for start, _end, _q in ranges}
+    ends = {end for _start, end, _q in ranges}
+    if not ranges:
+        return False
+    at = mark_text.find(rev_text)
+    while at != -1:
+        if at in starts and (at + len(rev_text)) in ends:
+            return True
+        at = mark_text.find(rev_text, at + 1)
+    return False
+
+
+def _ringer_attention_covers(marks, revision, rev_key):
+    """Did any of the reader's marks on this block actually land on THIS
+    revision?
+
+    Mike marks a sentence, not a paragraph — the surface renders every sentence
+    as its own addressable span and his sidecar rows carry the span he picked
+    (one 09-02 block on SCHEDULED-JOBS-REVIEW carries two marks, 0-25 and
+    26-206, on the same block). Until now any mark anywhere in a block
+    suppressed every earlier revision anywhere in that block, so an `ack` on
+    sentence one silently answered for a rewrite of sentence four and the
+    ringer list — the one mechanism whose job is to name what his bracket
+    swallowed — swallowed it too. That is the under-report direction, which is
+    the direction this list must never fail in.
+
+    A mark covers a revision when it came after it AND its own text contains
+    the revised text. A whole-block mark covers everything, as before. When
+    either side carries no usable text the mark still covers: an unknown span
+    keeps the old behaviour rather than flooding the list.
+    """
+    rev_texts = _ringer_revision_texts(revision)
+    for mark in marks:
+        if mark['key'] <= rev_key:
+            continue          # a mark BEFORE the revision is never attention on it
+        if mark['whole']:
+            return True       # a mark on the whole paragraph covers all of it
+        # A span that selects no text is a caret position, not attention: the
+        # binder accepts from == to (blockmap._resolve_on_block) and persists an
+        # empty quote, so covering-on-empty would let a click with no selection
+        # suppress every revision in the block — a whole-block suppression
+        # minted by a mark that read nothing. Same for a revision carrying no
+        # text at all: an unknown span is listed, not assumed seen. Both
+        # defaults now point the way this list is required to fail, which is
+        # toward showing him too much.
+        if not mark['text'] or not rev_texts:
+            continue
+        if any(_ringer_text_covers(mark['text'], text) for text in rev_texts):
+            return True
+    return False
+
+
 def compute_ringer_list(route_path, workspace=DEFAULT_WORKSPACE, reader=RINGER_READER):
     """The machine half of agreed-model 12b. Returns
     {reader, bracket:{lower,upper,lower_block,upper_block,basis}, ringers:[...],
@@ -4599,7 +4691,8 @@ def compute_ringer_list(route_path, workspace=DEFAULT_WORKSPACE, reader=RINGER_R
 
     # Blocks the reader touched explicitly. A reader-signal is bookkeeping, not
     # attention on a block, so it never counts as an explicit mark.
-    # {position: latest timestamp the reader marked it}. The time dimension is
+    # {position: [{key, text, whole}, ...] — every mark he made on that block,
+    # not just the newest}. The time dimension is
     # load-bearing: a mark at T1 is not attention on a revision made at T2.
     # Without it, one agree in round one suppresses every later revision to
     # that block, in every round, forever.
@@ -4630,8 +4723,12 @@ def compute_ringer_list(route_path, workspace=DEFAULT_WORKSPACE, reader=RINGER_R
         if pos is not None:
             reached.add(pos)
             key = (r.get('timestamp') or '', seq.get(r.get('id'), 0))
-            if key > marked.get(pos, ('', -1)):
-                marked[pos] = key
+            text, whole = _ringer_span_text(r)
+            # Every mark is kept, not just the latest: two marks on the same
+            # block are two different sentences, and collapsing them to the
+            # newest one threw away the span that mattered.
+            marked.setdefault(pos, []).append(
+                {'key': key, 'text': text, 'whole': whole})
     # Settling or reverting a revision is attention on that revision even when
     # it leaves no row of its own on the block.
     reader_names = (_WAITING_MIKE_AUTHORS if reader == RINGER_READER
@@ -4679,8 +4776,10 @@ def compute_ringer_list(route_path, workspace=DEFAULT_WORKSPACE, reader=RINGER_R
                 # cannot be found on the page, which is the least reviewable
                 # state a change can be in, not a reason to drop it.
                 and (pos is None or (lower <= pos <= upper
-                                     and marked.get(pos, ('', -1))
-                                     < ((r.get('timestamp') or ''), seq.get(r.get('id'), 0))))):
+                                     and not _ringer_attention_covers(
+                                         marked.get(pos, ()), r,
+                                         ((r.get('timestamp') or ''),
+                                          seq.get(r.get('id'), 0)))))):
             swallowed = True
         if not (flagged or swallowed):
             continue
@@ -5264,7 +5363,10 @@ def render_ringer_section(ringer):
                f"reader’s marks, revisions included. This reader’s bracket runs from the top of "
                f"the document to block {b['upper'] + 1} of {b['blocks_total']} "
                f"(edge set by {b['basis']}), and they marked {ringer['marked_blocks']} block(s) "
-               f"inside it. Every revision below is one their bracket swallowed without an "
+               f"inside it. A mark counts as attention on the sentence it covers, not on the "
+               f"whole paragraph, so an ack on one sentence never answers for a "
+               f"rewrite of another. Every revision below is one their bracket "
+               f"swallowed without an "
                f"explicit mark, named back to them. Generated from the sidecar; it cannot be "
                f"short by omission.")
     gap = ringer.get('trunk_gap') or {}

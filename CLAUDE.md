@@ -74,8 +74,12 @@ Per-workspace now (`workspaces.json::<ws>.roots`), not a single global list. Eac
 `business-ops/`, `SOMA/`, plus (workspace-gated) a synthetic `nightly/<worktree-slug>` route
 that auto-discovers `~/Projects/.nightly-*/NIGHTLY-REPORT.md` worktrees at request time (no
 server restart needed when a new nightly worktree appears). `business-ops/SPEND-INVENTORY-DRAFT.md`
-and `LEDGER.csv`-adjacent files are in-scope and serve fine — they're sensitive-local (never
-leave the machine, this server only binds `127.0.0.1`), not secret-from-Mike.
+and `LEDGER.csv`-adjacent files are in-scope and serve fine — they're sensitive-to-Mike, not
+secret-from-Mike. **Corrected 2026-09-04: they are no longer "never leave the machine."** The
+process still binds `127.0.0.1`, but `tailscale serve` proxies `https://macbook-pro.tail68bbcc.ts.net:8433`
+to it, so this server is reachable from Mike's Pixel over the tailnet. The only thing keeping
+that narrow is the tailnet ACL, which admits exactly one device to exactly that port — read
+`_estate/TAILNET-INGRESS.md` before widening anything, and before adding a new sensitive root.
 
 Path resolution rejects anything outside its workspace's roots (`os.path.normpath` + prefix
 check). `resolve_page()` additionally requires `.md`; `resolve_raw()` (see Links below) allows
@@ -601,9 +605,16 @@ curl -s http://localhost:8090/healthz
 - **Sidecar rewrite-on-status-update is O(n) per page.** `update_comment()` reads the whole
   JSONL, patches in memory, rewrites atomically (`.tmp` + `os.replace`). Fine at estate-review
   volume (dozens of comments per page); would need a real datastore past a few thousand.
-- **No auth on the comment/dispatch API.** Server binds `127.0.0.1` only — anything that can
-  reach localhost:8090 on this Mac can post/dispatch. Acceptable for a single-user local tool;
-  revisit if this ever needs to be reachable off-box.
+- **No auth on the comment/dispatch API — and it IS reachable off-box now.** The process binds
+  `127.0.0.1`, but since 2026-09-04 `tailscale serve` fronts it at
+  `https://macbook-pro.tail68bbcc.ts.net:8433` so the Pulse card's links work on Mike's phone.
+  Anything that reaches that address can post comments, post rulings **as Mike** (`author` is
+  client-asserted; see the `resolved_by` note above), and `POST /api/dispatch`, which spawns a
+  `cc-dispatch` worker with full filesystem access on this Mac. The sole control is the tailnet
+  ACL admitting one device on one port — no authentication, and nothing fails closed if that
+  rule widens. Real auth in front of this server is **owed and unbuilt**; it is Mike-gated and
+  should be put to him as its own decision. Details and the restore command:
+  `_estate/TAILNET-INGRESS.md`.
 - **Task-name/slug `.md` collision (fixed 2026-07-02):** `run_dispatch()` originally built the
   `cc-dispatch` task name straight from the page slug, which already contains `.md`
   (`estate_MORNING-REVIEW-2026-07-02.md`) — `cc-dispatch` appends its own `.md` for the report

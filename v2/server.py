@@ -4182,7 +4182,15 @@ def compute_ringer_list(route_path, workspace=DEFAULT_WORKSPACE, reader=RINGER_R
     """The machine half of agreed-model 12b. Returns
     {reader, bracket:{lower,upper,lower_block,upper_block,basis}, ringers:[...],
      swallowed, flagged, revisions, marked_blocks}."""
-    rows = [c for c in read_comments(route_path, workspace) if not c.get('deleted')]
+    all_rows = read_comments(route_path, workspace)
+    rows = [c for c in all_rows if not c.get('deleted')]
+    # A soft-deleted edit row is NOT a soft-deleted change: apply_sentence_change
+    # wrote and committed at create time, and the delete path does not revert.
+    # Deleting the row therefore removes the change from every list while
+    # leaving it in the trunk — the exact silent-swallow this section exists to
+    # prevent — so a deleted edit that carries a commit is listed as withdrawn.
+    withdrawn = [c for c in all_rows
+                 if c.get('deleted') and c.get('type') == 'edit' and c.get('commit')]
     _src, blocks, _mapping, _report = current_page_blocks(route_path, workspace)
     order = {b['id']: i for i, b in enumerate(blocks)}
     text_of = {b['id']: blockmap.norm(b.get('text') or '') for b in blocks}
@@ -4197,25 +4205,50 @@ def compute_ringer_list(route_path, workspace=DEFAULT_WORKSPACE, reader=RINGER_R
 
     # Blocks the reader touched explicitly. A reader-signal is bookkeeping, not
     # attention on a block, so it never counts as an explicit mark.
-    marked = set()
+    # {position: latest timestamp the reader marked it}. The time dimension is
+    # load-bearing: a mark at T1 is not attention on a revision made at T2.
+    # Without it, one agree in round one suppresses every later revision to
+    # that block, in every round, forever.
+    # Keys are (timestamp, append index): sidecar timestamps are
+    # second-resolution, so a mark and a revision made in the same second are
+    # ordered by the order they were written, the same tie-break
+    # `/api/read-state` already uses for two signals in one second.
+    seq = {r.get('id'): i for i, r in enumerate(rows)}
+    marked = {}
+    reached = set()
+    answered_threads = set()
     for r in rows:
         if not _ringer_is_reader(r, reader):
             continue
         if r.get('mark_kind') == 'reader-signal':
             continue
         pos = order.get(r.get('block_id'))
+        is_reply = bool(r.get('thread_id') and r.get('thread_id') != r.get('id'))
+        if is_reply:
+            # A reply is re-bound to its thread root's block, so it is attention
+            # on THAT thread, not on the block generally: answering a decision
+            # card says nothing about a separate revision to the same sentence.
+            # It still proves he reached the block, so it moves the bracket edge.
+            answered_threads.add(r.get('thread_id'))
+            if pos is not None:
+                reached.add(pos)
+            continue
         if pos is not None:
-            marked.add(pos)
+            reached.add(pos)
+            key = (r.get('timestamp') or '', seq.get(r.get('id'), 0))
+            if key > marked.get(pos, ('', -1)):
+                marked[pos] = key
     # Settling or reverting a revision is attention on that revision even when
     # it leaves no row of its own on the block.
+    reader_names = (_WAITING_MIKE_AUTHORS if reader == RINGER_READER
+                    else (reader.strip().lower(),))
     resolved_by_reader = {
         r.get('id') for r in rows
         if _ringer_is_revision(r) and (r.get('settled') or r.get('reverted'))
-        and (r.get('resolved_by') or '').strip().lower() in
-            (_WAITING_MIKE_AUTHORS if reader == RINGER_READER else (reader.strip().lower(),))
+        and (r.get('resolved_by') or '').strip().lower() in reader_names
     }
 
-    upper = max(marked) if marked else -1
+    upper = max(reached) if reached else -1
     basis = 'marks'
     if latest_signal is not None:
         sig_pos = order.get(latest_signal.get('last_read_block'))
@@ -4229,7 +4262,7 @@ def compute_ringer_list(route_path, workspace=DEFAULT_WORKSPACE, reader=RINGER_R
     # through — a ringer he already knew about costs him a glance, one that was
     # never named costs him the ruling.
     lower = 0
-    if not marked and latest_signal is None:
+    if not reached and latest_signal is None:
         # Nothing read, nothing marked: there is no bracket, so nothing was
         # swallowed. An empty list here is a true empty, not an omission.
         upper = -1
@@ -4246,11 +4279,14 @@ def compute_ringer_list(route_path, workspace=DEFAULT_WORKSPACE, reader=RINGER_R
         pos = order.get(r.get('block_id'))
         if (_ringer_is_revision(r) and not _ringer_is_reader(r, reader)
                 and upper >= 0 and r.get('id') not in resolved_by_reader
+                and r.get('id') not in answered_threads
                 # A revision whose block no longer exists (pos is None) is
                 # listed too: it changed text the reader was reading and now
                 # cannot be found on the page, which is the least reviewable
                 # state a change can be in, not a reason to drop it.
-                and (pos is None or (lower <= pos <= upper and pos not in marked))):
+                and (pos is None or (lower <= pos <= upper
+                                     and marked.get(pos, ('', -1))
+                                     < ((r.get('timestamp') or ''), seq.get(r.get('id'), 0))))):
             swallowed = True
         if not (flagged or swallowed):
             continue
@@ -4266,6 +4302,18 @@ def compute_ringer_list(route_path, workspace=DEFAULT_WORKSPACE, reader=RINGER_R
             'after': r.get('proposed') or '',
             'replace': bool(r.get('replace')),
             'status': r.get('status') or 'queued',
+            'block_text': text_of.get(r.get('block_id'), ''),
+        })
+    for r in withdrawn:
+        pos = order.get(r.get('block_id'))
+        ringers.append({
+            'id': r.get('id'), 'block_id': r.get('block_id'), 'position': pos,
+            'author': r.get('author'), 'timestamp': r.get('timestamp'),
+            'why': 'withdrawn',
+            'reason': 'The sidecar row was deleted but the change was already committed to the '
+                      'trunk, so it left every list while staying in the document.',
+            'before': r.get('snapshot') or '', 'after': r.get('proposed') or '',
+            'replace': bool(r.get('replace')), 'status': r.get('status') or 'queued',
             'block_text': text_of.get(r.get('block_id'), ''),
         })
     ringers.sort(key=lambda x: (x['position'] if x['position'] is not None else 10**6,
@@ -4295,6 +4343,7 @@ def compute_ringer_list(route_path, workspace=DEFAULT_WORKSPACE, reader=RINGER_R
         'ringers': ringers,
         'swallowed': sum(1 for x in ringers if x['why'] == 'swallowed'),
         'flagged': sum(1 for x in ringers if x['why'] == 'flagged'),
+        'withdrawn': sum(1 for x in ringers if x['why'] == 'withdrawn'),
         'revisions': revisions,
         'outside_bracket': outside,
         'marked_blocks': len(marked),
@@ -4333,6 +4382,7 @@ RINGER_CSS = """
 .ringer-tag{display:inline-block;font-size:11px;letter-spacing:.04em;text-transform:uppercase;
   padding:1px 7px;border-radius:9px;border:1px solid #5a4a24;color:#e8d9a8;margin-right:8px;}
 .ringer-tag.flagged{border-color:#6a3a3a;color:#f0b8b8;}
+.ringer-tag.withdrawn{border-color:#6a3a3a;color:#f0b8b8;}
 .ringer-meta{font-size:12px;color:#8d8470;}
 .ringer-diff{margin-top:7px;font-size:14px;line-height:1.6;color:#d8d2c4;}
 .ringer-diff del{color:#c98a8a;text-decoration:line-through;}
@@ -4365,8 +4415,9 @@ def render_ringer_section(ringer):
                 f"backstop for that.")
     rows_html = []
     for r in ringer['ringers']:
-        tag = 'flagged' if r['why'] == 'flagged' else 'swallowed'
-        label = 'writer-flagged' if r['why'] == 'flagged' else 'bracket swallowed'
+        tag = r['why'] if r['why'] in ('flagged', 'withdrawn') else 'swallowed'
+        label = {'flagged': 'writer-flagged',
+                 'withdrawn': 'withdrawn, still in the trunk'}.get(r['why'], 'bracket swallowed')
         pos = f"block {r['position'] + 1}" if r['position'] is not None else 'unanchored'
         reason = (f"<div class=\"ringer-meta\">{_html.escape(r['reason'])}</div>"
                   if r['reason'] else '')
@@ -4389,7 +4440,7 @@ def render_ringer_section(ringer):
             '<p class="ringer-empty">Nothing was swallowed this round: every revision inside '
             'the bracket was marked, settled or reverted by the reader.</p>')
     return (f'<section class="ringer-list" id="ringer-list">'
-            f'<h2>Ringer list ({ringer["swallowed"] + ringer["flagged"]})</h2>'
+            f'<h2>Ringer list ({len(ringer["ringers"])})</h2>'
             f'<p class="ringer-why">{why}</p>' + ''.join(rows_html) + '</section>')
 
 
@@ -5018,7 +5069,11 @@ class Handler(BaseHTTPRequestHandler):
             page = data.get('page', '')
             mark_id = data.get('id', '')
             action = data.get('action', 'settle')
-            resolver_author = (data.get('author') or 'mike').strip() or 'mike'
+            # No default of 'mike' here: an unnamed resolver must not be credited
+            # as the reader, or the ringer list clears itself. This field is
+            # client-asserted exactly like every `author` in this app — it is a
+            # record of who claimed to resolve, not an authenticated fact.
+            resolver_author = (data.get('author') or '').strip()
             if action not in ('settle', 'revert'):
                 self._send_json({'error': 'action must be settle or revert'}, status=400)
                 return
@@ -5044,7 +5099,9 @@ class Handler(BaseHTTPRequestHandler):
             if action == 'settle':
                 result = apply_sentence_settle(page, workspace, mark)
                 # `resolved_by` is what lets the ringer list tell a revision the
-                # reader acted on from one his bracket swallowed silently.
+                # reader acted on from one his bracket swallowed silently. It is
+                # as trustworthy as any other client-asserted author on this
+                # surface, which is to say: a record, not an authentication.
                 update_comment(page, mark_id, {'status': 'done', 'settled': True,
                                                'resolved_by': resolver_author}, workspace)
                 self._send_json({

@@ -219,6 +219,51 @@ class RingerListTests(unittest.TestCase):
         self.assertIn('Nothing was swallowed this round',
                       server.render_ringer_section(server.compute_ringer_list('docs/page.md')))
 
+    def test_a_mark_made_before_the_revision_does_not_suppress_it(self):
+        """Skip's finding 3: `marked` had no time dimension, so one agree in
+        round one suppressed every later revision to that block forever."""
+        self._mark(1)
+        self._revision(1, 'Alpha one.', 'Alpha one, revised.')
+        self._mark(3)
+        ringer = server.compute_ringer_list('docs/page.md')
+        self.assertEqual(1, ringer['swallowed'],
+                         'he marked that block before the change existed')
+
+    def test_a_reply_is_not_attention_on_the_block(self):
+        """Skip's finding 5: replies are re-bound to the thread root's block, so
+        answering a decision card was registering as a mark on the sentence."""
+        _s, root = self._post({'page': 'docs/page.md', 'type': 'mark',
+                               'mark_kind': 'decision', 'block_id': self._blk(1),
+                               'quote': 'Alpha one.', 'author': 'claude',
+                               'text': 'Which reading?'})
+        self._revision(1, 'Alpha one.', 'Alpha one, revised.')
+        self._post({'page': 'docs/page.md', 'thread_id': root['id'],
+                    'text': 'A', 'author': 'mike', 'status': 'seen'},
+                   path='/api/comments/reply')
+        self._mark(3)
+        self.assertEqual(1, server.compute_ringer_list('docs/page.md')['swallowed'])
+
+    def test_a_deleted_edit_row_whose_change_landed_is_listed_as_withdrawn(self):
+        """Skip's finding 2: deleting the row does not revert the trunk, so a
+        delete used to remove the change from every list while keeping it in
+        the document."""
+        _s, rev = self._revision(1, 'Alpha one.', 'Alpha one, revised.')
+        server.update_comment('docs/page.md', rev['id'],
+                              {'deleted': True, 'commit': 'deadbeef'}, 'estate')
+        ringer = server.compute_ringer_list('docs/page.md')
+        self.assertEqual(1, ringer['withdrawn'])
+        self.assertIn('withdrawn, still in the trunk',
+                      server.render_ringer_section(ringer))
+
+    def test_an_unnamed_resolver_is_not_credited_as_the_reader(self):
+        """Skip's finding 7: `resolved_by` defaulted to 'mike', so any settle
+        with no author cleared the ringer it was added to preserve."""
+        _s, rev = self._revision(1, 'Alpha one.', 'Alpha one, revised.')
+        self._mark(3)
+        self._post({'page': 'docs/page.md', 'id': rev['id'], 'action': 'settle'},
+                   path='/api/marks/merge')
+        self.assertEqual(1, server.compute_ringer_list('docs/page.md')['swallowed'])
+
     def test_api_ringer_requires_a_page(self):
         try:
             self._get('/api/ringer')

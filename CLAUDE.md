@@ -171,8 +171,40 @@ settling one's own change does not clear it from the list. Rows written before 2
 no `resolved_by`, so a revision settled before then still shows as swallowed — over-reporting,
 per the stated bias.
 
-Tests: `v2/tests/test_ringer_list.py` (15 cases) pins the bracket edges, the four ways a
-revision leaves the list, the server-rendered section, and the JSON twin.
+Attention has a time dimension and a scope, both found by an adversarial pass (Skip,
+2026-09-04) and both fixed before this shipped:
+- A mark only suppresses a revision if the mark came **after** it. Without that, one agree in
+  round one silenced every later revision to that block, in every round, forever. Same-second
+  rows are ordered by sidecar append index, the tie-break `/api/read-state` already uses.
+- A **reply** is re-bound to its thread root's block, so it is attention on that thread, not on
+  the block: answering a decision card says nothing about a separate revision to the same
+  sentence. A reply clears the revision it answers, and it still moves the bracket edge
+  (it proves he reached the block) — those are two different sets, `answered_threads` and
+  `reached`, and conflating them cost the real page 20 blocks of bracket.
+- A **soft-deleted edit row is not a soft-deleted change**: the trunk write happened at create
+  time and delete does not revert it, so deleting the row used to remove the change from every
+  list while leaving it in the document. Deleted edits carrying a `commit` are listed as
+  **withdrawn, still in the trunk**.
+- `resolved_by` no longer defaults to `mike`. An unnamed resolver is not credited as the
+  reader, or the list clears itself. It is client-asserted, exactly like every `author` on this
+  surface — a record of who claimed to resolve, not an authenticated fact.
+
+Still open, and named rather than hidden:
+- **The writer's real edit channel is not enforced.** The list only sees `type: 'edit'` rows.
+  A worker that edits the `.md` directly produces none, and `v2/dispatch-prompt-template.md`
+  currently *instructs* exactly that. Until the trunk is diffed against the sidecar, the list
+  is only as complete as the writer's discipline — which is the property 12b exists to remove.
+- **Sentence-level attention vs block-level suppression.** Marks carry `from`/`to` offsets and
+  edits carry `sentence_index`; neither is used. A mark on sentence 1 suppresses a revision to
+  sentence 4 of the same block.
+- **Block-id drift cuts both ways.** A retired id drops that mark from `reached`, which can
+  collapse the bracket edge and silently drop many rows, not just one.
+- **A round is not modelled.** The list is recomputed per render, so there is no persisted
+  artifact showing that a given round closed with a given list.
+
+Tests: `v2/tests/test_ringer_list.py` (19 cases) pins the bracket edges, the ways a revision
+leaves the list, the two empty states, one regression per fix above, the server-rendered
+section, and the JSON twin.
 
 ## "Waiting on you" inbox (2026-09-04) — the landing page
 

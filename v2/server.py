@@ -1057,13 +1057,61 @@ function updateCursorSentBanner(sentRecCount) {
   }
 }
 
+// The server renders every prose block as one <span class="mark-sentence"
+// data-from/data-to> per sentence (mark_layer_inner) in EVERY view — only the
+// classic dwell layer's BEHAVIOUR is view-gated, not the spans. So a deliberate
+// text selection inside a block can be snapped to whole sentences and reported
+// as a real code-point range in the block's normalized coordinate system.
+// This matters beyond display: `compute_ringer_list` treats a mark that spans a
+// whole block as attention on every sentence in it, so a payload that always
+// says from:0,to:null tells the ringer list Mike read a paragraph he glanced at.
+// Returns null (caller falls back to whole-block) unless the selection is a real
+// non-collapsed range inside `el` covering some but not all of its sentences —
+// a caret is not a reading, and selecting everything IS the whole block.
+function sentenceSpanInBlock(el) {
+  if (!el || !window.getSelection) return null;
+  const sel = window.getSelection();
+  if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return null;
+  const range = sel.getRangeAt(0);
+  const units = Array.from(el.querySelectorAll('.mark-sentence'));
+  if (units.length < 2) return null;
+  const hit = units.filter(u => {
+    const unitRange = document.createRange();
+    unitRange.selectNodeContents(u);
+    // Clip the selection to this sentence; if anything survives, it was covered.
+    try {
+      const clipped = range.cloneRange();
+      if (clipped.compareBoundaryPoints(Range.START_TO_START, unitRange) < 0) {
+        clipped.setStart(unitRange.startContainer, unitRange.startOffset);
+      }
+      if (clipped.compareBoundaryPoints(Range.END_TO_END, unitRange) > 0) {
+        clipped.setEnd(unitRange.endContainer, unitRange.endOffset);
+      }
+      return clipped.toString().trim().length > 0;
+    } catch (e) { return false; }
+  });
+  if (!hit.length || hit.length === units.length) return null;
+  const from = Math.min(...hit.map(u => Number(u.dataset.from)));
+  const to = Math.max(...hit.map(u => Number(u.dataset.to)));
+  if (!Number.isFinite(from) || !Number.isFinite(to) || to <= from) return null;
+  // The quote is the server's own per-sentence text (data-quote), joined by the
+  // single space `blockmap.norm` leaves between sentences — NOT normText.slice().
+  // from/to are Python CODE-POINT offsets and JS slice() counts UTF-16 code
+  // units, so one astral character (emoji; 434 of them across 215 estate docs)
+  // earlier in the block shifts the slice and the server refuses the mark 409.
+  const quote = hit.map(u => b64ToUtf8(u.dataset.quote)).join(' ');
+  return {from, to, quote};
+}
+
 function blockPayload(el) {
   if (!el) return {block_id: null, from: null, to: null, quote: null, block_text_sha: null};
+  const norm = b64ToUtf8(el.dataset.normText);
+  const span = sentenceSpanInBlock(el);
   return {
     block_id: el.dataset.blockId,
-    from: 0,
-    to: null,
-    quote: b64ToUtf8(el.dataset.normText),
+    from: span ? span.from : 0,
+    to: span ? span.to : null,
+    quote: span ? span.quote : norm,
     block_text_sha: el.dataset.blockSha,
   };
 }
@@ -2044,6 +2092,14 @@ body.v3-view.v3-terms-on a.term-link{color:#a3c9ff;text-decoration:underline dot
 body.v3-view .block-body.v3-inline-diff{cursor:pointer;}
 body.v3-view .v3-inline-diff del{background:#4a1f24;color:#f0a3ab;text-decoration:line-through;padding:0 2px;border-radius:2px;}
 body.v3-view .v3-inline-diff ins{background:#1f4a2a;color:#9cf0ac;text-decoration:none;padding:0 2px;border-radius:2px;}
+/* Sentence mark bar: raised by a text selection inside a block, so v3 has a way
+   to mark ONE sentence. Every other v3 affordance is block-scoped. */
+.v3-markbar{position:absolute;z-index:70;display:flex;gap:4px;padding:4px;border-radius:8px;
+  background:#181b21;border:1px solid #2a2d34;box-shadow:0 6px 18px rgba(0,0,0,.45);}
+.v3-markbar button{padding:3px 9px;border-radius:6px;border:1px solid #333;background:#1c1f26;
+  color:#e6e6e6;font-size:12px;cursor:pointer;}
+.v3-markbar button:hover{border-color:#2f6feb;}
+.v3-markbar button:disabled{opacity:.5;cursor:default;}
 """
 
 V3_JS = r"""
@@ -2908,12 +2964,86 @@ V3_JS = r"""
     btn.addEventListener('click', (e) => sendReaderSignal('done', e.currentTarget));
   }
 
+  // --- Sentence marks (2026-09-04) --------------------------------------
+  // v3 shipped with no sentence-level affordance at all: its comment box, its
+  // click-to-edit and its verdict buttons are all block-scoped, so every row it
+  // wrote carried from:0/to:null. `compute_ringer_list` reads a whole-block mark
+  // as attention on every sentence in the block, so an ack on a paragraph
+  // suppressed every revision inside it — the ringer list's cardinal failure
+  // direction. Selecting text now raises a bar that writes a real span
+  // (blockPayload/sentenceSpanInBlock, PAGE_JS, shared scope).
+  const MARKBAR_KINDS = [['agree','Agree'], ['ack','Ack'], ['clarify','Clarify'], ['strike','Strike']];
+  let markBar = null;
+
+  function hideMarkBar(){ if (markBar) { markBar.remove(); markBar = null; } }
+
+  function showMarkBar(wrap, rect){
+    hideMarkBar();
+    markBar = document.createElement('div');
+    markBar.className = 'v3-markbar';
+    markBar.innerHTML = MARKBAR_KINDS
+      .map(([k, label]) => `<button data-v3-mark="${k}">${KIND_META[k].glyph} ${label}</button>`)
+      .join('');
+    document.body.appendChild(markBar);
+    markBar.style.top = (window.scrollY + rect.top - markBar.offsetHeight - 8) + 'px';
+    markBar.style.left = (window.scrollX + rect.left) + 'px';
+    markBar.querySelectorAll('[data-v3-mark]').forEach(btn => {
+      // mousedown, not click: a click would first collapse the selection the
+      // payload is computed from.
+      btn.addEventListener('mousedown', async (e) => {
+        if (e.button !== 0) return;
+        e.preventDefault();
+        const payload = blockPayload(wrap);
+        // The bar exists only to write a span. If the selection is gone by the
+        // time the press lands — which is what a touch device does, dismissing
+        // the selection on touchstart before any synthesized mousedown — then
+        // posting anyway would write a WHOLE-BLOCK mark under a toast saying
+        // "one sentence", and a whole-block mark suppresses every revision in
+        // the paragraph. Refuse instead: an unavailable affordance is recoverable,
+        // a wrong record with a confident receipt is not.
+        if (payload.to === null) {
+          toast('Selection lost — select the sentence again to mark it.');
+          hideMarkBar();
+          return;
+        }
+        markBar.querySelectorAll('button').forEach(b => { b.disabled = true; });
+        try {
+          await postComment({anchor: wrap.dataset.anchor, snapshot: payload.quote,
+                             text: KIND_META[btn.dataset.v3Mark].label, type: 'mark',
+                             mark_kind: btn.dataset.v3Mark, strength: 1, ...payload});
+          toast(`${KIND_META[btn.dataset.v3Mark].label} — one sentence.`);
+        } catch (err) {
+          toast('Mark failed: ' + err.message);
+        }
+        hideMarkBar();
+        window.getSelection().removeAllRanges();
+      });
+    });
+  }
+
+  function wireSentenceMarks(){
+    document.addEventListener('selectionchange', () => {
+      const sel = window.getSelection();
+      if (!sel || sel.rangeCount === 0 || sel.isCollapsed) { hideMarkBar(); return; }
+      const range = sel.getRangeAt(0);
+      const wrap = (range.commonAncestorContainer.nodeType === 1
+        ? range.commonAncestorContainer
+        : range.commonAncestorContainer.parentElement)?.closest('.block-wrap');
+      // No span means no narrowing to offer — a whole-block selection already
+      // has a whole-block affordance (the comment box).
+      if (!wrap || !sentenceSpanInBlock(wrap)) { hideMarkBar(); return; }
+      showMarkBar(wrap, range.getBoundingClientRect());
+    });
+    window.addEventListener('scroll', hideMarkBar, {passive: true});
+  }
+
   document.addEventListener('DOMContentLoaded', async () => {
     document.body.classList.add('v3-view');
     wireSidebar();
     wireHeader();
     wirePanel();
     wireEndOfDoc();
+    wireSentenceMarks();
     initReadTracking();
     await fetchMarks();
     paintBlockIndicators();

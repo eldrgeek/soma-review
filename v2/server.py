@@ -4283,6 +4283,14 @@ def collect_waiting():
                 'reader_last_ts': max((r.get('timestamp') or '' for r in records
                                        if _waiting_by_mike(r)), default=''),
             })
+    # The page's own rule, published. Any consumer that recomputes "how much is
+    # waiting on him" from on_mike/ringers will drift from this page the first
+    # time the staleness window or the ringer/sidecar overlap rule changes —
+    # and the whole point of the 2026-09-04 fix was that two surfaces
+    # disagreed about the same round. So the rule ships with the data.
+    for r in rows:
+        r['stale'] = _waiting_is_stale(_waiting_round_ts(r))
+        r['ask_count'] = _waiting_ask_count(r)
     rows.sort(key=lambda r: (_waiting_ask_count(r) == 0,
                              _waiting_ask_count(r) == 0 and r['on_dee'] == 0,
                              _waiting_sort_ts(r)), reverse=False)
@@ -5619,7 +5627,16 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == '/api/waiting':
-            self._send_json(collect_waiting())
+            # Warm the ringer cache exactly as render_waiting and the sidebar
+            # do. Without this, an API-only consumer (the Pulse card job) could
+            # never promote an `unknown` row to a real count, because the only
+            # thing that ever warmed the cache was Mike opening this page — the
+            # act the card exists to make unnecessary. A row still counting is
+            # reported as `ringers_state: unknown`, and consumers must treat
+            # that as "not yet known", never as zero.
+            _rows = collect_waiting()
+            ringer_warm_async(_ringer_warm_targets(_rows))
+            self._send_json(_rows)
             return
 
         if path.startswith('/page/'):

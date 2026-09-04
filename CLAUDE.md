@@ -189,11 +189,86 @@ Attention has a time dimension and a scope, both found by an adversarial pass (S
   reader, or the list clears itself. It is client-asserted, exactly like every `author` on this
   surface — a record of who claimed to resolve, not an authenticated fact.
 
+### The trunk gap (2026-09-04) — the second witness
+
+The sidecar half above is complete only for changes that came through this surface. A worker
+that edits the `.md` file directly leaves no row (and `v2/dispatch-prompt-template.md` still
+*instructs* exactly that), so the list came back clean while the reader's text had changed
+under him — the same silent swallow one layer down, a list complete *if the writer behaved*.
+
+`compute_trunk_gap(route, workspace, reader)` uses git as the second witness. Every change
+applied through the surface is committed by `_git_commit_file` and records its sha on its row,
+so **commits touching the document in this round, minus the shas the sidecar claims, is exactly
+the set of changes made behind the surface's back.** Those become ringer rows with
+`why: 'unattributed'`, labelled *trunk change with no sidecar row*, with the same word-level
+del/ins diff the other rows use. An uncommitted working-tree edit is listed too — that is the
+state a half-finished direct edit is actually in.
+
+The round window runs from the reader's second-most-recent reader-signal (the close of his
+previous round), or from the earliest sidecar row if he has signalled at most once. It opens
+one second early, because sidecar stamps are second-resolution and the bias is over-report.
+
+Two things this got wrong first, both worth keeping in mind:
+- **Git's date parser does not honour a trailing `Z`** and reads the stamp as local time,
+  which shifted the window by the machine's UTC offset — four hours here, i.e. a whole round
+  going unreported. `_git_since()` hands git an explicit `+0000` stamp built with
+  `calendar.timegm` (`time.mktime` minus `time.timezone` is an hour out under DST).
+- **A commit under Mike's git identity proves nothing.** This laptop's `user.name` is
+  Mike Wolf, so every agent that commits here commits under his name. The first version
+  excluded "his own" commits and would have suppressed 7 of 7 real findings on
+  `soma/shared-cognition/mdp-agreed-model.md`. The flag is now carried onto the row as a
+  caveat and excludes nothing.
+
+When the check cannot run at all — the document is not in a git repo, or git fails — the
+section says so in those words. Silence there would be the page claiming a clean round it
+never verified, which is the exact over-claim 12b exists to stop.
+
+First run against the live agreed-model document: the sidecar half said `Ringer list (0)`;
+the trunk witness found **7 unrecorded rewrites of the ruling text Mike was reading**, every
+one of them a direct file write by an agent during the 09-03/09-04 runs.
+
+**The laundering hole, found by Skip and Codex independently and closed the same run.**
+`_git_commit_file` runs `git add <file>` — it stages the whole document, not the span it just
+wrote. So a direct edit left dirty in the working tree is swept into the *next* surface commit,
+whose sha a row then claims, and the gap check would have marked it accounted. That is not an
+edge case: an agent that edits the trunk directly is exactly an agent that does not commit.
+`_trunk_residue()` now checks a claimed commit's added words against what the claiming rows
+proposed; three or more words of residue (less is diff noise) rings the commit anyway, saying
+the commit carried text no row proposed.
+
+Other fixes from the same adversarial pass, each with a regression test:
+- A **`gave-up` signal does not close a round** (fork Q2 puts it mid-round), so only `done`
+  signals set the window's lower edge. Counting give-up would have called everything before it
+  checked.
+- The **revert commit sha is now stored on the row** (`revert_commit`). It was not, so Mike
+  reverting a change — his most deliberate act of attention — rang itself back at him as an
+  unrecorded trunk change, forever.
+- An **untracked document** reports `untracked`, not a clean round: `git status` says `??` for
+  the whole file, so a direct edit to it is invisible to both halves.
+- **Truncation is reported.** `-n50` is applied after `--since`, so a busy round could drop the
+  commit that mattered; the section now says the window was cut.
+- **`_git_since` returns `None`** on an unparseable stamp and forces `unavailable`, instead of
+  handing git a stamp it reads as local time — the exact four-hour shift the function exists to
+  prevent.
+- Diff header matching requires the **trailing space** (`--- `), or a deleted `---` front-matter
+  fence or horizontal rule is read as a header and dropped; and a working-tree entry is emitted
+  whenever the patch is non-empty, even when the changed lines are blank (deleting the blank
+  line between two paragraphs merges them, which is a real edit).
+- A sha shorter than **7 characters** never accounts for anything, and pathspecs are literal.
+
 Still open, and named rather than hidden:
-- **The writer's real edit channel is not enforced.** The list only sees `type: 'edit'` rows.
-  A worker that edits the `.md` directly produces none, and `v2/dispatch-prompt-template.md`
-  currently *instructs* exactly that. Until the trunk is diffed against the sidecar, the list
-  is only as complete as the writer's discipline — which is the property 12b exists to remove.
+- **A squash, rebase or amend rewrites shas**, so a sidecar row's recorded sha can stop
+  matching any commit in history and its change gets rung as unattributed. Over-report, so it
+  fails in the safe direction, but it is noise.
+- **A change applied with no commit is invisible to both halves.** `_git_commit_file` returns
+  `None` when git is unavailable or the repo refuses the commit; the row then claims no sha and
+  the trunk shows no commit either. Worse, the file stays dirty, so every later render reports
+  the surface's own write as an uncommitted direct edit.
+- **A change that arrives by merge is not seen.** `git log --since -- <path>` simplifies history,
+  so a merge commit TREESAME to a parent is omitted while the side-branch commit carries its own
+  older date. `--full-history` is the fix, not yet taken.
+- **Cost.** Up to 4+N git subprocesses per v3 render (0.4s on the real agreed-model page). The
+  cache key that would fix it is exactly (HEAD sha, sidecar mtime, file mtime).
 - **Sentence-level attention vs block-level suppression.** Marks carry `from`/`to` offsets and
   edits carry `sentence_index`; neither is used. A mark on sentence 1 suppresses a revision to
   sentence 4 of the same block.
@@ -202,7 +277,8 @@ Still open, and named rather than hidden:
 - **A round is not modelled.** The list is recomputed per render, so there is no persisted
   artifact showing that a given round closed with a given list.
 
-Tests: `v2/tests/test_ringer_list.py` (19 cases) pins the bracket edges, the ways a revision
+Tests: `v2/tests/test_ringer_list.py` (19 cases) and `v2/tests/test_trunk_gap.py` (10 cases,
+including the two bugs above) pin the bracket edges, the ways a revision
 leaves the list, the two empty states, one regression per fix above, the server-rendered
 section, and the JSON twin.
 

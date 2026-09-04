@@ -17,6 +17,7 @@ import time
 import uuid
 import hashlib
 import datetime
+import calendar
 import difflib
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -4316,6 +4317,28 @@ def compute_ringer_list(route_path, workspace=DEFAULT_WORKSPACE, reader=RINGER_R
             'replace': bool(r.get('replace')), 'status': r.get('status') or 'queued',
             'block_text': text_of.get(r.get('block_id'), ''),
         })
+    # The sidecar half is complete only if every change came through the review
+    # surface. The trunk gap is the second witness for the ones that did not.
+    try:
+        gap = compute_trunk_gap(route_path, workspace, reader, rows=rows, all_rows=all_rows)
+    except Exception as exc:  # noqa: BLE001 - a missing witness is not a clean round
+        gap = {'status': 'unavailable', 'reason': str(exc), 'since': None, 'basis': 'none',
+               'commits': [], 'unattributed': 0, 'accounted': 0, 'by_reader': 0}
+    for c in gap['commits']:
+        ringers.append({
+            'id': c['sha'] or 'worktree',
+            'block_id': None, 'position': None,
+            'author': c['author'], 'timestamp': (c['date'] or '')[:19],
+            'why': 'unattributed',
+            'reason': (f"{c['subject']} ({'working tree' if c['uncommitted'] else c['sha']}) — "
+                       f"this changed the document and no row on this surface claims it, so no "
+                       f"other list on this page can see it."
+                       + (" Committed under your own git identity, which proves nothing here: "
+                          "this machine commits agent work under your name too."
+                          if c.get('as_reader') else "")),
+            'before': c['before'], 'after': c['after'],
+            'replace': False, 'status': 'in-trunk', 'block_text': '',
+        })
     ringers.sort(key=lambda x: (x['position'] if x['position'] is not None else 10**6,
                                 x['timestamp'] or ''))
     listed_ids = {x['id'] for x in ringers}
@@ -4341,6 +4364,8 @@ def compute_ringer_list(route_path, workspace=DEFAULT_WORKSPACE, reader=RINGER_R
             'blocks_total': len(blocks),
         },
         'ringers': ringers,
+        'trunk_gap': gap,
+        'unattributed': sum(1 for x in ringers if x['why'] == 'unattributed'),
         'swallowed': sum(1 for x in ringers if x['why'] == 'swallowed'),
         'flagged': sum(1 for x in ringers if x['why'] == 'flagged'),
         'withdrawn': sum(1 for x in ringers if x['why'] == 'withdrawn'),
@@ -4348,6 +4373,279 @@ def compute_ringer_list(route_path, workspace=DEFAULT_WORKSPACE, reader=RINGER_R
         'outside_bracket': outside,
         'marked_blocks': len(marked),
     }
+
+
+# --- The trunk gap ---------------------------------------------------------
+#
+# The machine half above is complete only for changes that left a sidecar row.
+# A writer who edits the Markdown file directly — an agent with the Edit tool,
+# a `sed` in a dispatched job, a hand fix in an editor — changes the reader's
+# text with no row at all, so `compute_ringer_list` cannot see it and the list
+# comes back clean. That is the same silent swallow 12b exists to forbid, one
+# layer down: the list was complete *if the writer behaved*.
+#
+# The trunk itself is the second witness. Every sidecar change that lands is
+# committed by `_git_commit_file` and records its sha on the row, so the set of
+# commits touching the document minus the set of shas the sidecar claims is
+# exactly the set of changes made behind the review surface's back. The
+# working tree adds one more case: an edit not yet committed at all.
+#
+# Bias, as everywhere in 12b: over-report. Being shown a change the reader
+# already knew about costs him a glance; one that was never named costs him
+# the ruling.
+
+_TRUNK_GAP_MAX_COMMITS = 50
+
+
+def _git_out(repo_root, args, timeout=10):
+    try:
+        out = subprocess.run(['git', '-C', repo_root] + args,
+                             capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return None, str(exc)
+    if out.returncode != 0:
+        return None, (out.stderr or '').strip()
+    return out.stdout, None
+
+
+def _trunk_diff_texts(patch):
+    """Collapse a unified diff into (before, after) word streams, so the row can
+    show the change itself through the same del/ins renderer the sidecar rows
+    use rather than a description of it."""
+    before, after = [], []
+    for line in (patch or '').splitlines():
+        # Header lines are `--- a/x` / `+++ b/x` — WITH a trailing space. Matching
+        # on the bare prefix also eats a deleted `---` front-matter fence or
+        # horizontal rule, which is exactly the kind of edit that must be seen.
+        if line.startswith('--- ') or line.startswith('+++ ') or line in ('---', '+++'):
+            continue
+        if line.startswith('diff --git') or line.startswith('@@') or line.startswith('index '):
+            continue
+        if line.startswith('-'):
+            before.append(line[1:].strip())
+        elif line.startswith('+'):
+            after.append(line[1:].strip())
+    return (' '.join(x for x in before if x)[:800],
+            ' '.join(x for x in after if x)[:800])
+
+
+_TRUNK_READER_EMAILS = ('mw@mike-wolf.com', 'mike@embeddedsystemsresearch.org')
+
+
+def _trunk_author_is_reader(name, email, reader=RINGER_READER):
+    """Does this commit CLAIM to be the reader's own hand?
+
+    Only a claim, never a verdict: this laptop's `user.name` is Mike Wolf, so
+    every agent that commits here commits under his name. Excluding commits by
+    "the reader" would therefore suppress almost exactly the set of changes
+    this list exists to name — checked against the real
+    `soma/shared-cognition/mdp-agreed-model.md`, where 7 of 7 unattributed
+    commits carried his identity and none were typed by him. So the flag is
+    carried onto the row as a caveat and excludes nothing.
+    """
+    name = (name or '').strip().lower()
+    email = (email or '').strip().lower()
+    if reader == RINGER_READER:
+        return email in _TRUNK_READER_EMAILS or name in ('mike wolf', 'mike', 'mikewolf')
+    return reader.strip().lower() in f'{name} {email}'
+
+
+def _trunk_residue(added_text, owner_rows):
+    """What a commit added beyond what its claiming sidecar rows proposed.
+
+    Word-level, order-insensitive and deliberately crude: the question is only
+    whether the commit carried text nobody recorded, not what that text means.
+    Words the rows proposed are struck out one occurrence at a time; what is
+    left is text that entered the document with no row behind it."""
+    proposed = []
+    for r in owner_rows:
+        proposed.extend(blockmap.norm(r.get('proposed') or '').split())
+        proposed.extend(blockmap.norm(r.get('snapshot') or '').split())
+    pool = {}
+    for w in proposed:
+        pool[w] = pool.get(w, 0) + 1
+    left = []
+    for w in blockmap.norm(added_text or '').split():
+        if pool.get(w):
+            pool[w] -= 1
+        else:
+            left.append(w)
+    # A word or two of residue is diff noise (a moved comma, a re-wrapped line).
+    # Three or more is a sentence someone wrote.
+    return ' '.join(left) if len(left) >= 3 else ''
+
+
+def _git_since(stamp):
+    """Sidecar stamps are `%Y-%m-%dT%H:%M:%SZ`. Git's approxidate parser does
+    not reliably honour a trailing `Z` and will read it as local time, which
+    silently shifts the window by the machine's UTC offset — four hours on this
+    laptop, i.e. a whole round of changes going unreported. Hand it an explicit
+    `+0000` stamp, one second early so a commit made in the same second as the
+    round's opening mark falls inside the window."""
+    try:
+        t = time.strptime(stamp, '%Y-%m-%dT%H:%M:%SZ')
+        # timegm, not mktime: mktime reads the struct as local time, and
+        # `time.timezone` does not carry DST, so the naive correction is an
+        # hour out for half the year.
+        return time.strftime('%Y-%m-%d %H:%M:%S +0000',
+                             time.gmtime(calendar.timegm(t) - 1))
+    except (TypeError, ValueError):
+        return None
+
+
+def compute_trunk_gap(route_path, workspace=DEFAULT_WORKSPACE, reader=RINGER_READER,
+                      rows=None, all_rows=None):
+    """Changes to the trunk in this round that no sidecar row accounts for.
+
+    Returns {status, reason, since, basis, commits:[...], unattributed,
+    accounted, by_reader}. `status` is 'ok', 'no-round' (no round to report on
+    yet), 'untracked' (the document is not in a git repo, so the trunk keeps no
+    history and this check cannot run), or 'unavailable' (git failed)."""
+    empty = {'status': 'no-round', 'reason': '', 'since': None, 'basis': 'none',
+             'commits': [], 'unattributed': 0, 'accounted': 0, 'by_reader': 0}
+    if all_rows is None:
+        all_rows = read_comments(route_path, workspace)
+    if rows is None:
+        rows = [c for c in all_rows if not c.get('deleted')]
+
+    # The window is this round: from the close of the previous round (the
+    # reader's second-most-recent signal) to now. With only one signal or none,
+    # the round runs from the first sidecar row on the page — the earliest
+    # moment anyone was reviewing this document at all.
+    # Only a `done` signal closes a round. `gave-up` is mid-round by design
+    # (fork Q2: the click records the block that lost him), so counting it as a
+    # round boundary would shrink the window to the part of the round AFTER he
+    # gave up and call everything before it checked.
+    signals = [r for r in rows
+               if r.get('type') == 'mark' and r.get('mark_kind') == 'reader-signal'
+               and r.get('signal') == 'done' and _ringer_is_reader(r, reader)]
+    signals.sort(key=lambda r: (r.get('timestamp') or ''))
+    stamps = [r.get('timestamp') for r in all_rows if r.get('timestamp')]
+    if len(signals) >= 2:
+        since, basis = signals[-2].get('timestamp'), 'the close of your previous round'
+    elif stamps:
+        since, basis = min(stamps), 'the first mark on this page'
+    else:
+        return empty
+
+    try:
+        fs_path = resolve_page(route_path, workspace)
+    except Exception as exc:  # noqa: BLE001
+        return dict(empty, status='unavailable', reason=str(exc))
+    repo_root = _git_repo_root(fs_path)
+    if not repo_root:
+        return dict(empty, status='untracked', since=since, basis=basis,
+                    reason='the document is not inside a git repository, so the trunk keeps '
+                           'no history to compare the sidecar against')
+    rel = os.path.relpath(os.path.realpath(fs_path), os.path.realpath(repo_root))
+
+    since_arg = _git_since(since)
+    if since_arg is None:
+        # Guessing here re-introduces the exact four-hour window shift
+        # `_git_since` exists to prevent, and it would do it silently.
+        return dict(empty, status='unavailable', since=since, basis=basis,
+                    reason=f'the round stamp {since!r} is not in the sidecar format, so the '
+                           f'window cannot be computed without guessing a timezone')
+
+    # An untracked document has no history to compare against, and `git status`
+    # reports `??` for the whole file — so a direct edit to it is invisible to
+    # both halves. That is an unverifiable trunk, not a clean one.
+    status_out, status_err = _git_out(repo_root, ['--literal-pathspecs', 'status',
+                                                  '--porcelain', '--', rel])
+    if status_out is None:
+        return dict(empty, status='unavailable', since=since, basis=basis,
+                    reason=f'git status failed ({status_err or "no reason given"})')
+    if status_out.lstrip().startswith('??'):
+        return dict(empty, status='untracked', since=since, basis=basis,
+                    reason='the document is not tracked by git, so the trunk keeps no history '
+                           'to compare the sidecar against')
+
+    fmt = '%H\x1f%an\x1f%ae\x1f%aI\x1f%s'
+    out, err = _git_out(repo_root, ['--literal-pathspecs', 'log', f'--since={since_arg}',
+                                    f'-n{_TRUNK_GAP_MAX_COMMITS + 1}',
+                                    f'--format={fmt}', '--', rel])
+    if out is None:
+        return dict(empty, status='unavailable', since=since, basis=basis, reason=err or 'git failed')
+    lines = [l for l in out.splitlines() if l.strip()]
+    truncated = len(lines) > _TRUNK_GAP_MAX_COMMITS
+    lines = lines[:_TRUNK_GAP_MAX_COMMITS]
+
+    # A sha shorter than 7 characters is not an identifier, it is a prefix that
+    # matches one commit in sixteen — a junk value in one row would account for
+    # a share of all history.
+    claimed = {}
+    for r in all_rows:
+        for field in ('commit', 'revert_commit'):
+            sha = (r.get(field) or '').strip().lower()
+            if len(sha) >= 7:
+                claimed.setdefault(sha, []).append(r)
+
+    def _claimants(low):
+        hit = claimed.get(low)
+        if hit:
+            return hit
+        for c, rows_for in claimed.items():
+            if low.startswith(c) or c.startswith(low):
+                return rows_for
+        return None
+
+    commits, accounted, by_reader, laundered = [], 0, 0, 0
+    for line in lines:
+        parts = line.split('\x1f')
+        if len(parts) != 5:
+            continue
+        sha, name, email, date, subject = parts
+        low = sha.lower()
+        patch, _e = _git_out(repo_root, ['--literal-pathspecs', 'show', sha,
+                                         '--format=', '--unified=0', '--', rel])
+        before, after = _trunk_diff_texts(patch)
+        owners = _claimants(low)
+        if owners is not None:
+            # `_git_commit_file` runs `git add <file>` — it stages the WHOLE
+            # document, not the span it just wrote. So a direct edit left dirty
+            # in the working tree is swept into the next surface commit and
+            # would be laundered into "accounted for" by its sha. Check the
+            # added text against what the claiming rows actually proposed; a
+            # residue means this commit carried more than the surface wrote.
+            residue = _trunk_residue(after, owners)
+            if not residue:
+                accounted += 1
+                continue
+            laundered += 1
+            subject = (f'{subject} — carried text no row proposed, staged into a recorded '
+                       f'commit (git add stages the whole file)')
+            after = residue
+            before = ''
+        as_reader = _trunk_author_is_reader(name, email, reader)
+        by_reader += 1 if as_reader else 0
+        commits.append({'sha': sha[:12], 'author': name, 'date': date, 'subject': subject,
+                        'before': before, 'after': after, 'uncommitted': False,
+                        'as_reader': as_reader})
+
+    # An edit sitting in the working tree is the same gap with the commit step
+    # missing — and it is the state a half-finished direct edit is actually in.
+    if status_out.strip():
+        patch, diff_err = _git_out(repo_root, ['--literal-pathspecs', 'diff', 'HEAD',
+                                               '--unified=0', '--', rel])
+        if patch is None:
+            return dict(empty, status='unavailable', since=since, basis=basis,
+                        commits=commits, unattributed=len(commits), accounted=accounted,
+                        reason=f'the working tree is dirty and git diff failed '
+                               f'({diff_err or "no reason given"}), so an uncommitted direct '
+                               f'edit cannot be read')
+        before, after = _trunk_diff_texts(patch)
+        if (patch or '').strip():
+            # Non-empty patch, possibly empty texts: a blank-line-only change
+            # merges two paragraphs and is a real edit to the document.
+            commits.append({'sha': None, 'author': 'working tree', 'date': '',
+                            'subject': 'uncommitted edit to the trunk, not committed at all',
+                            'before': before, 'after': after, 'uncommitted': True,
+                            'as_reader': False})
+
+    return {'status': 'ok', 'reason': '', 'since': since, 'basis': basis,
+            'commits': commits, 'unattributed': len(commits), 'truncated': truncated,
+            'accounted': accounted, 'by_reader': by_reader, 'laundered': laundered,
+            'window_commits': len(lines)}
 
 
 def _ringer_diff_html(before, after):
@@ -4383,6 +4681,7 @@ RINGER_CSS = """
   padding:1px 7px;border-radius:9px;border:1px solid #5a4a24;color:#e8d9a8;margin-right:8px;}
 .ringer-tag.flagged{border-color:#6a3a3a;color:#f0b8b8;}
 .ringer-tag.withdrawn{border-color:#6a3a3a;color:#f0b8b8;}
+.ringer-tag.unattributed{border-color:#6a4a2a;color:#f0cf9a;}
 .ringer-meta{font-size:12px;color:#8d8470;}
 .ringer-diff{margin-top:7px;font-size:14px;line-height:1.6;color:#d8d2c4;}
 .ringer-diff del{color:#c98a8a;text-decoration:line-through;}
@@ -4408,6 +4707,32 @@ def render_ringer_section(ringer):
                f"inside it. Every revision below is one their bracket swallowed without an "
                f"explicit mark, named back to them. Generated from the sidecar; it cannot be "
                f"short by omission.")
+    gap = ringer.get('trunk_gap') or {}
+    if gap.get('status') == 'ok':
+        if gap['unattributed']:
+            why += (f" {gap['unattributed']} change(s) reached the document since "
+                    f"{gap['basis']} with no row on this surface at all — a direct file "
+                    f"write, invisible to every other list here. They are listed below.")
+        elif gap.get('window_commits'):
+            why += (f" The trunk was also checked against the sidecar since {gap['basis']}: "
+                    f"{gap['accounted']} committed change(s) all trace to a row here, so "
+                    f"nothing reached the document behind this surface's back.")
+        else:
+            why += (f" No commit has touched this file since {gap['basis']}, so the trunk "
+                    f"witness had nothing to check — which is not the same as every change "
+                    f"tracing to a row.")
+        if gap.get('truncated'):
+            why += (f" The window held more than {_TRUNK_GAP_MAX_COMMITS} commits and was cut "
+                    f"to the newest {_TRUNK_GAP_MAX_COMMITS}; older ones in this round were "
+                    f"NOT checked.")
+        if gap.get('laundered'):
+            why += (f" {gap['laundered']} of them is recorded by a row that does not account "
+                    f"for all its text: `git add` stages the whole file, so a direct edit left "
+                    f"dirty gets swept into the next recorded commit.")
+    elif gap.get('status') in ('untracked', 'unavailable'):
+        why += (f" The trunk could NOT be checked against the sidecar — "
+                f"{_html.escape(gap.get('reason') or 'git was unavailable')}. A change made "
+                f"by writing the file directly would not appear in this list.")
     if ringer.get('outside_bracket'):
         why += (f" {ringer['outside_bracket']} further revision(s) now sit below the bracket "
                 f"edge on the current page and are not listed here — a rewritten block can "
@@ -4415,10 +4740,13 @@ def render_ringer_section(ringer):
                 f"backstop for that.")
     rows_html = []
     for r in ringer['ringers']:
-        tag = r['why'] if r['why'] in ('flagged', 'withdrawn') else 'swallowed'
+        tag = r['why'] if r['why'] in ('flagged', 'withdrawn', 'unattributed') else 'swallowed'
         label = {'flagged': 'writer-flagged',
-                 'withdrawn': 'withdrawn, still in the trunk'}.get(r['why'], 'bracket swallowed')
-        pos = f"block {r['position'] + 1}" if r['position'] is not None else 'unanchored'
+                 'withdrawn': 'withdrawn, still in the trunk',
+                 'unattributed': 'trunk change with no sidecar row'}.get(r['why'],
+                                                                        'bracket swallowed')
+        pos = ('in the trunk' if r['why'] == 'unattributed'
+               else f"block {r['position'] + 1}" if r['position'] is not None else 'unanchored')
         reason = (f"<div class=\"ringer-meta\">{_html.escape(r['reason'])}</div>"
                   if r['reason'] else '')
         rows_html.append(
@@ -4426,17 +4754,19 @@ def render_ringer_section(ringer):
             f'<span class="ringer-tag {tag}">{label}</span>'
             f'<span class="ringer-meta">{pos} · by {_html.escape(r["author"] or "?")}'
             f'{" · replace" if r["replace"] else ""} · {_html.escape((r["timestamp"] or "")[:19])}</span> '
-            f'<a class="ringer-goto" href="#{_html.escape(r["block_id"] or "")}">go to block</a>'
-            f'<div class="ringer-diff">{_ringer_diff_html(r["before"], r["after"])}</div>'
-            f'{reason}</div>'
+            + (f'<a class="ringer-goto" href="#{_html.escape(r["block_id"])}">go to block</a>'
+               if r['block_id'] else '')
+            + f'<div class="ringer-diff">{_ringer_diff_html(r["before"], r["after"])}</div>'
+            + f'{reason}</div>'
         )
     if not rows_html:
         # Two different empties, and conflating them would be the same
         # over-claim the ringer list exists to prevent: "everything was
         # handled" is a stronger statement than "there was nothing to handle".
         rows_html.append(
-            '<p class="ringer-empty">No one revised your text on this page, so there was '
-            'nothing for the bracket to swallow.</p>' if not ringer['revisions'] else
+            '<p class="ringer-empty">No one revised your text on this page through this '
+            'surface, so there was nothing for the bracket to swallow.</p>'
+            if not ringer['revisions'] else
             '<p class="ringer-empty">Nothing was swallowed this round: every revision inside '
             'the bracket was marked, settled or reverted by the reader.</p>')
     return (f'<section class="ringer-list" id="ringer-list">'
@@ -5117,7 +5447,11 @@ class Handler(BaseHTTPRequestHandler):
             except NotFoundError:
                 self._send_json({'error': 'unknown page'}, status=404)
                 return
+            # The revert writes and commits. Without the sha on the row, the
+            # trunk witness sees a commit no row claims and rings the reader's
+            # own revert back at him as an unrecorded change.
             update_comment(page, mark_id, {'status': 'done', 'reverted': True,
+                                           'revert_commit': result.get('commit'),
                                            'resolved_by': resolver_author}, workspace)
             self._send_json({
                 'ok': True, 'reverted': True,

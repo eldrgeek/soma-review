@@ -207,6 +207,18 @@ class RingerListTests(unittest.TestCase):
         self.assertEqual(1, ringer['outside_bracket'])
         self.assertIn('below the bracket edge', server.render_ringer_section(ringer))
 
+    def test_two_empties_are_worded_differently(self):
+        """"Everything was handled" is a stronger claim than "there was nothing
+        to handle" — conflating them is the over-claim this list exists to stop."""
+        self._mark(1)
+        self._mark(3)
+        self.assertIn('nothing for the bracket to swallow',
+                      server.render_ringer_section(server.compute_ringer_list('docs/page.md')))
+        self._revision(2, 'Bravo two.', 'Bravo two, revised.')
+        self._mark(2)
+        self.assertIn('Nothing was swallowed this round',
+                      server.render_ringer_section(server.compute_ringer_list('docs/page.md')))
+
     def test_api_ringer_requires_a_page(self):
         try:
             self._get('/api/ringer')

@@ -4380,9 +4380,14 @@ def render_ringer_section(ringer):
             f'{reason}</div>'
         )
     if not rows_html:
-        rows_html.append('<p class="ringer-empty">Nothing was swallowed this round: every '
-                         'revision inside the bracket was marked, settled or reverted by the '
-                         'reader.</p>')
+        # Two different empties, and conflating them would be the same
+        # over-claim the ringer list exists to prevent: "everything was
+        # handled" is a stronger statement than "there was nothing to handle".
+        rows_html.append(
+            '<p class="ringer-empty">No one revised your text on this page, so there was '
+            'nothing for the bracket to swallow.</p>' if not ringer['revisions'] else
+            '<p class="ringer-empty">Nothing was swallowed this round: every revision inside '
+            'the bracket was marked, settled or reverted by the reader.</p>')
     return (f'<section class="ringer-list" id="ringer-list">'
             f'<h2>Ringer list ({ringer["swallowed"] + ringer["flagged"]})</h2>'
             f'<p class="ringer-why">{why}</p>' + ''.join(rows_html) + '</section>')

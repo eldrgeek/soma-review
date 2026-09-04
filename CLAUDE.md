@@ -171,7 +171,7 @@ settling one's own change does not clear it from the list. Rows written before 2
 no `resolved_by`, so a revision settled before then still shows as swallowed — over-reporting,
 per the stated bias.
 
-Tests: `v2/tests/test_ringer_list.py` (14 cases) pins the bracket edges, the four ways a
+Tests: `v2/tests/test_ringer_list.py` (15 cases) pins the bracket edges, the four ways a
 revision leaves the list, the server-rendered section, and the JSON twin.
 
 ## "Waiting on you" inbox (2026-09-04) — the landing page

@@ -7,6 +7,7 @@ persistent comments. Stdlib only (http.server + json), no external deps.
 
 See soma-review/CLAUDE.md and README.md for the API and sidecar format.
 """
+import copy
 import html as _html
 import json
 import os
@@ -3423,12 +3424,14 @@ def apply_sentence_change(route_path, workspace, mark, author_label='claude'):
     with open(fs_path, 'w', encoding='utf-8') as f:
         f.write(new_src)
     commit_sha = None
+    commit_err = None
     repo_root = _git_repo_root(fs_path)
     if repo_root:
         message = f"mdp: change {mark.get('id')} on {route_path} ({author_label})"
-        commit_sha, _err = _git_commit_file(repo_root, fs_path, message)
+        commit_sha, commit_err = _git_commit_file(repo_root, fs_path, message)
     result = _rerender_block(route_path, workspace, fs_path, new_src, block_id, block)
     result['commit'] = commit_sha
+    result['commit_error'] = commit_err
     result['sentence_index'] = sentence_index
     return result
 
@@ -3470,12 +3473,14 @@ def apply_sentence_revert(route_path, workspace, mark):
     with open(fs_path, 'w', encoding='utf-8') as f:
         f.write(new_src)
     commit_sha = None
+    commit_err = None
     repo_root = _git_repo_root(fs_path)
     if repo_root:
         message = f"mdp: revert {mark.get('id')} on {route_path} (Mike)"
-        commit_sha, _err = _git_commit_file(repo_root, fs_path, message)
+        commit_sha, commit_err = _git_commit_file(repo_root, fs_path, message)
     result = _rerender_block(route_path, workspace, fs_path, new_src, block_id, block)
     result['commit'] = commit_sha
+    result['commit_error'] = commit_err
     result['sentence_index'] = sentence_index
     return result
 
@@ -4330,9 +4335,15 @@ def compute_ringer_list(route_path, workspace=DEFAULT_WORKSPACE, reader=RINGER_R
             'block_id': None, 'position': None,
             'author': c['author'], 'timestamp': (c['date'] or '')[:19],
             'why': 'unattributed',
+            # A stranded surface write IS claimed by a row — the commit failed,
+            # that is all. Saying "no row claims it" there would be false, and
+            # would send the reader hunting for an author who is on the page.
             'reason': (f"{c['subject']} ({'working tree' if c['uncommitted'] else c['sha']}) — "
-                       f"this changed the document and no row on this surface claims it, so no "
-                       f"other list on this page can see it."
+                       + ("this changed the document and the trunk keeps no record of it, so it "
+                          "cannot be checked against history."
+                          if c.get('surface_write') else
+                          "this changed the document and no row on this surface claims it, so no "
+                          "other list on this page can see it.")
                        + (" Committed under your own git identity, which proves nothing here: "
                           "this machine commits agent work under your name too."
                           if c.get('as_reader') else "")),
@@ -4450,7 +4461,7 @@ def _trunk_author_is_reader(name, email, reader=RINGER_READER):
     return reader.strip().lower() in f'{name} {email}'
 
 
-def _trunk_residue(added_text, owner_rows):
+def _trunk_residue(added_text, owner_rows, floor=3):
     """What a commit added beyond what its claiming sidecar rows proposed.
 
     Word-level, order-insensitive and deliberately crude: the question is only
@@ -4471,8 +4482,11 @@ def _trunk_residue(added_text, owner_rows):
         else:
             left.append(w)
     # A word or two of residue is diff noise (a moved comma, a re-wrapped line).
-    # Three or more is a sentence someone wrote.
-    return ' '.join(left) if len(left) >= 3 else ''
+    # Three or more is a sentence someone wrote. `floor` drops to 1 on the
+    # DELETED side, where the noise argument does not hold: a two-word deletion
+    # nobody proposed ("Charlie three.") is a removal from the reader's document,
+    # and swallowing it is how a deletion inherits the "this was us" label.
+    return ' '.join(left) if len(left) >= floor else ''
 
 
 def _git_since(stamp):
@@ -4491,6 +4505,23 @@ def _git_since(stamp):
                              time.gmtime(calendar.timegm(t) - 1))
     except (TypeError, ValueError):
         return None
+
+
+# One v3 render costs up to 54 git subprocesses and ~0.4s of trunk-gap work, and
+# a reader refreshing a page changes none of its inputs. Key the answer on
+# everything that can change it — repo HEAD, the working tree's own state, the
+# sidecar's mtime and size, and the document's — so a stale entry is only
+# possible if git, the sidecar and the file all report unchanged.
+_TRUNK_GAP_CACHE = {}
+_TRUNK_GAP_CACHE_MAX = 64
+
+
+def _stat_key(path):
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_mtime_ns, st.st_size)
 
 
 def compute_trunk_gap(route_path, workspace=DEFAULT_WORKSPACE, reader=RINGER_READER,
@@ -4539,6 +4570,24 @@ def compute_trunk_gap(route_path, workspace=DEFAULT_WORKSPACE, reader=RINGER_REA
                            'no history to compare the sidecar against')
     rel = os.path.relpath(os.path.realpath(fs_path), os.path.realpath(repo_root))
 
+    head, _head_err = _git_out(repo_root, ['rev-parse', 'HEAD'])
+    # `rows`/`all_rows` are parameters, so the sidecar's mtime is not the whole
+    # input — a caller that hands in a filtered or synthesized row set computes
+    # a different answer. Digest what the answer actually reads off the rows.
+    rows_digest = hashlib.sha256('\x1f'.join(
+        f"{r.get('commit')}|{r.get('revert_commit')}|{r.get('commit_error')}|"
+        f"{r.get('timestamp')}|{r.get('proposed')}|{r.get('snapshot')}|{r.get('author')}"
+        for r in all_rows).encode('utf-8')).hexdigest()
+    cache_key = (repo_root, rel, route_path, workspace, reader, since,
+                 (head or '').strip(), rows_digest, _stat_key(fs_path),
+                 _stat_key(sidecar_path(route_path, workspace)))
+    # A HEAD that could not be read is a key that does not move when HEAD does.
+    # Never serve or store an answer under it.
+    cacheable = bool((head or '').strip())
+    hit = _TRUNK_GAP_CACHE.get(cache_key) if cacheable else None
+    if hit is not None:
+        return copy.deepcopy(hit)
+
     since_arg = _git_since(since)
     if since_arg is None:
         # Guessing here re-introduces the exact four-hour window shift
@@ -4560,8 +4609,17 @@ def compute_trunk_gap(route_path, workspace=DEFAULT_WORKSPACE, reader=RINGER_REA
                     reason='the document is not tracked by git, so the trunk keeps no history '
                            'to compare the sidecar against')
 
-    fmt = '%H\x1f%an\x1f%ae\x1f%aI\x1f%s'
-    out, err = _git_out(repo_root, ['--literal-pathspecs', 'log', f'--since={since_arg}',
+    # `--full-history`, and the commit date (`%cI`) rather than the author date.
+    # Default history simplification drops a merge that is TREESAME to one of
+    # its parents and follows that parent instead — so a writer who edits the
+    # document on a branch and merges it in after the round opens is invisible:
+    # the merge is simplified away and the side commit it points at carries its
+    # own older date, outside the window. `--full-history` keeps the merge, and
+    # merges are diffed against their first parent below so one that changed
+    # nothing along this line of history is dropped again.
+    fmt = '%H\x1f%an\x1f%ae\x1f%cI\x1f%s\x1f%P'
+    out, err = _git_out(repo_root, ['--literal-pathspecs', 'log', '--full-history',
+                                    f'--since={since_arg}',
                                     f'-n{_TRUNK_GAP_MAX_COMMITS + 1}',
                                     f'--format={fmt}', '--', rel])
     if out is None:
@@ -4589,17 +4647,71 @@ def compute_trunk_gap(route_path, workspace=DEFAULT_WORKSPACE, reader=RINGER_REA
                 return rows_for
         return None
 
-    commits, accounted, by_reader, laundered = [], 0, 0, 0
+    # Two passes on purpose. A merge and the side commit it carried describe one
+    # change, and `git log` hands them back newest-first — so whether a row is a
+    # duplicate of another cannot be decided until every candidate has been
+    # read, and an *accounted* side commit has to be able to account for its own
+    # merge (the surface records the side commit's sha, never the merge's).
+    records, probe_failures = [], []
     for line in lines:
         parts = line.split('\x1f')
-        if len(parts) != 5:
+        if len(parts) != 6:
             continue
-        sha, name, email, date, subject = parts
+        sha, name, email, date, subject, parents = parts
         low = sha.lower()
-        patch, _e = _git_out(repo_root, ['--literal-pathspecs', 'show', sha,
-                                         '--format=', '--unified=0', '--', rel])
+        parent_shas = parents.split()
+        is_merge = len(parent_shas) > 1
+        if is_merge:
+            # `git show` on a merge prints no diff at all by default, so the
+            # merge that carried a branch's rewrite into the trunk would read as
+            # an empty change. Diff it against its first parent: that is exactly
+            # what the merge did to this line of history.
+            patch, perr = _git_out(repo_root, ['--literal-pathspecs', 'diff',
+                                               parent_shas[0], sha, '--unified=0', '--', rel])
+        else:
+            patch, perr = _git_out(repo_root, ['--literal-pathspecs', 'show', sha,
+                                               '--format=', '--unified=0', '--', rel])
+        if patch is None:
+            # A subprocess that failed is not a commit that changed nothing.
+            # Dropping it here (or listing it with an empty diff) would let a
+            # timeout or an index lock print "everything traces to a row".
+            probe_failures.append(f'{sha[:12]} ({perr or "no reason given"})')
+            continue
+        if is_merge and not patch.strip():
+            continue  # the merge changed nothing along this line of history
         before, after = _trunk_diff_texts(patch)
-        owners = _claimants(low)
+        if is_merge:
+            subject = f'{subject} — merge, brought this change into the trunk from a branch'
+        records.append({'sha': sha, 'name': name, 'email': email, 'date': date,
+                        'subject': subject, 'before': before, 'after': after,
+                        'is_merge': is_merge, 'owners': _claimants(low)})
+
+    commits, accounted, by_reader, laundered = [], 0, 0, 0
+    # Only a fingerprint that is genuinely a duplicate of ANOTHER SHAPE of the
+    # same change may suppress a row: a merge against the commit it carried.
+    # Deduping non-merge against non-merge would swallow a re-application after
+    # a revert (X→Y, Y→X, X→Y) and leave the page describing a document that
+    # ends in X while the file holds Y.
+    def _fp(rec):
+        pair = (blockmap.norm(rec['before'] or ''), blockmap.norm(rec['after'] or ''))
+        return pair if any(pair) else None      # an empty diff is not an identity
+    merge_fps = {_fp(r) for r in records if r['is_merge']} - {None}
+    plain_fps = {_fp(r) for r in records if not r['is_merge']} - {None}
+    seen = set()
+    for rec in records:
+        fp = _fp(rec)
+        twin = (fp is not None
+                and (fp in plain_fps if rec['is_merge'] else fp in merge_fps))
+        if twin and fp in seen:
+            continue
+        owners = rec['owners']
+        before, after, subject = rec['before'], rec['after'], rec['subject']
+        if owners is None and rec['is_merge'] and fp in plain_fps:
+            # The merge itself is claimed by nobody — the surface records the
+            # side commit's sha. Inherit that commit's claim rather than ringing
+            # every merged PR at the reader.
+            owners = next((r['owners'] for r in records
+                           if not r['is_merge'] and _fp(r) == fp and r['owners']), None)
         if owners is not None:
             # `_git_commit_file` runs `git add <file>` — it stages the WHOLE
             # document, not the span it just wrote. So a direct edit left dirty
@@ -4610,17 +4722,22 @@ def compute_trunk_gap(route_path, workspace=DEFAULT_WORKSPACE, reader=RINGER_REA
             residue = _trunk_residue(after, owners)
             if not residue:
                 accounted += 1
+                if fp is not None:
+                    seen.add(fp)
                 continue
             laundered += 1
             subject = (f'{subject} — carried text no row proposed, staged into a recorded '
                        f'commit (git add stages the whole file)')
             after = residue
             before = ''
-        as_reader = _trunk_author_is_reader(name, email, reader)
+        if fp is not None:
+            seen.add(fp)
+        as_reader = _trunk_author_is_reader(rec['name'], rec['email'], reader)
         by_reader += 1 if as_reader else 0
-        commits.append({'sha': sha[:12], 'author': name, 'date': date, 'subject': subject,
+        commits.append({'sha': rec['sha'][:12], 'author': rec['name'], 'date': rec['date'],
+                        'subject': subject,
                         'before': before, 'after': after, 'uncommitted': False,
-                        'as_reader': as_reader})
+                        'as_reader': as_reader, 'merge': rec['is_merge']})
 
     # An edit sitting in the working tree is the same gap with the commit step
     # missing — and it is the state a half-finished direct edit is actually in.
@@ -4637,15 +4754,70 @@ def compute_trunk_gap(route_path, workspace=DEFAULT_WORKSPACE, reader=RINGER_REA
         if (patch or '').strip():
             # Non-empty patch, possibly empty texts: a blank-line-only change
             # merges two paragraphs and is a real edit to the document.
-            commits.append({'sha': None, 'author': 'working tree', 'date': '',
-                            'subject': 'uncommitted edit to the trunk, not committed at all',
+            #
+            # One of these is not a stranger's edit: `_git_commit_file` can fail
+            # (no committer identity, an index lock, a pre-commit hook), and it
+            # used to swallow the error — the row then stored `commit: null`,
+            # the file stayed dirty, and every later render reported the
+            # surface's own write as an edit of unknown origin that never
+            # cleared. Rows now carry `commit_error`; if the uncommitted text is
+            # what those rows proposed, say whose it is and why it is loose.
+            # Scoped to THIS round: `commit_error` is written once and never
+            # cleared, so an unscoped read would let a single failure in a round
+            # weeks ago label every later direct edit as this surface's own.
+            failed_rows = [r for r in all_rows
+                           if (r.get('commit_error') or '').strip()
+                           and (r.get('timestamp') or '') >= (since or '')]
+            # BOTH sides have to be accounted for. A stranger's deletion has an
+            # empty `after`, and `_trunk_residue('')` is empty by arithmetic, not
+            # by evidence — checking only the added side would hand the single
+            # most destructive edit the "this was us" label at zero words.
+            residue_after = _trunk_residue(after, failed_rows) if failed_rows else after
+            residue_before = _trunk_residue(before, failed_rows, floor=1) if failed_rows else before
+            surface_write = (bool(failed_rows) and not residue_after and not residue_before
+                             and bool((after or '').strip()))
+            if surface_write:
+                why = failed_rows[-1].get('commit_error') or 'no reason recorded'
+                subject = ('in the trunk, uncommitted — this surface wrote it and the commit '
+                           f'failed ({why}), so the trunk keeps no record of it')
+                author = failed_rows[-1].get('author') or 'this surface'
+            else:
+                # The whole dirty diff is shown, not the residue: trimming it to
+                # the unmatched words strikes holes through a stranger's
+                # sentence and throws the deleted side away entirely.
+                subject = 'uncommitted edit to the trunk, not committed at all'
+                author = 'working tree'
+                if failed_rows and (residue_after or residue_before):
+                    subject += (' — part of this text is a surface write whose commit failed, '
+                                'and part is not; the whole dirty diff is shown')
+            commits.append({'sha': None, 'author': author, 'date': '',
+                            'subject': subject,
                             'before': before, 'after': after, 'uncommitted': True,
+                            'surface_write': surface_write,
                             'as_reader': False})
 
-    return {'status': 'ok', 'reason': '', 'since': since, 'basis': basis,
-            'commits': commits, 'unattributed': len(commits), 'truncated': truncated,
-            'accounted': accounted, 'by_reader': by_reader, 'laundered': laundered,
-            'window_commits': len(lines)}
+    if probe_failures:
+        # Some commit in the window could not be read, so this list is a partial
+        # answer. Every other git failure in this function is `unavailable`;
+        # these were the two that quietly were not.
+        return dict(empty, status='unavailable', since=since, basis=basis,
+                    commits=commits, unattributed=len(commits), accounted=accounted,
+                    by_reader=by_reader, laundered=laundered, truncated=truncated,
+                    window_commits=len(lines),
+                    reason=f'{len(probe_failures)} commit(s) in this round could not be read '
+                           f'({"; ".join(probe_failures[:3])}), so what is listed below is a '
+                           f'partial answer, not a checked round')
+    result = {'status': 'ok', 'reason': '', 'since': since, 'basis': basis,
+              'commits': commits, 'unattributed': len(commits), 'truncated': truncated,
+              'accounted': accounted, 'by_reader': by_reader, 'laundered': laundered,
+              'window_commits': len(lines)}
+    # Only the 'ok' answer is cached. Every other exit is a failure to look
+    # (git unavailable, an untracked document) and must be retried, not pinned.
+    if cacheable:
+        if len(_TRUNK_GAP_CACHE) >= _TRUNK_GAP_CACHE_MAX:
+            _TRUNK_GAP_CACHE.clear()
+        _TRUNK_GAP_CACHE[cache_key] = copy.deepcopy(result)
+    return result
 
 
 def _ringer_diff_html(before, after):
@@ -5293,6 +5465,12 @@ class Handler(BaseHTTPRequestHandler):
                     self._send_json({'error': 'unknown page'}, status=404)
                     return
                 comment['commit'] = change_result.get('commit')
+                # A write whose commit failed leaves a dirty working tree and a
+                # row claiming no sha. Without this field the trunk witness sees
+                # the surface's own write as an edit of unknown origin, forever
+                # — the row is the only thing that can say "this one is ours".
+                if change_result.get('commit_error'):
+                    comment['commit_error'] = change_result['commit_error']
                 if change_result.get('sentence_index') is not None:
                     comment['sentence_index'] = change_result['sentence_index']
                 # Not persisted to the sidecar (would bloat every row with a
@@ -5450,9 +5628,12 @@ class Handler(BaseHTTPRequestHandler):
             # The revert writes and commits. Without the sha on the row, the
             # trunk witness sees a commit no row claims and rings the reader's
             # own revert back at him as an unrecorded change.
-            update_comment(page, mark_id, {'status': 'done', 'reverted': True,
-                                           'revert_commit': result.get('commit'),
-                                           'resolved_by': resolver_author}, workspace)
+            revert_patch = {'status': 'done', 'reverted': True,
+                            'revert_commit': result.get('commit'),
+                            'resolved_by': resolver_author}
+            if result.get('commit_error'):
+                revert_patch['commit_error'] = result['commit_error']
+            update_comment(page, mark_id, revert_patch, workspace)
             self._send_json({
                 'ok': True, 'reverted': True,
                 'block_id': result['block_id'], 'html': result['html'], 'commit': result['commit'],

@@ -260,15 +260,6 @@ Still open, and named rather than hidden:
 - **A squash, rebase or amend rewrites shas**, so a sidecar row's recorded sha can stop
   matching any commit in history and its change gets rung as unattributed. Over-report, so it
   fails in the safe direction, but it is noise.
-- **A change applied with no commit is invisible to both halves.** `_git_commit_file` returns
-  `None` when git is unavailable or the repo refuses the commit; the row then claims no sha and
-  the trunk shows no commit either. Worse, the file stays dirty, so every later render reports
-  the surface's own write as an uncommitted direct edit.
-- **A change that arrives by merge is not seen.** `git log --since -- <path>` simplifies history,
-  so a merge commit TREESAME to a parent is omitted while the side-branch commit carries its own
-  older date. `--full-history` is the fix, not yet taken.
-- **Cost.** Up to 4+N git subprocesses per v3 render (0.4s on the real agreed-model page). The
-  cache key that would fix it is exactly (HEAD sha, sidecar mtime, file mtime).
 - **Sentence-level attention vs block-level suppression.** Marks carry `from`/`to` offsets and
   edits carry `sentence_index`; neither is used. A mark on sentence 1 suppresses a revision to
   sentence 4 of the same block.
@@ -277,8 +268,62 @@ Still open, and named rather than hidden:
 - **A round is not modelled.** The list is recomputed per render, so there is no persisted
   artifact showing that a given round closed with a given list.
 
-Tests: `v2/tests/test_ringer_list.py` (19 cases) and `v2/tests/test_trunk_gap.py` (10 cases,
-including the two bugs above) pin the bracket edges, the ways a revision
+### Three holes closed (2026-09-04, second pass)
+
+All three were named by the pass that built the witness and left open for a later run.
+
+- **A change that arrives by merge is seen.** `git log --since -- <path>` simplifies history: a
+  merge TREESAME to a parent is dropped and the log follows the side branch instead, whose
+  commit carries its own older date and falls outside the round. A writer who edits the document
+  on a branch and merges it in after the round opened was therefore invisible. The log now runs
+  `--full-history` and reads `%cI` (commit date), and merges — which `git show` prints with no
+  diff at all — are diffed against their first parent. A merge that changed nothing along this
+  line of history is dropped again, and a side commit plus the merge that carried it are
+  fingerprinted on their (before, after) text so one change rings once, not twice.
+- **A stranded surface write says whose it is.** `_git_commit_file` already returned its error
+  and both callers threw it away. `apply_sentence_change` / `apply_sentence_revert` now return
+  `commit_error` and the POST handlers persist it on the row. When the working tree is dirty and
+  the dirty text is what those rows proposed, the section reads *in the trunk, uncommitted — this
+  surface wrote it and the commit failed (<reason>)* instead of reporting the surface's own write
+  as an edit of unknown origin on every render forever. If part of the dirty text is not
+  accounted for by a failed row, only the residue is rung, at the same 3-word noise floor — a
+  stranded write is not a laundering channel for whatever else is dirty in the same file.
+- **The gap is cached.** Key: `(repo_root, rel, route, workspace, reader, since, HEAD sha,
+  page mtime_ns+size, sidecar mtime_ns+size)`. Only the `ok` answer is cached; every other exit
+  is a failure to look and must be retried, not pinned. Answers are handed out as deep copies.
+  Measured on the live agreed-model page: 0.34s cold, 0.07s warm.
+
+Five cracks the adversarial pass (Skip) found in that same change, all fixed before it shipped,
+three of them routes to a page claiming a checked round it never checked:
+- **A `git` call that failed is not a commit that changed nothing.** The per-commit `show`/`diff`
+  dropped a `None` return, so an index lock or a 10s timeout during a render printed *"nothing
+  reached the document behind this surface's back"*. Any unreadable commit now forces
+  `unavailable` and names the shas, with the partial list still shown.
+- **A deletion was inheriting the stranded-write label.** `_trunk_residue('')` is empty by
+  arithmetic, not by evidence, so a stranger deleting a paragraph netted zero residue and read as
+  the surface's own bookkeeping. Both sides of the diff must now be accounted for, the deleted
+  side at a 1-word floor (the noise argument does not hold for a removal), and `commit_error`
+  rows are scoped to the current round — the field is written once and never cleared, so an
+  unscoped read let one failure years ago vouch for every later direct edit.
+- **Dedupe only ever suppresses a merge against the commit it carried.** Fingerprinting any two
+  commits alike swallowed a re-application after a revert (X→Y, Y→X, X→Y), leaving the page
+  describing a document that ends in X while the file holds Y. An empty diff is not an identity.
+- **A merge of a surface commit is accounted, not rung.** The sidecar records the side commit's
+  sha and never the merge's, so on an estate that merges through `pr-merge-green` every merged PR
+  carrying a recorded change would have rung as a stranger's edit.
+- **The cache key carries a digest of the row set**, since `rows`/`all_rows` are parameters, and
+  an answer computed with an unreadable HEAD is never stored — that key does not move when HEAD
+  does.
+
+Still open here: `-n50` is applied after `--since` and `--full-history` puts TREESAME merges into
+that budget before discarding them, so a busy round can cut more real commits than before; the
+section says the window was cut but not which shas. And `git log` walks HEAD only, so a change
+committed on an unmerged branch is not seen — correct, because the reader's file is unchanged
+too, but the prose does not distinguish that from "nothing touched this file".
+
+Tests: `v2/tests/test_ringer_list.py` (19 cases) and `v2/tests/test_trunk_gap.py` (21 cases,
+including the merge, stranded-write, cache and Skip-pass cases) pin the bracket edges,
+the ways a revision
 leaves the list, the two empty states, one regression per fix above, the server-rendered
 section, and the JSON twin.
 

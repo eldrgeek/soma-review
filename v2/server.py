@@ -5549,6 +5549,97 @@ def run_board_regenerate():
 
 # --- HTTP handler ------------------------------------------------------
 
+# --- Tunnel identity gate ---------------------------------------------------
+# soma-review binds 127.0.0.1 and used to be reachable only from this machine.
+# Since 2026-09-04 it is also published on the tailnet as
+# `https://macbook-pro.tail68bbcc.ts.net:8433` (via `tailscale serve`) so the
+# MDP unseen-changes Pulse card can hand Mike a link his Pixel can open. That
+# made an UNAUTHENTICATED surface network-reachable, and `/api/dispatch` behind
+# it spawns `cc-dispatch` — an autonomous worker with full filesystem access.
+# The only thing standing between the tailnet and code execution on this Mac
+# was a packet-filter rule in a console this fleet cannot read.
+#
+# `tailscale serve` solves the authentication half for us, and it was worth
+# measuring rather than assuming: the proxy OVERWRITES any client-supplied
+# `Tailscale-User-*` and `X-Forwarded-For` headers with the true caller's
+# tailnet identity (verified 2026-09-04 by forging all three through a throwaway
+# `--https=8443` mount and reading them back unchanged at the origin). So:
+#
+#   * no `Tailscale-Headers-Info` / `X-Forwarded-For`  -> the request came in on
+#     the loopback bind. Local already has full power; behaviour unchanged.
+#   * marker present + login in TUNNEL_ALLOWED_LOGINS  -> it is Mike. Allowed,
+#     EXCEPT the code-execution endpoints below.
+#   * marker present + any other login                 -> 403 on everything.
+#
+# The last line is the point: if the tailnet ACL is ever widened — by Mike, by
+# an admin-console default, by a new device — the surface does NOT silently
+# become open. It fails closed on identity instead of on a firewall rule.
+# A caller through the tunnel cannot remove the marker, so the deny direction
+# cannot be spoofed away.
+TUNNEL_ALLOWED_LOGINS = {
+    e.strip().lower()
+    for e in os.environ.get('SOMA_REVIEW_TUNNEL_LOGINS', 'mw@mike-wolf.com').split(',')
+    if e.strip()
+}
+
+# ALLOW-list, not a deny-list (2026-09-04, after an adversarial pass). The first
+# version denied `/api/dispatch` and called the job done, on the assumption that
+# it was the only way from this server to code execution. It is not. `POST
+# /api/comments {type:"edit"}` writes the change into the trunk `.md` and git
+# commits it; every whitelisted root includes files that autonomous workers READ
+# AS INSTRUCTIONS (`_estate/WORKQUEUE.md`, `_estate/coo/`, `SOMA/**`). Rewriting
+# the work queue is code execution with a 30-minute delay. `/api/board/regenerate`
+# spawns subprocesses outright. A deny-list on this surface would have been wrong
+# again the next time anyone added an endpoint, and wrong silently — so the
+# tunnel now gets an explicit list of what it MAY reach, and everything else,
+# including anything added tomorrow, is 403 by default.
+TUNNEL_ALLOWED_GET = (
+    '/', '/waiting', '/healthz', '/api/waiting', '/api/workspaces', '/api/comments',
+)
+TUNNEL_ALLOWED_GET_PREFIXES = ('/page/', '/raw/', '/static/', '/api/comments/')
+# The one write the tunnel exists for: Mike marking a document from his phone.
+TUNNEL_ALLOWED_POST = ('/api/comments',)
+
+
+def tunnel_caller(headers, on_tunnel_socket=False):
+    """(is_tunnel, login) for one request.
+
+    `on_tunnel_socket` is the authoritative signal: the tunnel has its own
+    listener (SOMA_REVIEW_TUNNEL_PORT, default 8091) and `tailscale serve` points
+    at it, so local-ness comes from WHICH SOCKET ACCEPTED the connection. The
+    header check stays as a belt-and-braces second signal, because it costs
+    nothing and covers a mis-pointed mount.
+
+    Why the socket had to become authoritative: `tailscale serve --tcp 8433
+    tcp://127.0.0.1:8090` forwards RAW TCP and injects no headers at all, so a
+    header-only gate reads every tunnel caller as loopback and hands it full
+    power. The mount is one `serve reset` away from anyone, so an absence-detector
+    that fails OPEN is an inverted control. A socket cannot be argued with.
+
+    Duplicate identity headers are refused rather than resolved. The forgery
+    experiment that justifies this design sent ONE `Tailscale-User-Login` and
+    proved the proxy replaces it; it did not prove what happens with two, and
+    `.get()` returns the first. Refusing `len != 1` is correct under either
+    answer.
+    """
+    marker = (headers.get('Tailscale-Headers-Info') is not None
+              or headers.get('X-Forwarded-For') is not None)
+    if not (marker or on_tunnel_socket):
+        return False, ''
+    logins = headers.get_all('Tailscale-User-Login') or []
+    if len(logins) != 1:
+        return True, ''  # none, or an ambiguous pair -> no identity -> refused
+    return True, logins[0].strip().lower()
+
+
+def tunnel_path_allowed(method, path):
+    if method == 'GET':
+        return path in TUNNEL_ALLOWED_GET or path.startswith(TUNNEL_ALLOWED_GET_PREFIXES)
+    if method == 'POST':
+        return path in TUNNEL_ALLOWED_POST
+    return False
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = 'soma-review/2.0'
 
@@ -5592,7 +5683,69 @@ class Handler(BaseHTTPRequestHandler):
             return workspace, remainder
         return DEFAULT_WORKSPACE, path
 
+    # Set True on the subclass bound to the tunnel-only port.
+    on_tunnel_socket = False
+
+    def _tunnel_gate(self, raw_path):
+        """False -> the response has already been sent; the caller must return."""
+        is_tunnel, login = tunnel_caller(self.headers, self.on_tunnel_socket)
+        method = self.command
+        if not is_tunnel:
+            # Loopback. Local already has full power — but "loopback" is not
+            # "this machine's own intent": it is every page Mike has open, and
+            # a mutating POST with no Origin check is CSRF from any website.
+            return self._origin_ok(method)
+        _, path = self._split_workspace(urlparse(raw_path).path)
+        if login not in TUNNEL_ALLOWED_LOGINS:
+            sys.stderr.write(
+                'tunnel-gate: DENY identity login=%r path=%r xff=%r\n'
+                % (login, path, self.headers.get('X-Forwarded-For')))
+            self._refuse('not authorized on this network')
+            return False
+        if not tunnel_path_allowed(method, path):
+            sys.stderr.write('tunnel-gate: DENY path login=%r %s %r\n' % (login, method, path))
+            self._refuse('this endpoint runs only on the machine itself')
+            return False
+        return self._origin_ok(method)
+
+    def _origin_ok(self, method):
+        """Reject cross-site mutating requests.
+
+        `_read_json_body` never checked Content-Type and nothing checked Origin,
+        so `fetch(..., {method:'POST', headers:{'Content-Type':'text/plain'}})`
+        from ANY page open in Mike's browser was a CORS-simple request: no
+        preflight, the write lands, and the attacker not being able to read the
+        response does not matter because the payload IS the write. Through the
+        tunnel the proxy stamps his verified identity onto that forged request,
+        which turns a local CSRF into an authenticated remote write. Same hole on
+        loopback, which is why this runs on both paths.
+        """
+        if method not in ('POST', 'PUT', 'PATCH', 'DELETE'):
+            return True
+        origin = self.headers.get('Origin')
+        if not origin:
+            return True  # curl, the estate's own scripts, same-origin form posts
+        host = (self.headers.get('X-Forwarded-Host') or self.headers.get('Host') or '')
+        if origin.split('//', 1)[-1] == host:
+            return True
+        sys.stderr.write('tunnel-gate: DENY origin=%r host=%r\n' % (origin, host))
+        self._refuse('cross-site request refused')
+        return False
+
+    def _refuse(self, msg):
+        # Drain the body before answering, or a keep-alive client desyncs the
+        # next request on the same connection the day protocol_version is raised.
+        try:
+            n = int(self.headers.get('Content-Length', 0) or 0)
+            if n > 0:
+                self.rfile.read(n)
+        except (ValueError, OSError):
+            pass
+        self._send_json({'error': msg}, status=403)
+
     def do_GET(self):
+        if not self._tunnel_gate(self.path):
+            return
         parsed = urlparse(self.path)
         workspace, path = self._split_workspace(parsed.path)
         qs = parse_qs(parsed.query)
@@ -5737,12 +5890,21 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == '/healthz':
-            self._send_json({'ok': True, 'ts': time.time()})
+            is_tunnel, login = tunnel_caller(self.headers, self.on_tunnel_socket)
+            # The suite's only way to prove the proxy's identity headers actually
+            # arrived through the real mount. Without this, a Tailscale release
+            # that stopped injecting them would leave every forged-header test
+            # still passing.
+            self._send_json({'ok': True, 'ts': time.time(),
+                             'tunnel': {'is_tunnel': is_tunnel, 'login': login,
+                                        'socket': self.on_tunnel_socket}})
             return
 
         self._send_html('<h1>404</h1>', status=404)
 
     def do_POST(self):
+        if not self._tunnel_gate(self.path):
+            return
         parsed = urlparse(self.path)
         workspace, path = self._split_workspace(parsed.path)
 
@@ -6171,11 +6333,23 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json({'error': 'not found'}, status=404)
 
 
+class TunnelHandler(Handler):
+    """Identical server, reached only through `tailscale serve`. Being on this
+    socket IS the proof that a request came from the network, which is what makes
+    the gate impossible to defeat by changing the mount's proxy mode."""
+    on_tunnel_socket = True
+
+
 def main():
     port = int(os.environ.get('SOMA_REVIEW_PORT', '8090'))
-    server = ThreadingHTTPServer(('127.0.0.1', port), Handler)
+    tunnel_port = int(os.environ.get('SOMA_REVIEW_TUNNEL_PORT', '8091'))
     home = get_workspace(DEFAULT_WORKSPACE)['home']
+    server = ThreadingHTTPServer(('127.0.0.1', port), Handler)
+    tunnel = ThreadingHTTPServer(('127.0.0.1', tunnel_port), TunnelHandler)
+    threading.Thread(target=tunnel.serve_forever, daemon=True).start()
     print(f'soma-review v2 listening on http://localhost:{port}/page/{home}')
+    print(f'soma-review v2 tunnel-only listener on 127.0.0.1:{tunnel_port} '
+          f'(point `tailscale serve --https=8433` here, never at {port})')
     server.serve_forever()
 
 

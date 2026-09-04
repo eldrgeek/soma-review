@@ -78,8 +78,44 @@ and `LEDGER.csv`-adjacent files are in-scope and serve fine — they're sensitiv
 secret-from-Mike. **Corrected 2026-09-04: they are no longer "never leave the machine."** The
 process still binds `127.0.0.1`, but `tailscale serve` proxies `https://macbook-pro.tail68bbcc.ts.net:8433`
 to it, so this server is reachable from Mike's Pixel over the tailnet. The only thing keeping
-that narrow is the tailnet ACL, which admits exactly one device to exactly that port — read
+that narrow WAS the tailnet ACL, which admits exactly one device to exactly that port — read
 `_estate/TAILNET-INGRESS.md` before widening anything, and before adding a new sensitive root.
+
+**Since 2026-09-04 the ACL is no longer the only control.** An ACL rule lives in an admin
+console this fleet cannot read, so a widening would have opened this server — and
+`POST /api/dispatch` behind it, which spawns `cc-dispatch` with full filesystem access —
+silently. `Handler._tunnel_gate()` now runs as the first statement of `do_GET` and `do_POST`:
+
+**There are now two listeners.** `main()` binds `127.0.0.1:8090` (loopback, `Handler`) and
+`127.0.0.1:8091` (`TunnelHandler`, `on_tunnel_socket = True`); `tailscale serve --https=8433`
+points at **8091**. Which socket accepted the connection is the authoritative network signal,
+because `tailscale serve --tcp` forwards raw TCP and injects no headers — a header-only gate
+would have read every tunnel caller as loopback. Never repoint that mount at 8090.
+
+- **Accepted on `:8090` with no proxy headers** → loopback. Local already has full power.
+- **On the tunnel socket, `Tailscale-User-Login` in `TUNNEL_ALLOWED_LOGINS`** (default
+  `mw@mike-wolf.com`, override `SOMA_REVIEW_TUNNEL_LOGINS`) → only `TUNNEL_ALLOWED_GET` /
+  `TUNNEL_ALLOWED_GET_PREFIXES` / `TUNNEL_ALLOWED_POST`. **It is an allow-list.** The first
+  version denied `/api/dispatch` alone and that was wrong: `POST /api/comments {type:"edit"}`
+  writes into the trunk `.md` and commits it, and the whitelist includes `_estate/WORKQUEUE.md`
+  and `_estate/coo/` — files autonomous workers read as instructions. If you add an endpoint,
+  it is refused from the tunnel until you list it, which is the intended direction.
+- **On the tunnel socket, any other login, none, or two** → `403` on everything. Duplicate
+  `Tailscale-User-Login` headers are refused rather than resolved.
+- **Any mutating request carrying a foreign `Origin`** → `403`, on BOTH listeners.
+  `_read_json_body` never checked `Content-Type`, so a CORS-simple `fetch` from any page open
+  in Mike's browser used to be an unauthenticated write — and through the tunnel the proxy
+  stamped his verified identity onto it.
+- `GET /healthz` reports `{"tunnel": {is_tunnel, login, socket}}` so a test can prove the
+  proxy's identity headers actually arrived, rather than only that a forgery was rejected.
+
+This is real authentication, not a heuristic: `tailscale serve` **overwrites** client-supplied
+`Tailscale-User-*` and `X-Forwarded-For` headers with the true caller identity (measured, not
+assumed — see `_estate/TAILNET-INGRESS.md`). A tunnel caller cannot strip the marker, so the
+deny direction cannot be spoofed away. Falsify with
+`_estate/bin/soma-review-tunnel-gate-test.sh` (**23 cases**; refusals asserted, four against
+the live `:8433` mount). If you add an endpoint the phone needs, add it to the allow-list and
+add a case — including a case that pins the refusal you did NOT open.
 
 Path resolution rejects anything outside its workspace's roots (`os.path.normpath` + prefix
 check). `resolve_page()` additionally requires `.md`; `resolve_raw()` (see Links below) allows

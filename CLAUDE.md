@@ -1029,6 +1029,42 @@ contract, same-origin execution, capability declaration in the panel) — see th
 spec above for the full three-kind contract both hosts (soma-review, Playmaker) are meant to
 share once built.
 
+## v3 sentence marks (2026-09-04)
+
+v3 shipped with no sentence-level affordance: its comment box, its click-to-edit and its
+verdict buttons are all block-scoped, so `blockPayload()` hardcoded `from: 0, to: null` and
+every row v3 wrote claimed the whole paragraph. `compute_ringer_list` reads a whole-block mark
+as attention on every sentence in the block, so an ack on a paragraph suppressed every revision
+inside it — the ringer list's cardinal failure direction, live on the only view Mike opens
+(95 of his 138 rows carry `to: null`).
+
+`mark_layer_inner` renders one `<span class="mark-sentence" data-from/data-to/data-quote>` per
+sentence in **every** view; only the classic dwell layer's *behaviour* is view-gated, not the
+spans. `sentenceSpanInBlock(el)` (PAGE_JS) clips a non-collapsed selection against them and
+returns the exact covered run. `blockPayload` uses it and falls back to whole-block for a caret,
+no selection, a selection in another block, or a selection covering everything. V3_JS's
+`wireSentenceMarks()` raises a bar (agree/ack/clarify/strike) on selection that posts with the
+span.
+
+Two things that are easy to get wrong here, both found by an adversarial pass before this shipped:
+- **The quote is `data-quote`, never `normText.slice(from, to)`.** `from`/`to` are Python
+  code-point offsets and JS `slice()` counts UTF-16 code units, so one astral character (emoji —
+  434 across 215 estate docs) earlier in the block shifts the quote by one, `_resolve_on_block`
+  fails, and the mark is refused 409 with no explanation.
+- **A press with no live selection is refused, not posted.** Posting would write a whole-block
+  mark under a toast saying "one sentence" — a touch device dismisses the selection on
+  `touchstart`, before any synthesized `mousedown`, and the phone is how Mike reads this.
+
+Bounds, stated rather than buried: `v3PaintInlineDiffs` replaces a revised block's innerHTML
+with a del/ins render carrying no `.mark-sentence` spans, so the bar **cannot appear on a block
+that has an open change** — the blocks the ringer list exists for. Not a regression, but the
+old failure still holds there. List blocks likewise: their per-item ranges live in
+`data-list-units` and are unused. The bar is mouse-only (no Tab+Enter) and touch is untested.
+
+Tests: `v2/tests/test_v3_sentence_marks.py` (8 cases) drives a real browser — a DOM selection
+becoming code-point offsets cannot be faked — and skips when Playwright or its Chromium build is
+absent. Note `sync_playwright().start()` hangs on this machine; `__enter__` does not.
+
 ## Authorship
 
 v2 built 2026-07-02 by Dee (Claude Sonnet 5, engineering-lead/COO role) per Mike's spec

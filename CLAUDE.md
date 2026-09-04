@@ -122,6 +122,58 @@ workspace. When the estate does its next morning review cycle, update `workspace
 `estate.home`/`estate.nav` to point at the new dated files (or generalize to a manifest — not
 done yet, see Gotchas).
 
+## Ringer list (2026-09-04) — the machine half of agreed-model 12b
+
+Fork Q1 was ruled Alternative B on 2026-09-03: a bracket of assent covers everything between
+two of Mike's marks, revisions included. So a revision can reach the trunk file with his assent
+and without his attention. Item 12b of `SOMA/shared-cognition/mdp-agreed-model.md` is the
+counterweight — every round closes with a generated list naming each such revision back to him,
+so the list cannot be empty by omission. Writer-composed ringer lists fail exactly there: the
+first hand-written one, on `mdp-proposal.md`, omitted the entry the writer was most invested in.
+
+`compute_ringer_list(route, workspace, reader='mike')` derives the list from the same sidecar
+rows the review surface already writes, plus the durable block map for document order.
+`render_ringer_section()` renders it into every `?view=v3` page **server-side**, and
+`GET /api/ringer?page=<route>` returns the same data as JSON. Server-side is the point: a list
+that appears only when a client script succeeds is a list that can go missing silently.
+
+Two halves, one list:
+- **swallowed** (machine) — a `type: 'edit'` row (the `replace` flag is a panel label on the
+  same record, not a different kind) by an author other than the reader, inside the bracket,
+  on a block the reader never marked, that he never settled or reverted himself.
+- **flagged** (writer) — any row carrying `ringer: true` (+ optional `reason`, stored as
+  `ringer_reason`): a sentence the writer believes he should *not* have agreed with. Listed
+  with or without a bracket.
+
+The bracket is deliberately generous, and the bias is stated rather than hidden: **over-report
+rather than under-report.** A ringer he already knew about costs him a glance; one that was
+never named costs him the ruling.
+- lower edge = the top of the document, always. Reading is top-down, so reaching a mark at
+  block N means passing every block above it.
+- upper edge = the deepest of (his own marks, his `last_read_block` from a reader-signal row).
+  `bracket.basis` says which set it.
+- no marks and no reader signal = no bracket. The section then says so explicitly instead of
+  showing an empty list, which would read as a clean round.
+- a revision whose block no longer exists (`position: null`) is listed anyway — that is the
+  least reviewable state a change can be in, not a reason to drop it.
+
+Known limitation, measured on the real corpus: **a rewritten block can move.** On
+`mdp-proposal.md` the `replace` of Mike's central question now resolves to block 29 of 35,
+below a bracket whose edge is block 21, so the machine half loses it. `outside_bracket` counts
+these and the rendered section says so in prose; the writer-flagged half is the backstop, and
+that specific row carries `ringer: true` for exactly this reason. A positional bracket compared
+against a document that has since been rewritten is the structural weakness here — the durable
+fix is to anchor the bracket to block ids as they were at read time, which needs the reader
+signal to carry the block order it saw.
+
+`/api/marks/merge` now records `resolved_by` (from the request's `author`, default `mike`), so
+settling one's own change does not clear it from the list. Rows written before 2026-09-04 have
+no `resolved_by`, so a revision settled before then still shows as swallowed — over-reporting,
+per the stated bias.
+
+Tests: `v2/tests/test_ringer_list.py` (14 cases) pins the bracket edges, the four ways a
+revision leaves the list, the server-rendered section, and the JSON twin.
+
 ## "Waiting on you" inbox (2026-09-04) — the landing page
 
 `/waiting` (and `/w/<ws>/waiting`, plus `/api/waiting` for the same data as JSON) is a derived

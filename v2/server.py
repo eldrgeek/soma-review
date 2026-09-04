@@ -17,6 +17,7 @@ import time
 import uuid
 import hashlib
 import datetime
+import difflib
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, unquote
@@ -2661,7 +2662,7 @@ V3_JS = r"""
   }
   async function settleOrRevertMark(m, action){
     const res = await fetch(`${API_BASE}/api/marks/merge`, {method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({page: ROUTE, id: m.id, action})});
+      body: JSON.stringify({page: ROUTE, id: m.id, action, author: 'mike'})});
     let data = {};
     try { data = await res.json(); } catch(_) {}
     if (!res.ok) { alert(data.error || (action + ' failed')); return false; }
@@ -3791,6 +3792,21 @@ def render_page(route_path, workspace=DEFAULT_WORKSPACE, view='classic'):
 
     level_label = compute_level(src, route_path) if view == 'v3' else None
 
+    # Agreed model 12b: the ringer list is part of closing a round, so it is
+    # rendered into the page itself rather than left to a client script or to
+    # the writer's memory. Failure to build it never breaks the page — a page
+    # that cannot show its ringer list says so is better than one that hides
+    # the failure by showing nothing.
+    ringer_section = ''
+    if view == 'v3':
+        try:
+            ringer_section = render_ringer_section(compute_ringer_list(route_path, workspace))
+        except Exception as exc:  # noqa: BLE001 - never 500 a page over the ringer list
+            ringer_section = ('<section class="ringer-list" id="ringer-list">'
+                              '<h2>Ringer list unavailable</h2><p class="ringer-why">'
+                              f'Could not be generated: {_html.escape(str(exc))}. '
+                              'Treat this round as unclosed.</p></section>')
+
     html_doc = f"""<!DOCTYPE html>
 <html>
 <head>
@@ -3798,7 +3814,7 @@ def render_page(route_path, workspace=DEFAULT_WORKSPACE, view='classic'):
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{_html.escape(title)} — soma-review</title>
 {mark_fonts}
-<style>{PAGE_CSS}{MARK_LAYER_CSS if mark_layer else ''}{VIEW_TOGGLE_CSS}{V3_CSS if view == 'v3' else ''}</style>
+<style>{PAGE_CSS}{MARK_LAYER_CSS if mark_layer else ''}{VIEW_TOGGLE_CSS}{V3_CSS if view == 'v3' else ''}{RINGER_CSS if view == 'v3' else ''}</style>
 {chip_head}{tour_head}
 </head>
 <body{body_class}>
@@ -3816,6 +3832,7 @@ def render_page(route_path, workspace=DEFAULT_WORKSPACE, view='classic'):
   </div>
   {blocks_html}
   {mark_legend}
+  {ringer_section}
   <section class="unresolved-marks" id="unresolved-marks" hidden>
     <h2>Unresolved marks (<span id="unresolved-count">0</span>)</h2>
     <p class="unresolved-explainer">Their source text moved or disappeared. Nothing was discarded.</p>
@@ -4114,6 +4131,261 @@ def render_waiting(workspace=DEFAULT_WORKSPACE):
   </div>
 </main>
 </body></html>"""
+
+
+# --- Ringer list (agreed model 12b, 2026-09-04, COO run) --------------------
+#
+# Fork Q1 closed as Alternative B (Mike, 2026-09-03): a bracket of assent
+# covers everything between two of the reader's own marks, revisions included.
+# A revision inside that bracket that the reader never looked at individually
+# therefore reaches the trunk WITH his assent and WITHOUT his attention.
+# 12b is the counterweight: every round closes with a machine-generated list
+# naming each such revision back to him, so the list can never be empty by
+# omission — which is exactly the failure a writer-composed list produces
+# (the writer omits the revision it is most invested in).
+#
+# Derived, never authored. Inputs are the same sidecar rows the review surface
+# already writes plus the durable block map for document order. Two sources
+# feed one list:
+#   swallowed  = machine half. A revision (type 'edit', incl. replace) by an
+#                author other than the reader, whose block lies inside the
+#                reader's bracket, that the reader never marked, settled or
+#                reverted himself.
+#   flagged    = writer half. Any row carrying `ringer: true` — a sentence the
+#                writer believes he should NOT have agreed with. Same list, so
+#                one section answers "what did my bracket swallow".
+#
+# The bracket is deliberately generous (it counts a change against the writer
+# whenever there is doubt): its lower edge is the top of the document once any
+# reader signal exists, and its upper edge is the deepest of the reader's own
+# marks and his last-read block. A revision below the upper edge was inside
+# the span he consented to.
+
+RINGER_READER = 'mike'
+
+
+def _ringer_is_reader(row, reader=RINGER_READER):
+    author = (row.get('author') or '').strip().lower()
+    if reader == RINGER_READER:
+        return author in _WAITING_MIKE_AUTHORS
+    return author == reader.strip().lower()
+
+
+def _ringer_is_revision(row):
+    """A revision is a change to the reader's text: an edit mark (the `replace`
+    flag is a panel label on the same record, not a different kind). Reader
+    signals and plain comments are not revisions."""
+    return row.get('type') == 'edit' and not row.get('deleted')
+
+
+def compute_ringer_list(route_path, workspace=DEFAULT_WORKSPACE, reader=RINGER_READER):
+    """The machine half of agreed-model 12b. Returns
+    {reader, bracket:{lower,upper,lower_block,upper_block,basis}, ringers:[...],
+     swallowed, flagged, revisions, marked_blocks}."""
+    rows = [c for c in read_comments(route_path, workspace) if not c.get('deleted')]
+    _src, blocks, _mapping, _report = current_page_blocks(route_path, workspace)
+    order = {b['id']: i for i, b in enumerate(blocks)}
+    text_of = {b['id']: blockmap.norm(b.get('text') or '') for b in blocks}
+
+    signals = [r for r in rows
+               if r.get('type') == 'mark' and r.get('mark_kind') == 'reader-signal'
+               and _ringer_is_reader(r, reader)]
+    latest_signal = None
+    if signals:
+        latest_signal = max(enumerate(signals),
+                            key=lambda p: (p[1].get('timestamp') or '', p[0]))[1]
+
+    # Blocks the reader touched explicitly. A reader-signal is bookkeeping, not
+    # attention on a block, so it never counts as an explicit mark.
+    marked = set()
+    for r in rows:
+        if not _ringer_is_reader(r, reader):
+            continue
+        if r.get('mark_kind') == 'reader-signal':
+            continue
+        pos = order.get(r.get('block_id'))
+        if pos is not None:
+            marked.add(pos)
+    # Settling or reverting a revision is attention on that revision even when
+    # it leaves no row of its own on the block.
+    resolved_by_reader = {
+        r.get('id') for r in rows
+        if _ringer_is_revision(r) and (r.get('settled') or r.get('reverted'))
+        and (r.get('resolved_by') or '').strip().lower() in
+            (_WAITING_MIKE_AUTHORS if reader == RINGER_READER else (reader.strip().lower(),))
+    }
+
+    upper = max(marked) if marked else -1
+    basis = 'marks'
+    if latest_signal is not None:
+        sig_pos = order.get(latest_signal.get('last_read_block'))
+        if sig_pos is not None and sig_pos > upper:
+            upper = sig_pos
+            basis = 'reader-signal'
+    # The lower edge is always the top of the document, not the reader's first
+    # mark: reading is top-down, so reaching a mark at block N means passing
+    # every block above it. This over-reports rather than under-reports, which
+    # is the correct bias for a list whose whole job is to catch what slipped
+    # through — a ringer he already knew about costs him a glance, one that was
+    # never named costs him the ruling.
+    lower = 0
+    if not marked and latest_signal is None:
+        # Nothing read, nothing marked: there is no bracket, so nothing was
+        # swallowed. An empty list here is a true empty, not an omission.
+        upper = -1
+
+    def _block_label(pos):
+        if pos is None or pos < 0 or pos >= len(blocks):
+            return None
+        return blocks[pos]['id']
+
+    ringers = []
+    for r in rows:
+        flagged = bool(r.get('ringer'))
+        swallowed = False
+        pos = order.get(r.get('block_id'))
+        if (_ringer_is_revision(r) and not _ringer_is_reader(r, reader)
+                and upper >= 0 and r.get('id') not in resolved_by_reader
+                # A revision whose block no longer exists (pos is None) is
+                # listed too: it changed text the reader was reading and now
+                # cannot be found on the page, which is the least reviewable
+                # state a change can be in, not a reason to drop it.
+                and (pos is None or (lower <= pos <= upper and pos not in marked))):
+            swallowed = True
+        if not (flagged or swallowed):
+            continue
+        ringers.append({
+            'id': r.get('id'),
+            'block_id': r.get('block_id'),
+            'position': pos,
+            'author': r.get('author'),
+            'timestamp': r.get('timestamp'),
+            'why': 'flagged' if flagged else 'swallowed',
+            'reason': r.get('ringer_reason') or r.get('reason') or '',
+            'before': r.get('snapshot') or '',
+            'after': r.get('proposed') or '',
+            'replace': bool(r.get('replace')),
+            'status': r.get('status') or 'queued',
+            'block_text': text_of.get(r.get('block_id'), ''),
+        })
+    ringers.sort(key=lambda x: (x['position'] if x['position'] is not None else 10**6,
+                                x['timestamp'] or ''))
+    listed_ids = {x['id'] for x in ringers}
+    revisions = sum(1 for r in rows if _ringer_is_revision(r) and not _ringer_is_reader(r, reader))
+    # Rewriting a block's text can move it, so a revision the reader really did
+    # pass can end up below the bracket edge on the CURRENT page and drop out
+    # of the machine half. Counted and shown rather than smoothed away: the
+    # writer-flagged half is the backstop for exactly this case.
+    outside = sum(1 for r in rows
+                  if _ringer_is_revision(r) and not _ringer_is_reader(r, reader)
+                  and r.get('id') not in listed_ids
+                  and (order.get(r.get('block_id')) or 0) > upper >= 0)
+    return {
+        'page': route_path,
+        'workspace': workspace,
+        'reader': reader,
+        'bracket': {
+            'lower': lower if upper >= 0 else None,
+            'upper': upper if upper >= 0 else None,
+            'lower_block': _block_label(lower) if upper >= 0 else None,
+            'upper_block': _block_label(upper) if upper >= 0 else None,
+            'basis': basis if upper >= 0 else 'none',
+            'blocks_total': len(blocks),
+        },
+        'ringers': ringers,
+        'swallowed': sum(1 for x in ringers if x['why'] == 'swallowed'),
+        'flagged': sum(1 for x in ringers if x['why'] == 'flagged'),
+        'revisions': revisions,
+        'outside_bracket': outside,
+        'marked_blocks': len(marked),
+    }
+
+
+def _ringer_diff_html(before, after):
+    """Word-level del/ins, server side — the same reading the v3 client paints
+    inline, so the ringer row shows the change itself and not a description of
+    it (agreed model item 3)."""
+    a = re.split(r'(\s+)', before or '')
+    b = re.split(r'(\s+)', after or '')
+    sm = difflib.SequenceMatcher(a=a, b=b, autojunk=False)
+    out = []
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag in ('equal',):
+            out.append(_html.escape(''.join(a[i1:i2])))
+            continue
+        if tag in ('replace', 'delete'):
+            seg = ''.join(a[i1:i2])
+            if seg:
+                out.append(f'<del>{_html.escape(seg)}</del>')
+        if tag in ('replace', 'insert'):
+            seg = ''.join(b[j1:j2])
+            if seg:
+                out.append(f'<ins>{_html.escape(seg)}</ins>')
+    return ''.join(out)
+
+
+RINGER_CSS = """
+.ringer-list{margin:34px 0 10px;padding:18px 20px;border:1px solid #3a3222;border-radius:10px;background:#191712;}
+.ringer-list h2{margin:0 0 6px;font-size:16px;color:#e8d9a8;}
+.ringer-list .ringer-why{margin:0 0 14px;color:#a99c7d;font-size:13px;line-height:1.55;max-width:70ch;}
+.ringer-row{border-top:1px solid #2e2a20;padding:12px 0;}
+.ringer-row:first-of-type{border-top:none;}
+.ringer-tag{display:inline-block;font-size:11px;letter-spacing:.04em;text-transform:uppercase;
+  padding:1px 7px;border-radius:9px;border:1px solid #5a4a24;color:#e8d9a8;margin-right:8px;}
+.ringer-tag.flagged{border-color:#6a3a3a;color:#f0b8b8;}
+.ringer-meta{font-size:12px;color:#8d8470;}
+.ringer-diff{margin-top:7px;font-size:14px;line-height:1.6;color:#d8d2c4;}
+.ringer-diff del{color:#c98a8a;text-decoration:line-through;}
+.ringer-diff ins{color:#9ed49e;text-decoration:none;}
+.ringer-row a.ringer-goto{color:#8fb8e0;text-decoration:none;font-size:12px;}
+.ringer-empty{color:#8d8470;font-size:13px;}
+"""
+
+
+def render_ringer_section(ringer):
+    """Server-rendered so the list exists in the page's HTML whether or not the
+    v3 client script ran — a list that only appears when JavaScript succeeds is
+    a list that can be empty by omission, which is the thing 12b forbids."""
+    b = ringer['bracket']
+    if b['upper'] is None:
+        why = ('No bracket yet on this page — the reader has neither marked a block nor '
+               'signalled where they stopped, so nothing has been swallowed.')
+    else:
+        why = (f"Fork Q1 is Alternative B: a bracket of assent covers everything between the "
+               f"reader’s marks, revisions included. This reader’s bracket runs from the top of "
+               f"the document to block {b['upper'] + 1} of {b['blocks_total']} "
+               f"(edge set by {b['basis']}), and they marked {ringer['marked_blocks']} block(s) "
+               f"inside it. Every revision below is one their bracket swallowed without an "
+               f"explicit mark, named back to them. Generated from the sidecar; it cannot be "
+               f"short by omission.")
+    if ringer.get('outside_bracket'):
+        why += (f" {ringer['outside_bracket']} further revision(s) now sit below the bracket "
+                f"edge on the current page and are not listed here — a rewritten block can "
+                f"move, so the machine half can lose one. The writer-flagged entries are the "
+                f"backstop for that.")
+    rows_html = []
+    for r in ringer['ringers']:
+        tag = 'flagged' if r['why'] == 'flagged' else 'swallowed'
+        label = 'writer-flagged' if r['why'] == 'flagged' else 'bracket swallowed'
+        pos = f"block {r['position'] + 1}" if r['position'] is not None else 'unanchored'
+        reason = (f"<div class=\"ringer-meta\">{_html.escape(r['reason'])}</div>"
+                  if r['reason'] else '')
+        rows_html.append(
+            f'<div class="ringer-row" data-ringer-id="{_html.escape(r["id"] or "")}">'
+            f'<span class="ringer-tag {tag}">{label}</span>'
+            f'<span class="ringer-meta">{pos} · by {_html.escape(r["author"] or "?")}'
+            f'{" · replace" if r["replace"] else ""} · {_html.escape((r["timestamp"] or "")[:19])}</span> '
+            f'<a class="ringer-goto" href="#{_html.escape(r["block_id"] or "")}">go to block</a>'
+            f'<div class="ringer-diff">{_ringer_diff_html(r["before"], r["after"])}</div>'
+            f'{reason}</div>'
+        )
+    if not rows_html:
+        rows_html.append('<p class="ringer-empty">Nothing was swallowed this round: every '
+                         'revision inside the bracket was marked, settled or reverted by the '
+                         'reader.</p>')
+    return (f'<section class="ringer-list" id="ringer-list">'
+            f'<h2>Ringer list ({ringer["swallowed"] + ringer["flagged"]})</h2>'
+            f'<p class="ringer-why">{why}</p>' + ''.join(rows_html) + '</section>')
 
 
 # --- Dispatch --------------------------------------------------------------
@@ -4485,6 +4757,21 @@ class Handler(BaseHTTPRequestHandler):
             })
             return
 
+        if path == '/api/ringer':
+            # Agreed model 12b, machine half: what did the reader's bracket
+            # swallow on this page. JSON twin of the section rendered into the
+            # v3 page, so a round can be closed from a script as well as by eye.
+            page = qs.get('page', [''])[0]
+            if not page:
+                self._send_json({'error': 'page required'}, status=400)
+                return
+            reader = qs.get('reader', [RINGER_READER])[0] or RINGER_READER
+            try:
+                self._send_json(compute_ringer_list(page, workspace, reader))
+            except NotFoundError:
+                self._send_json({'error': 'unknown page or workspace'}, status=404)
+            return
+
         if path == '/api/workspaces':
             workspaces = load_workspaces()
             self._send_json({
@@ -4597,6 +4884,14 @@ class Handler(BaseHTTPRequestHandler):
                 comment['proposed'] = data.get('proposed')
                 if data.get('replace'):
                     comment['replace'] = True
+                # Writer half of the ringer list (agreed model 12b): the author
+                # of a change can flag it as one the reader should NOT simply
+                # agree with. It then appears in the same generated list as the
+                # revisions the bracket swallowed, so there is one place to look.
+                if data.get('ringer'):
+                    comment['ringer'] = True
+                    if data.get('reason'):
+                        comment['ringer_reason'] = str(data.get('reason'))
                 # Sentence-level change is applied to the trunk file AT ONCE
                 # (MDP mechanics item B, corrected by Mike 2026-09-03
                 # evening): this comment record is the OPEN-CHANGE marker
@@ -4718,6 +5013,7 @@ class Handler(BaseHTTPRequestHandler):
             page = data.get('page', '')
             mark_id = data.get('id', '')
             action = data.get('action', 'settle')
+            resolver_author = (data.get('author') or 'mike').strip() or 'mike'
             if action not in ('settle', 'revert'):
                 self._send_json({'error': 'action must be settle or revert'}, status=400)
                 return
@@ -4742,7 +5038,10 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if action == 'settle':
                 result = apply_sentence_settle(page, workspace, mark)
-                update_comment(page, mark_id, {'status': 'done', 'settled': True}, workspace)
+                # `resolved_by` is what lets the ringer list tell a revision the
+                # reader acted on from one his bracket swallowed silently.
+                update_comment(page, mark_id, {'status': 'done', 'settled': True,
+                                               'resolved_by': resolver_author}, workspace)
                 self._send_json({
                     'ok': True, 'settled': True,
                     'block_id': result['block_id'], 'html': result['html'], 'commit': result['commit'],
@@ -4756,7 +5055,8 @@ class Handler(BaseHTTPRequestHandler):
             except NotFoundError:
                 self._send_json({'error': 'unknown page'}, status=404)
                 return
-            update_comment(page, mark_id, {'status': 'done', 'reverted': True}, workspace)
+            update_comment(page, mark_id, {'status': 'done', 'reverted': True,
+                                           'resolved_by': resolver_author}, workspace)
             self._send_json({
                 'ok': True, 'reverted': True,
                 'block_id': result['block_id'], 'html': result['html'], 'commit': result['commit'],

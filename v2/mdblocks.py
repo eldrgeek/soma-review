@@ -568,7 +568,8 @@ def _find_term_by_label(label, terms):
     return None
 
 
-def render_inline(text, link_resolver=None, terms=None, lexicon=None, auto_lexicon=False, auto_seen=None):
+def render_inline(text, link_resolver=None, terms=None, lexicon=None, auto_lexicon=False, auto_seen=None,
+                  auto_local_terms=False):
     """Render inline markdown (links, bold, italic, code) to HTML.
     link_resolver(href) -> href_out, is_internal
     `terms`, if given, is the {slug: {...}} table from extract_terms(); links whose
@@ -722,16 +723,31 @@ def render_inline(text, link_resolver=None, terms=None, lexicon=None, auto_lexic
     # insensitively; single-word aliases (capitalized coinages like SOMA,
     # Yeshie, Pulse) match case-sensitively, so lowercase everyday uses of the
     # same word are left alone.
-    if auto_lexicon and lexicon and lexicon.get('by_alias'):
-        all_aliases = sorted(
-            {alias for slug, entry in lexicon['by_slug'].items() for alias in entry['aliases']},
-            key=len, reverse=True,
-        )
+    #
+    # A page's OWN Terms section links at first use unconditionally (Mike's
+    # ruling, 2026-09-03: "define every term the page uses — Terms section,
+    # linked at first use"). Before 2026-09-04 the alternation was built from
+    # lexicon aliases only, so a page-local term was linked only where it
+    # happened to collide with a lexicon alias: `mdp-agreed-model.md` defined
+    # 21 terms and linked 1. Page-local labels are now their own aliases, and
+    # they are matched case-INSENSITIVELY even when single-word, because a
+    # page-local term is a coinage this page is defining ("trunk", "bracket",
+    # "fold") rather than an estate-wide capitalized name — the case-sensitive
+    # rule below exists to protect everyday words from the LEXICON, and a page
+    # that wrote the definition itself has already opted in.
+    lexicon_aliases = (
+        {alias for slug, entry in lexicon['by_slug'].items() for alias in entry['aliases']}
+        if (auto_lexicon and lexicon and lexicon.get('by_alias')) else set()
+    )
+    local_aliases = ({e['term'] for e in (terms or {}).values() if e.get('term')}
+                     if auto_local_terms else set())
+    if lexicon_aliases or local_aliases:
+        all_aliases = sorted(lexicon_aliases | local_aliases, key=len, reverse=True)
         if all_aliases:
             parts = []
             for alias in all_aliases:
                 esc = re.escape(alias)
-                if ' ' in alias:
+                if ' ' in alias or alias in local_aliases:
                     parts.append(f'(?i:\\b{esc}\\b)')
                 else:
                     parts.append(f'\\b{esc}\\b')
@@ -834,6 +850,14 @@ def parse_markdown(src, link_resolver=None, terms_out=None, lexicon=None):
         Terms section. Headings never call this — they're excluded unconditionally
         at the call site."""
         return bool(auto_lexicon_flag and lexicon and terms_section_level[0] is None)
+
+    def auto_local_now():
+        """Whether the block currently being rendered may auto-link the page's OWN
+        Terms entries. Unlike auto_lex_now() this needs no opt-in marker — a page
+        that wrote a Terms section has already opted in by writing it (Mike,
+        2026-09-03: terms are "linked at first use") — but it obeys the same
+        rule that the Terms section never links itself."""
+        return bool(terms and terms_section_level[0] is None)
 
     def make_id(candidate):
         base = candidate
@@ -952,13 +976,14 @@ def parse_markdown(src, link_resolver=None, terms_out=None, lexicon=None):
                 i += 1
             raw_lines = [line] + [f'row: {r}' for r in rows]
             _al = auto_lex_now()
+            _alt = auto_local_now()
             thead = ''.join(
-                f'<th>{render_inline(c, link_resolver, terms=terms, lexicon=lexicon, auto_lexicon=_al)}</th>'
+                f'<th>{render_inline(c, link_resolver, terms=terms, lexicon=lexicon, auto_lexicon=_al, auto_local_terms=_alt)}</th>'
                 for c in header_cells
             )
             tbody = ''.join(
                 '<tr>' + ''.join(
-                    f'<td>{render_inline(c, link_resolver, terms=terms, lexicon=lexicon, auto_lexicon=_al)}</td>'
+                    f'<td>{render_inline(c, link_resolver, terms=terms, lexicon=lexicon, auto_lexicon=_al, auto_local_terms=_alt)}</td>'
                     for c in row
                 ) + '</tr>'
                 for row in rows
@@ -981,7 +1006,7 @@ def parse_markdown(src, link_resolver=None, terms_out=None, lexicon=None):
             raw = '\n'.join(quote_lines)
             html_body = (
                 f'<blockquote>'
-                f'{render_inline(raw, link_resolver, terms=terms, lexicon=lexicon, auto_lexicon=auto_lex_now())}'
+                f'{render_inline(raw, link_resolver, terms=terms, lexicon=lexicon, auto_lexicon=auto_lex_now(), auto_local_terms=auto_local_now())}'
                 f'</blockquote>'
             )
             blocks.append({
@@ -1002,7 +1027,7 @@ def parse_markdown(src, link_resolver=None, terms_out=None, lexicon=None):
             raw = '\n'.join(item_lines)
             html_body = _render_list(
                 item_lines, link_resolver, terms=terms, claim_id=claim_id,
-                lexicon=lexicon, auto_lexicon=auto_lex_now(),
+                lexicon=lexicon, auto_lexicon=auto_lex_now(), auto_local_terms=auto_local_now(),
             )
             blocks.append({
                 'line_start': blk_line_start, 'line_end': i,
@@ -1022,7 +1047,7 @@ def parse_markdown(src, link_resolver=None, terms_out=None, lexicon=None):
             para_lines.append(lines[i].strip())
             i += 1
         raw = ' '.join(para_lines)
-        html_body = f'<p>{render_inline(raw, link_resolver, terms=terms, lexicon=lexicon, auto_lexicon=auto_lex_now())}</p>'
+        html_body = f'<p>{render_inline(raw, link_resolver, terms=terms, lexicon=lexicon, auto_lexicon=auto_lex_now(), auto_local_terms=auto_local_now())}</p>'
         blocks.append({
             'line_start': blk_line_start, 'line_end': i,
             'kind': 'paragraph', 'level': None, 'heading_path': heading_path(),
@@ -1038,7 +1063,8 @@ def parse_markdown(src, link_resolver=None, terms_out=None, lexicon=None):
     return title, blocks
 
 
-def _render_list(item_lines, link_resolver, terms=None, claim_id=None, lexicon=None, auto_lexicon=False):
+def _render_list(item_lines, link_resolver, terms=None, claim_id=None, lexicon=None, auto_lexicon=False,
+                 auto_local_terms=False):
     # Simple flat rendering with indent-based nesting by leading whitespace count // 2.
     ordered = bool(re.match(r'^\s*\d+\.\s+', item_lines[0])) if item_lines else False
     tag = 'ol' if ordered else 'ul'
@@ -1053,6 +1079,7 @@ def _render_list(item_lines, link_resolver, terms=None, claim_id=None, lexicon=N
             if out and out[-1].endswith('</li>'):
                 out[-1] = out[-1][:-5] + ' ' + render_inline(
                     line.strip(), link_resolver, terms=terms, lexicon=lexicon, auto_lexicon=auto_lexicon,
+                    auto_local_terms=auto_local_terms,
                 ) + '</li>'
             continue
         indent, marker, content = m.groups()
@@ -1076,7 +1103,7 @@ def _render_list(item_lines, link_resolver, terms=None, claim_id=None, lexicon=N
             li_id_attr = f' id="{term_id}"'
         out.append(
             f'<li{li_id_attr}>'
-            f'{render_inline(content, link_resolver, terms=terms, lexicon=lexicon, auto_lexicon=auto_lexicon)}'
+            f'{render_inline(content, link_resolver, terms=terms, lexicon=lexicon, auto_lexicon=auto_lexicon, auto_local_terms=auto_local_terms)}'
             f'</li>'
         )
         prev_indent = indent_level

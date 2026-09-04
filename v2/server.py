@@ -3085,7 +3085,23 @@ def list_item_ranges(text):
     return ranges
 
 
-def mark_layer_inner(block, link_resolver=None, terms=None, lexicon=None, auto_lexicon=False):
+def _auto_local_for(block, terms_out):
+    """Whether THIS block may auto-link the page's own Terms entries.
+
+    Mirrors mdblocks.parse_markdown's `auto_local_now()` on the mark-layer
+    render path, which re-renders prose sentence by sentence and so bypasses the
+    paragraph HTML parse_markdown produced. Before 2026-09-04 that path dropped
+    page-local term links from every paragraph on a v3 page: only list blocks,
+    which keep their parsed html verbatim, kept theirs. A page's own Terms
+    section still never links itself.
+    """
+    if not terms_out:
+        return False
+    return blockmap.norm(block.get('mark_layer_section_title') or '') != 'terms'
+
+
+def mark_layer_inner(block, link_resolver=None, terms=None, lexicon=None, auto_lexicon=False,
+                     auto_local_terms=False):
     """Render prose as sentence-addressable spans without disturbing rich blocks.
 
     Each sentence is a separate render_inline() call, but auto-lexicon linking's
@@ -3109,7 +3125,7 @@ def mark_layer_inner(block, link_resolver=None, terms=None, lexicon=None, auto_l
         pieces.append(
             f'<span class="mark-sentence" data-from="{start}" data-to="{end}" '
             f'data-quote="{quote_b64}">'
-            f'{render_inline(quote, link_resolver, terms=terms, lexicon=lexicon, auto_lexicon=auto_lexicon, auto_seen=auto_seen)}'
+            f'{render_inline(quote, link_resolver, terms=terms, lexicon=lexicon, auto_lexicon=auto_lexicon, auto_seen=auto_seen, auto_local_terms=auto_local_terms)}'
             f'</span>'
         )
     content = ' '.join(pieces)
@@ -3118,7 +3134,7 @@ def mark_layer_inner(block, link_resolver=None, terms=None, lexicon=None, auto_l
 
 
 def render_block_html(block, route_path, status_chip=None, link_resolver=None, terms=None,
-                       lexicon=None, auto_lexicon=False):
+                       lexicon=None, auto_lexicon=False, auto_local_terms=False):
     kind = block['kind']
     anchor = block['anchor']
     block_id = _html_attr_escape(block['id'])
@@ -3127,6 +3143,7 @@ def render_block_html(block, route_path, status_chip=None, link_resolver=None, t
     inner, has_sentence_units = mark_layer_inner(
         block, link_resolver, terms=terms, lexicon=lexicon,
         auto_lexicon=auto_lexicon and kind != 'heading',
+        auto_local_terms=auto_local_terms and kind != 'heading',
     )
     # Raw markdown source, base64'd, so the client can swap rendered HTML for an
     # editable <textarea> pre-filled with the exact source text (edit-as-comment,
@@ -3399,6 +3416,7 @@ def _rerender_block(route_path, workspace, fs_path, new_src, block_id, old_block
         status_chip=(wq_status_chip(new_block) if badges_on else None),
         link_resolver=resolver, terms=terms_out, lexicon=lexicon,
         auto_lexicon=auto_lexicon_page,
+        auto_local_terms=_auto_local_for(new_block, terms_out),
     )
     return {'block_id': new_block['id'], 'html': html}
 
@@ -3707,6 +3725,7 @@ def render_page(route_path, workspace=DEFAULT_WORKSPACE, view='classic'):
             terms=terms_out,
             lexicon=lexicon,
             auto_lexicon=auto_lexicon_page,
+            auto_local_terms=_auto_local_for(b, terms_out),
         )
         for b in blocks]
     if view == 'v3':

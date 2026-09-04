@@ -739,15 +739,33 @@ def render_inline(text, link_resolver=None, terms=None, lexicon=None, auto_lexic
         {alias for slug, entry in lexicon['by_slug'].items() for alias in entry['aliases']}
         if (auto_lexicon and lexicon and lexicon.get('by_alias')) else set()
     )
-    local_aliases = ({e['term'] for e in (terms or {}).values() if e.get('term')}
-                     if auto_local_terms else set())
+    # A local label may name several forms ("Watch-only / armed", "Path 0 / Path A"),
+    # the same ' / ' convention build_lexicon_index() uses for lexicon aliases. Split
+    # it, or the alternation only ever matches the literal joined string, which
+    # appears nowhere — so the terms with the MOST names got zero links.
+    # All-digit labels are dropped: the alternation runs while stashed code spans and
+    # links are still \x00N\x00 placeholders, and \x00 is a non-word char, so a bare
+    # number would match a placeholder INDEX and shred the output.
+    local_aliases = set()
+    if auto_local_terms:
+        for e in (terms or {}).values():
+            for alias in str(e.get('term') or '').split(' / '):
+                alias = alias.strip()
+                if alias and not alias.isdigit():
+                    local_aliases.add(alias)
     if lexicon_aliases or local_aliases:
         all_aliases = sorted(lexicon_aliases | local_aliases, key=len, reverse=True)
         if all_aliases:
             parts = []
             for alias in all_aliases:
                 esc = re.escape(alias)
-                if ' ' in alias or alias in local_aliases:
+                if alias in local_aliases:
+                    # `\b` treats `-` as a boundary, so `\bround\b` matches inside
+                    # "round-trip" and hovers a review-round definition over a
+                    # serializer test. A page-local coinage links only as a free
+                    # word, never as a limb of a hyphenated compound.
+                    parts.append(f'(?i:(?<![\\w-]){esc}(?![\\w-]))')
+                elif ' ' in alias:
                     parts.append(f'(?i:\\b{esc}\\b)')
                 else:
                     parts.append(f'\\b{esc}\\b')
@@ -760,7 +778,19 @@ def render_inline(text, link_resolver=None, terms=None, lexicon=None, auto_lexic
                 # #terms/#term-<slug> fallback above: if this page defines its
                 # own meaning for the matched word, link to that instead of
                 # the lexicon's.
-                local_entry = _find_term_by_label(matched, terms) if terms else None
+                # EXACT (case-insensitive) label match only. _find_term_by_label's
+                # containment fallback is correct for an explicit `[label](#terms)`
+                # link and wrong here: the lexicon alias "bracketed assent" — the
+                # phrase Mike actually ruled on — contains the local label
+                # "bracket", so containment handed the wrong definition to the
+                # longer, more specific phrase.
+                matched_l = matched.strip().lower()
+                local_entry = next(
+                    (e for e in (terms or {}).values()
+                     if any(a.strip().lower() == matched_l
+                            for a in str(e.get('term') or '').split(' / '))),
+                    None,
+                )
                 if local_entry:
                     seen_key = f'local:{local_entry["slug"]}'
                     if seen_key in seen_slugs:

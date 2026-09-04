@@ -36,6 +36,17 @@ def slugs_linked(blocks, in_terms_section=False):
     return out
 
 
+LEXICON_SRC = """# Lexicon
+
+### bracketed assent · two marks imply agreement to everything between them
+
+**What we mean.** Every line between two marks counts as at least acknowledged.
+
+### trunk · the main branch of a git repository
+
+**What we mean.** The line of development everything else merges into.
+"""
+
 PAGE = """# A page
 
 The trunk is the file. A bracket is a span between two marks.
@@ -74,9 +85,7 @@ class LocalTermLinking(unittest.TestCase):
         self.assertEqual(slugs_linked(blocks), [])
 
     def test_page_local_definition_wins_over_the_lexicon(self):
-        lexicon = mdblocks.build_lexicon_index(
-            "# Lexicon\n\n## trunk\n\nThe main branch of a git repository.\n"
-        )
+        lexicon = mdblocks.build_lexicon_index(LEXICON_SRC)
         blocks, _ = render('<!-- auto-lexicon -->\n' + PAGE, lexicon=lexicon)
         linked = slugs_linked(blocks)
         self.assertIn('trunk', linked)
@@ -149,3 +158,67 @@ class MarkLayerPath(unittest.TestCase):
         blocks, terms_out = self._blocks("# P\n\nThe trunk is the file.\n")
         para = next(b for b in blocks if b['kind'] == 'paragraph')
         self.assertFalse(self.server._auto_local_for(para, terms_out))
+
+
+class AdversarialPassFixes(unittest.TestCase):
+    """Findings from the `skip` adversarial pass, 2026-09-04. Each test names the
+    crack it closes and goes red against the first version of the change."""
+
+    def test_a_hyphenated_compound_is_not_a_use_of_the_term(self):
+        """`\\b` treats `-` as a boundary, so `round-trip identity test` linked the
+        definition of a review round. Live on the trunk page when found."""
+        src = ("# P\n\nThe round-trip identity test is a gate.\n\n"
+               "## Terms\n\n- **round** — one pass of a document between writer and reader.\n")
+        blocks, _ = render(src)
+        self.assertEqual(slugs_linked(blocks), [])
+
+    def test_a_free_standing_use_still_links(self):
+        src = ("# P\n\nEach round ends with a list.\n\n"
+               "## Terms\n\n- **round** — one pass of a document.\n")
+        blocks, _ = render(src)
+        self.assertIn('round', slugs_linked(blocks))
+
+    def test_a_slash_separated_label_links_each_of_its_names(self):
+        """`Watch-only / armed` produced one alternation branch matching the literal
+        joined string, which appears nowhere — the terms with the most names got
+        zero links."""
+        src = ("# P\n\nThe seat is armed. Before that it was watch-only.\n\n"
+               "## Terms\n\n- **Watch-only / armed** — whether the seat may act.\n")
+        blocks, _ = render(src)
+        # One TERM, so one link per block: `auto_seen` is keyed on the term, not
+        # the alias. What matters is that a name other than the literal joined
+        # string can match at all.
+        self.assertEqual(slugs_linked(blocks), ['watch-only-armed'])
+        two_blocks = ("# P\n\nThe seat is armed.\n\nBefore that it was watch-only.\n\n"
+                      "## Terms\n\n- **Watch-only / armed** \u2014 whether the seat may act.\n")
+        self.assertEqual(slugs_linked(render(two_blocks)[0]),
+                         ['watch-only-armed', 'watch-only-armed'])
+
+    def test_a_longer_lexicon_phrase_is_not_hijacked_by_a_shorter_local_label(self):
+        """`_find_term_by_label`'s containment fallback gave the local `bracket`
+        definition to the lexicon phrase `bracketed assent` — the phrase Mike
+        actually ruled on getting the wrong definition."""
+        lexicon = mdblocks.build_lexicon_index(LEXICON_SRC)
+        src = ("<!-- auto-lexicon -->\n# P\n\nReading rules: bracketed assent.\n\n"
+               "## Terms\n\n- **bracket** — the span between two explicit marks.\n")
+        blocks, _ = render(src, lexicon=lexicon)
+        self.assertEqual(slugs_linked(blocks), ['lex-bracketed-assent'])
+
+    def test_an_all_digit_label_never_enters_the_alternation(self):
+        """The alternation runs while code spans are still \\x00N\\x00 placeholders,
+        and \\x00 is a non-word char, so a bare number would match a placeholder
+        index and shred the output."""
+        src = ("# P\n\nSee `x` and item 12 below.\n\n"
+               "## Terms\n\n- **12** — a numbered item.\n")
+        blocks, _ = render(src)
+        for b in blocks:
+            self.assertNotIn('\x00', b['html'])
+
+    def test_the_server_terms_guard_actually_fires_on_a_capital_T_heading(self):
+        """blockmap.norm() does not lowercase, so comparing it against the literal
+        'terms' was True for every block on every page: the guard never fired."""
+        import server, blockmap
+        block = {'mark_layer_section_title': blockmap.norm('Terms')}
+        self.assertFalse(server._auto_local_for(block, {'trunk': {}}))
+        body = {'mark_layer_section_title': blockmap.norm('The model')}
+        self.assertTrue(server._auto_local_for(body, {'trunk': {}}))

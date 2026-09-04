@@ -3097,7 +3097,15 @@ def _auto_local_for(block, terms_out):
     """
     if not terms_out:
         return False
-    return blockmap.norm(block.get('mark_layer_section_title') or '') != 'terms'
+    # blockmap.norm() NFC-normalizes and collapses whitespace; it does NOT
+    # lowercase. Every page writes `## Terms` with a capital T, so comparing the
+    # normed title against the lowercase literal was True everywhere and this
+    # guard never fired once: the Terms section's own prose auto-linked to
+    # bullets two lines below it. Caught by the adversarial pass, not by the
+    # suite, because the suite pinned the OTHER copy of this rule
+    # (mdblocks.auto_local_now), which tracks heading LEVEL and was correct.
+    title = blockmap.norm(block.get('mark_layer_section_title') or '').strip().lower()
+    return title != 'terms'
 
 
 def mark_layer_inner(block, link_resolver=None, terms=None, lexicon=None, auto_lexicon=False,

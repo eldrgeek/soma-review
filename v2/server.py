@@ -5046,8 +5046,10 @@ def _ringer_attention_covers(marks, revision, rev_key):
 
     A mark covers a revision when it came after it AND its own text contains
     the revised text. A whole-block mark covers everything, as before. When
-    either side carries no usable text the mark still covers: an unknown span
-    keeps the old behaviour rather than flooding the list.
+    either side carries no usable text the mark does NOT cover: an unknown
+    span is listed rather than assumed seen, which is the over-report
+    direction this list is required to fail toward (see the inline comment
+    below for why).
     """
     rev_texts = _ringer_revision_texts(revision)
     for mark in marks:

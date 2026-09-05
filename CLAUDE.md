@@ -300,13 +300,23 @@ Still open, and named rather than hidden:
 - **A squash, rebase or amend rewrites shas**, so a sidecar row's recorded sha can stop
   matching any commit in history and its change gets rung as unattributed. Over-report, so it
   fails in the safe direction, but it is noise.
-- **Sentence-level attention vs block-level suppression.** Marks carry `from`/`to` offsets and
-  edits carry `sentence_index`; neither is used. A mark on sentence 1 suppresses a revision to
-  sentence 4 of the same block.
 - **Block-id drift cuts both ways.** A retired id drops that mark from `reached`, which can
   collapse the bracket edge and silently drop many rows, not just one.
 - **A round is not modelled.** The list is recomputed per render, so there is no persisted
   artifact showing that a given round closed with a given list.
+
+**Closed, but this doc had drifted (found and fixed 2026-09-05):** the section above used to
+also list "sentence-level attention vs block-level suppression" — a mark on sentence 1
+suppressing a revision to sentence 4 of the same block — as still open. It was already fixed
+the same day it was named, in `_ringer_attention_covers` (commit `98060eb2`, 2026-09-04): a
+mark only covers a revision when it comes after it AND its own quoted text contains the
+revised sentence whole (`_ringer_text_covers`), so an `ack` on one sentence no longer answers
+for a rewrite elsewhere in the block. Covered by `test_mark_on_another_sentence_does_not_suppress_the_revision`
+and `test_mark_on_the_revised_sentence_does_suppress_it` in `v2/tests/test_ringer_list.py`
+(27/27 passing). This doc just never got updated after the fix landed — the same staleness
+pattern sibling mission lines caught in Playmaker's ROADMAP.md twice today (Capture, Character
+Memory): a fix ships, the doc still calls it a gap, and the next reader re-derives or
+re-attempts work that is already done.
 
 ### Three holes closed (2026-09-04, second pass)
 

@@ -3147,8 +3147,30 @@ V3_JS = r"""
   function hideMarkBar(){ if (markBar) { markBar.remove(); markBar = null; } }
 
   function showMarkBar(wrap, rect){
+    // Snapshot the payload NOW, while the selection is still live (we are
+    // called straight from a selectionchange handler). A touch device clears
+    // the DOM selection on the button's own touchstart, before any
+    // synthesized mousedown/click reaches the handler below — so recomputing
+    // blockPayload(wrap) at press time saw a collapsed selection and always
+    // refused ("Selection lost"), making every sentence-level mark kind
+    // unreachable on touch. Reading window.getSelection() once here, while
+    // it is still the selection the bar was raised for, removes that
+    // dependency entirely; the handler below just posts what was captured.
+    // Accepted trade-off (Skip's adversarial pass, 2026-09-05): the block's
+    // text could change between the bar being raised and the tap landing
+    // (someone else's edit lands via soma-comment-saved) — the old
+    // press-time recompute would have picked that up, this frozen payload
+    // won't. That fails SAFE, not silently: a stale quote/block_text_sha
+    // mismatches validated_binding() and the server refuses 409 rather than
+    // misbinding to the wrong span (same guarantee test_stale_offsets_on_
+    // ambiguous_duplicate_quote_refuse_not_misbind already proves for the
+    // sibling stale-offset path). Worth a dedicated test if concurrent
+    // editing on the same page becomes real; today's usage is one reader at
+    // a time, so this is speculative rather than live.
+    const payload = blockPayload(wrap);
+    if (payload.to === null) return;
     hideMarkBar();
-    markBar = document.createElement('div');
+    const bar = markBar = document.createElement('div');
     markBar.className = 'v3-markbar';
     markBar.innerHTML = MARKBAR_KINDS
       .map(([k, label]) => `<button data-v3-mark="${k}">${KIND_META[k].glyph} ${label}</button>`)
@@ -3157,25 +3179,24 @@ V3_JS = r"""
     markBar.style.top = (window.scrollY + rect.top - markBar.offsetHeight - 8) + 'px';
     markBar.style.left = (window.scrollX + rect.left) + 'px';
     markBar.querySelectorAll('[data-v3-mark]').forEach(btn => {
-      // mousedown, not click: a click would first collapse the selection the
-      // payload is computed from.
-      btn.addEventListener('mousedown', async (e) => {
-        if (e.button !== 0) return;
+      // Bound on both mousedown (desktop) and touchstart (mobile — a tap's
+      // synthesized mousedown/click fires ~300ms after touchend on most
+      // mobile browsers, by which point the bar may already be gone). One
+      // `fired` guard shared by both listeners stops a real touch tap from
+      // posting twice if a browser sends both events for the same press.
+      let fired = false;
+      const fire = async (e) => {
+        if (e.type === 'mousedown' && e.button !== 0) return;
         e.preventDefault();
-        const payload = blockPayload(wrap);
-        // The bar exists only to write a span. If the selection is gone by the
-        // time the press lands — which is what a touch device does, dismissing
-        // the selection on touchstart before any synthesized mousedown — then
-        // posting anyway would write a WHOLE-BLOCK mark under a toast saying
-        // "one sentence", and a whole-block mark suppresses every revision in
-        // the paragraph. Refuse instead: an unavailable affordance is recoverable,
-        // a wrong record with a confident receipt is not.
-        if (payload.to === null) {
-          toast('Selection lost — select the sentence again to mark it.');
-          hideMarkBar();
-          return;
-        }
-        markBar.querySelectorAll('button').forEach(b => { b.disabled = true; });
+        // `bar` is this closure's own bar; `markBar` is whatever bar (if any)
+        // is currently live. They diverge only if this bar was already torn
+        // down (selectionchange/scroll) before the press landed on a node a
+        // caller kept a reference to after it left the document — not a real
+        // tap (a removed node isn't on screen to tap), so there is nothing
+        // to disable and nothing to post.
+        if (fired || markBar !== bar) return;
+        fired = true;
+        bar.querySelectorAll('button').forEach(b => { b.disabled = true; });
         try {
           await postComment({anchor: wrap.dataset.anchor, snapshot: payload.quote,
                              text: KIND_META[btn.dataset.v3Mark].label, type: 'mark',
@@ -3186,7 +3207,9 @@ V3_JS = r"""
         }
         hideMarkBar();
         window.getSelection().removeAllRanges();
-      });
+      };
+      btn.addEventListener('mousedown', fire);
+      btn.addEventListener('touchstart', fire, {passive: false});
     });
   }
 

@@ -181,15 +181,17 @@ class V3SentenceMarkTests(unittest.TestCase):
         self.assertEqual(1, len(marks), 'the mark must be accepted, not refused 409')
         self.assertFalse(marks[0].get('unresolved'))
 
-    def test_a_lost_selection_is_refused_not_recorded_whole_block(self):
-        """A touch device dismisses the selection before the press lands. Posting
-        anyway would write a whole-block mark — which suppresses every revision
-        in the paragraph — under a toast claiming one sentence."""
+    def test_a_press_on_a_bar_already_taken_down_writes_nothing(self):
+        """A retained reference to a bar's button, dispatched to after the bar
+        was already torn down by a later selectionchange, cannot correspond to
+        a real tap (a removed node isn't on screen to tap) — but the handler
+        must not crash on it, and must not post the payload it captured
+        earlier either. This used to crash inside the handler (`markBar` was
+        already null) and wrote nothing by accident, which looked like a pass
+        for the wrong reason; asserting on `page.errors` (pageerror listener)
+        makes the accidental-crash path fail this test instead of exercising it."""
         self._select_sentence(1)
         self.page.wait_for_selector('.v3-markbar')
-        # Hold the button, THEN drop the selection: losing it removes the bar
-        # from the document (the safe branch), so the press has to be delivered
-        # to the retained node to exercise the branch where it does not.
         self.page.evaluate("""() => {
             const btn = document.querySelector('.v3-markbar [data-v3-mark="ack"]');
             window.__retainedBtn = btn;
@@ -201,14 +203,34 @@ class V3SentenceMarkTests(unittest.TestCase):
                            "new MouseEvent('mousedown', {bubbles: true, button: 0}))")
         self.page.wait_for_timeout(600)
         self.assertEqual([], [r for r in self._rows() if r.get('type') == 'mark'],
-                         'no selection means no mark, not a whole-block mark')
-        # The absence of a row is not proof the guard ran: before the guard, the
-        # same press threw inside the handler (markBar was already null) and
-        # wrote nothing by accident. The refusal message is what distinguishes
-        # a deliberate refusal from a crash that happened to be harmless.
-        self.assertIn('Selection lost',
-                      self.page.eval_on_selector('#toast', 'el => el.textContent'),
-                      'the reader must be told why nothing was marked')
+                         'a bar that no longer exists cannot record a mark')
+        self.assertEqual([], self.errors, 'the stale-bar press must not throw')
+
+    def test_touch_clearing_selection_before_the_tap_lands_still_marks(self):
+        """The actual bug: on a touch device, the tap that presses a mark-bar
+        button clears the DOM selection (via touchstart's default action)
+        before the button's own press handler runs. The old handler
+        recomputed its payload from the live selection at press time, saw it
+        empty, and silently refused every sentence mark on touch. The fix
+        snapshots the payload when the bar is raised, while the selection is
+        still the one it was raised for, so the press can go on to write it
+        even though the live selection is gone by the time the tap lands."""
+        self._select_sentence(1)
+        self.page.wait_for_selector('.v3-markbar')
+        self.page.evaluate("""() => {
+            const btn = document.querySelector('.v3-markbar [data-v3-mark="ack"]');
+            // Mirror the real device ordering: the selection is gone before
+            // the button's own touchstart handler executes.
+            window.getSelection().removeAllRanges();
+            btn.dispatchEvent(new Event('touchstart', {bubbles: true, cancelable: true}));
+        }""")
+        self.page.wait_for_timeout(800)
+        marks = [r for r in self._rows() if r.get('type') == 'mark']
+        self.assertEqual(1, len(marks), 'a touch tap must still record the sentence it was raised for')
+        self.assertEqual('ack', marks[0]['mark_kind'])
+        self.assertEqual('Beta is the second sentence.', marks[0]['quote'])
+        self.assertFalse(marks[0].get('unresolved'))
+        self.assertEqual([], self.errors)
 
     def test_no_mark_bar_without_a_selection(self):
         self.assertEqual(0, self.page.eval_on_selector_all('.v3-markbar', 'e => e.length'))

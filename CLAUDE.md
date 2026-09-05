@@ -1133,13 +1133,30 @@ returns unresolved otherwise — an ambiguous quote across duplicate list items 
 (`test_stale_offsets_on_ambiguous_duplicate_quote_refuse_not_misbind`). Both paths were already
 safe by construction; this closes the open question with tests rather than leaving it unverified.
 
-Still open, named rather than fixed here: a soft-wrapped list-item continuation line is invisible
-to `list_item_ranges()` (it only ranges the item's first physical line, splitting on
-`text.splitlines()`), so a wrapped item's bound quote is shorter than its full rendered text —
-pre-existing in the ranges function itself (shared with the classic view), not introduced by this
-change, and not a binding-safety issue (the bound quote still resolves), just an under-selection
-for that one item shape; the mark bar is still mouse-only (no Tab+Enter) and touch is untested;
-and **two or more consecutive deleted sentences collapse to the same zero-width coordinate** — a fresh mark on either would be ambiguous between them if one could ever bind to
+**Fixed same day (207fbe1, 02:10:45 EDT), doc corrected here since this paragraph kept calling it
+open afterward:** a soft-wrapped list-item continuation line used to be invisible to
+`list_item_ranges()` (it only ranged the item's first physical line); folding is now
+indent-independent, with a named accepted limitation that a continuation line which itself looks
+like a marker line still reads as a new item (pinned by test, not a misbinding).
+
+**Fixed 2026-09-05 (mission-1): the mark bar reaches touch, not mouse-only.** `showMarkBar`'s
+button handlers used to recompute `blockPayload(wrap)` from the live `window.getSelection()` at
+press time; a tap's own `touchstart` clears the DOM selection (browser default action) before any
+synthesized mousedown/click reaches that handler, so every sentence-level mark kind was silently
+unreachable on touch — the device the tool's primary reader actually reads on. Fixed by snapshotting
+`blockPayload(wrap)` once, synchronously, when the bar is raised (`showMarkBar` is called straight
+from a `selectionchange` listener, so the selection is still live then) and posting that frozen
+payload from either a `mousedown` or a `touchstart` listener, guarded by one `fired` flag against a
+double-post. Skip's adversarial pass found one real, low-severity, accepted trade-off: the block's
+text could change between the bar being raised and the tap landing (concurrent editing), and the
+frozen payload wouldn't reflect it — but that fails safe (server 409 on a stale quote/sha via
+`validated_binding()`, not misbinding), and is speculative under today's one-reader-at-a-time usage.
+Tests: `test_touch_clearing_selection_before_the_tap_lands_still_marks` (the real regression case)
+and `test_a_press_on_a_bar_already_taken_down_writes_nothing` (a stale/detached bar must no-op, not
+crash) in `test_v3_sentence_marks.py`.
+
+Still open, named rather than fixed here:
+**two or more consecutive deleted sentences collapse to the same zero-width coordinate** — a fresh mark on either would be ambiguous between them if one could ever bind to
 a del span at all (latent, found by the same adversarial pass). **Re-checked 2026-09-05: not
 exploitable today, for a different reason than "rare in the corpus."** `sentenceSpanInBlock`'s
 own `to <= from` guard refuses every zero-width selection before it reaches `from`/`to` at all —

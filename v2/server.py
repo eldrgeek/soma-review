@@ -34,6 +34,7 @@ import blockmap  # noqa: E402
 from blockmap import norm  # noqa: E402
 import tours as tour_engine  # noqa: E402  (Quinn tours of completed jobs — see tours.py)
 import cursor_intake  # noqa: E402  (Grok/Cursor intake — see SOMA/cursor-intake/README.md)
+from mark_layer_adapter import to_mark_layer_nodes  # noqa: E402  (SOMA agreed model item 6a)
 
 PROJECTS_ROOT = os.path.expanduser('~/Projects')
 DISPATCH_PROMPT_TEMPLATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dispatch-prompt-template.md')
@@ -6407,6 +6408,32 @@ class Handler(BaseHTTPRequestHandler):
                        'url_prefix': workspace_url_prefix(slug)}
                 for slug, cfg in workspaces.items()
             })
+            return
+
+        if path == '/api/mark-layer':
+            # SOMA agreed model item 6a, first live surface: expose
+            # to_mark_layer_nodes's node/fragment shape for a page's raw
+            # markdown source. Deliberately a NEW endpoint, not a change to
+            # any existing route's response — /page/*, /api/comments etc.
+            # keep their current wire format untouched, so this is safe to
+            # ship without a live-consumer migration. Not yet linked from
+            # any page UI; a script or the eventual mark-bar client reads it
+            # directly. Deliberately absent from TUNNEL_ALLOWED_GET (fail-closed
+            # default, see the block above) — loopback-only for now; add it to
+            # the allowlist when a real tunnel consumer (e.g. Mike's phone)
+            # needs it, per Skip's 2026-09-05 review of this route.
+            page = qs.get('page', [''])[0]
+            if not page:
+                self._send_json({'error': 'page required'}, status=400)
+                return
+            try:
+                fs_path = resolve_page(page, workspace)
+            except NotFoundError:
+                self._send_json({'error': 'unknown page or workspace'}, status=404)
+                return
+            with open(fs_path, 'rb') as handle:
+                src = handle.read().decode('utf-8')
+            self._send_json({'page': page, 'nodes': to_mark_layer_nodes(src)})
             return
 
         if path == '/healthz':

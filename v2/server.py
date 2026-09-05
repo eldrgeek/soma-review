@@ -3405,7 +3405,17 @@ def sentence_ranges(text):
         punct_at = match.start()
         if normalized[punct_at] == '.':
             prefix = normalized[start:punct_at]
-            token_match = re.search(r'([A-Za-z](?:[A-Za-z.]*)?)$', prefix)
+            # Unicode-letter class, not [A-Za-z]: an accented single-letter
+            # initial ("É. Dupont a dit ça.") has no ASCII match here, so
+            # `token` came back empty and this fell through to "real
+            # boundary" — while mdblocks._is_sentence_abbreviation's own
+            # single-letter check (word.isalpha(), Unicode-aware) and
+            # Playmaker's splitSentences (`^\p{L}$`) both correctly treat it
+            # as an initial. Found by the cross-engine parity test
+            # (test_engine_parity.py) comparing this function — the one that
+            # actually decides which spans render as clickable — against
+            # those two, 2026-09-05.
+            token_match = re.search(r'([^\W\d_](?:[^\W\d_]|\.)*)$', prefix)
             token = (token_match.group(1).lower().rstrip('.') if token_match else '')
             if token and _is_sentence_abbreviation(token):
                 continue

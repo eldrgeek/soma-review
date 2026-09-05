@@ -3355,16 +3355,53 @@ def list_item_ranges(text):
     """Return exact normalized ranges for each visible Markdown list item.
 
     Lists remain one durable block, while each rendered ``li`` becomes an
-    independently addressable review unit inside that block.
+    independently addressable review unit inside that block. A soft-wrapped
+    item's continuation lines (no marker of their own) are folded into the
+    same item instead of being dropped, so the bound quote covers the item's
+    full rendered text, not just its first physical line.
+
+    Folding is indent-independent by design: this function only ever runs on
+    text already identified as one list block, so any interior line that is
+    neither blank nor itself a marker line has nowhere else to belong. The
+    estate's real markdown wraps list items flush-left with no continuation
+    indent (verified against `_estate/*.md`), so gating the fold on "more
+    indented than the marker" — the first version of this fix — silently
+    missed the dominant real-world case (caught by an adversarial pass before
+    ship).
+
+    Known, accepted trade-off: a continuation line that itself happens to
+    look like a marker (e.g. an author wraps "...see item\n2. below for
+    detail." as one sentence) reads as the start of a new item instead of a
+    continuation. This mirrors the pre-fix behavior for the "new item"
+    reading and is the same ambiguity CommonMark resolves with "does this
+    line interrupt a paragraph" rules this parser does not implement; it is
+    not a misbinding (the resulting range still resolves to real, correct
+    text), only a segmentation call this function does not attempt to
+    perfect.
     """
     normalized = blockmap.norm(text)
     ranges = []
     cursor = 0
-    for line in text.splitlines():
-        match = re.match(r'^\s*(?:[-*+]|\d+\.)\s+(.*)$', line)
+    lines = text.splitlines()
+    marker_re = re.compile(r'^\s*(?:[-*+]|\d+\.)\s+(.*)$')
+    i = 0
+    n = len(lines)
+    while i < n:
+        match = marker_re.match(lines[i])
         if not match:
+            i += 1
             continue
-        quote = blockmap.norm(match.group(1))
+        parts = [match.group(1)]
+        i += 1
+        while i < n:
+            cont = lines[i]
+            if not cont.strip():
+                break
+            if marker_re.match(cont):
+                break
+            parts.append(cont.strip())
+            i += 1
+        quote = blockmap.norm(' '.join(parts))
         if not quote:
             continue
         start = normalized.find(quote, cursor)

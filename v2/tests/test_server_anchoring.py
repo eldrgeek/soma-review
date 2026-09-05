@@ -166,6 +166,66 @@ class ServerAnchoringTests(unittest.TestCase):
                 'quote': 'Buy milk',
             })
 
+    def test_list_item_ranges_folds_soft_wrapped_continuation_lines(self):
+        # Line-1 next item (20260905T052632Z-mission-1): a soft-wrapped list
+        # item's continuation line (no marker of its own) was invisible to
+        # list_item_ranges() — only the item's first physical splitlines()
+        # line was ranged, so the bound quote under-selected the item's full
+        # rendered text. Fixed by folding continuation lines into the same
+        # item before matching, indent-independent: the first version of
+        # this fix required the continuation to be MORE indented than the
+        # marker, but an adversarial pass + a grep of `_estate/*.md` found
+        # the estate's real wraps are flush-left (zero extra indent), which
+        # that version silently missed — the exact case this test now pins.
+        text = (
+            '- First item wraps\n'
+            'with no continuation indent at all.\n'
+            '- Second item, single line.\n'
+            '1. Ordered item also wraps\n'
+            'flush-left too.\n'
+        )
+        normalized = blockmap.norm(text)
+        ranges = server.list_item_ranges(text)
+        quotes = [normalized[start:end] for start, end, _quote in ranges]
+        self.assertEqual(
+            [
+                'First item wraps with no continuation indent at all.',
+                'Second item, single line.',
+                'Ordered item also wraps flush-left too.',
+            ],
+            quotes,
+        )
+        starts = [start for start, _end, _quote in ranges]
+        self.assertEqual(starts, sorted(starts))
+        self.assertEqual(len(starts), len(set(starts)))
+
+    def test_list_item_ranges_nested_item_is_not_swallowed_as_continuation(self):
+        # A nested list item (its own marker, deeper indent) must still be
+        # its own range, not folded into the parent as a continuation line —
+        # the marker check has to run before any indent reasoning.
+        text = '- First **claim**.\n  - Nested second claim.\n- Final claim.'
+        ranges = server.list_item_ranges(text)
+        normalized = blockmap.norm(text)
+        self.assertEqual(
+            ['First **claim**.', 'Nested second claim.', 'Final claim.'],
+            [normalized[start:end] for start, end, _quote in ranges],
+        )
+
+    def test_list_item_ranges_marker_like_continuation_becomes_its_own_item(self):
+        # Named limitation (Skip's adversarial pass, 2026-09-05): a
+        # continuation line that itself looks like a marker is read as a new
+        # item, not folded — e.g. an author soft-wraps "see item / 2. below
+        # for detail." as one sentence. Not a misbinding (both resulting
+        # ranges still resolve to real, correct text); pinning the actual
+        # behavior so a future change to this can see what it's changing.
+        text = '1. See the note\n2. below for detail.\n'
+        normalized = blockmap.norm(text)
+        ranges = server.list_item_ranges(text)
+        self.assertEqual(
+            ['See the note', 'below for detail.'],
+            [normalized[start:end] for start, end, _quote in ranges],
+        )
+
     def test_post_mark_persists_review_metadata(self):
         self.write_doc('# Review title\n\nA focused sentence for review.\n')
         server.render_page('docs/page.md')

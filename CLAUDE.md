@@ -1087,11 +1087,36 @@ the old flat `v3RenderDiffHtml` only when the block has fewer than 2 sentence un
 lists, anything that never had spans to begin with — that bound is genuinely still open, see
 below).
 
-Still open, named rather than fixed here: **list blocks** (their per-item ranges live in
-`data-list-units` and are unused here or by the sentence-mark bar in general — a list item inside
-an open change is still whole-block-only); the bar is mouse-only (no Tab+Enter) and touch is
-untested; and **two or more consecutive deleted sentences collapse to the same zero-width
-coordinate** — a fresh mark on either would be ambiguous between them if one could ever bind to
+**Fixed 2026-09-05: list items are now addressable in v3.** `data-list-units` (per-item ranges,
+already used by the classic dwell layer's `hydrateRichUnits()`) had no v3 equivalent, so a list
+item had zero binding of any kind in v3 — worse than the generic whole-block fallback other rich
+blocks get, since `has_sentence_units` is True for a list with items and the block-body never got
+the catch-all `.mark-block-unit` class either. `hydrateListUnits()` (shared PAGE_JS scope, not
+view-gated) now decorates each rendered `<li>` with `.mark-block-unit`/`data-from`/`data-to`/
+`data-quote` on every page load; `sentenceSpanInBlock()` was widened to query
+`.mark-sentence, .mark-block-unit` so the same selection-to-span clipping logic works over
+hydrated list items. No server change was needed — `list_item_ranges()` already produces the same
+`(start, end, quote)` shape in the same `blockmap.norm()` coordinate space `sentence_ranges()`
+uses, and the classic view already posts real marks through the identical API with this shape.
+
+Skip's adversarial pass caught one real regression before this shipped: `v3PaintInlineDiffs`'s
+flat word-diff fallback (for blocks `v3RenderSentenceDiffBody` bails on) replaces `body.innerHTML`
+with plain `<span>` diff text and no `<ul>/<li>` markup at all — harmless before this fix (a list
+item had no binding to lose), a real regression after it (an open edit/replace mark on a list
+block destroyed every item's binding, and the list stopped rendering as a list, until the mark
+resolved). Fixed by skipping that fallback specifically when the block already carries hydrated
+`.mark-block-unit` children (`v3PaintInlineDiffs`, `server.py`) — such a block keeps its real,
+addressable rendering instead, with no inline diff overlay for that one block shape. Tests:
+`tests/test_v3_sentence_marks.py::V3ListItemMarkTests` (5 cases, including the open-edit
+regression case).
+
+Still open, named rather than fixed here: a soft-wrapped list-item continuation line is invisible
+to `list_item_ranges()` (it only ranges the item's first physical line, splitting on
+`text.splitlines()`), so a wrapped item's bound quote is shorter than its full rendered text —
+pre-existing in the ranges function itself (shared with the classic view), not introduced by this
+change, and not a binding-safety issue (the bound quote still resolves), just an under-selection
+for that one item shape; the mark bar is still mouse-only (no Tab+Enter) and touch is untested;
+and **two or more consecutive deleted sentences collapse to the same zero-width coordinate** — a fresh mark on either would be ambiguous between them if one could ever bind to
 a del span at all (latent, found by the same adversarial pass). **Re-checked 2026-09-05: not
 exploitable today, for a different reason than "rare in the corpus."** `sentenceSpanInBlock`'s
 own `to <= from` guard refuses every zero-width selection before it reaches `from`/`to` at all —

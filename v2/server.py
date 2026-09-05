@@ -792,6 +792,37 @@ function b64ToUtf8(b64) {
   return new TextDecoder('utf-8').decode(bytes);
 }
 
+function utf8ToB64(s) { return btoa(unescape(encodeURIComponent(s || ''))); }
+
+// data-list-units (mark_layer_inner, kind=='list') carries one {from,to,quote}
+// per rendered <li>, in the same normalized code-point coordinate system as a
+// paragraph's .mark-sentence spans. The classic dwell layer already turns
+// this into per-item .mark-block-unit elements (MARK_LAYER_JS's own
+// hydrateRichUnits, gated by __MARK_LAYER__); v3 never called an equivalent,
+// so a list item in v3 had no addressable unit at all — not even the
+// whole-block fallback sentenceSpanInBlock() gives every other rich block,
+// since kind=='list' blocks are the one case where has_sentence_units is
+// True (list_units is non-empty) yet nothing in the rendered HTML carries a
+// binding. This is the shared (non-classic) hydration so v3's sentence-mark
+// bar can reach a list item the same way it reaches a sentence.
+function hydrateListUnits() {
+  document.querySelectorAll('.block-wrap[data-list-units]').forEach(wrap => {
+    if (wrap.dataset.listUnitsHydrated) return;
+    wrap.dataset.listUnitsHydrated = '1';
+    let units = [];
+    try { units = JSON.parse(b64ToUtf8(wrap.dataset.listUnits)); } catch (_) { return; }
+    const items = Array.from(wrap.querySelectorAll('.block-body li'));
+    units.forEach((unit, index) => {
+      const item = items[index];
+      if (!item) return;
+      item.classList.add('mark-block-unit');
+      item.dataset.from = unit.from;
+      item.dataset.to = unit.to;
+      item.dataset.quote = utf8ToB64(unit.quote || '');
+    });
+  });
+}
+
 function escapeHtml(s) {
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
@@ -1073,7 +1104,11 @@ function sentenceSpanInBlock(el) {
   const sel = window.getSelection();
   if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return null;
   const range = sel.getRangeAt(0);
-  const units = Array.from(el.querySelectorAll('.mark-sentence'));
+  // .mark-block-unit here means a hydrated list item (hydrateListUnits) — the
+  // other user of that class, a whole atomic block (table/code/etc.), is a
+  // single element and bails out on the length check below same as it always
+  // did.
+  const units = Array.from(el.querySelectorAll('.mark-sentence, .mark-block-unit'));
   if (units.length < 2) return null;
   const hit = units.filter(u => {
     const unitRange = document.createRange();
@@ -1542,6 +1577,7 @@ document.addEventListener('DOMContentLoaded', () => {
     window.initMarkLayer();
     return;
   }
+  hydrateListUnits();
   wireBlockAffordances();
   wireEditableBlocks();
   wireEnterOpensComment();
@@ -2486,6 +2522,19 @@ V3_JS = r"""
         // that never had sentence units to begin with.
         let painted = null;
         try { painted = v3RenderSentenceDiffBody(body, mark.snapshot || ''); } catch(_) { painted = null; }
+        // A list block (hydrateListUnits, 2026-09-05) has real per-item
+        // .mark-block-unit bindings on its <li> elements, not .mark-sentence
+        // spans, so v3RenderSentenceDiffBody always bails here — but the flat
+        // v3RenderDiffHtml fallback below replaces body.innerHTML with plain
+        // <span class="diff-del/ins"> text and NO <ul>/<li> markup at all.
+        // That erases every item's binding for as long as the mark stays
+        // open (found by Skip's adversarial pass before this shipped: the
+        // "fallback" for a list block is a regression, not a degrade, since
+        // this fix is what gave list items a binding to lose). Leave the
+        // block's real, addressable rendering alone instead; its mark is
+        // still reachable via the dialog, just without an inline diff
+        // overlay for this block shape.
+        if (painted == null && body.querySelector('.mark-block-unit')) return;
         body.innerHTML = painted != null ? painted : v3RenderDiffHtml(mark.snapshot || '', mark.proposed || '');
         body.classList.add('v3-inline-diff');
         body.dataset.v3MarkId = mark.id;

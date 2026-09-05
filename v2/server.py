@@ -466,6 +466,10 @@ a.external-link::after { content: " \2197"; font-size: 11px; opacity: .6; }
                           background: #1c2230; color: #8a93a3; border: 1px solid #262b33; }
 .workspace-switcher a.active { background: #22344a; color: #9cc7ff; border-color: #2a5adf; }
 .workspace-switcher a:hover { color: #cbd3e0; }
+.mark-layer-node-badge { margin-left: 8px; padding: 1px 7px; border-radius: 10px;
+                          font-size: 10px; font-weight: 600; background: #1c2230; color: #8a93a3;
+                          border: 1px solid #262b33; vertical-align: middle; cursor: default; }
+.mark-layer-node-badge:not([hidden]) { display: inline-block; }
 .sidebar a { display: block; padding: 6px 8px; border-radius: 6px; text-decoration: none; font-size: 14px; color: #cbd3e0; }
 .sidebar a:hover { background: #1e2430; }
 .sidebar a.active { background: #22344a; color: #9cc7ff; }
@@ -1571,8 +1575,31 @@ function wireTermPopovers() {
   });
 }
 
+function wireMarkLayerNodeIndicator() {
+  // First on-page (not console-only) consumer of window.__MARK_LAYER_NODES__
+  // (SOMA agreed model item 6a). Deliberately inert beyond a read-only count:
+  // this does not gate rendering, does not touch existing block/comment DOM,
+  // and hides itself entirely when the value is absent or empty so it can
+  // never appear as a false claim about a page the adapter failed to parse.
+  const badge = document.getElementById('mark-layer-node-badge');
+  if (!badge) return;
+  const nodes = window.__MARK_LAYER_NODES__;
+  if (!Array.isArray(nodes) || nodes.length === 0) return;
+  const counts = {};
+  for (const n of nodes) {
+    const kind = (n && n.kind) || 'unknown';
+    counts[kind] = (counts[kind] || 0) + 1;
+  }
+  const breakdown = Object.keys(counts).sort().map(k => `${k}: ${counts[k]}`).join(', ');
+  badge.textContent = `${nodes.length} mark-layer nodes`;
+  badge.title = breakdown;
+  badge.hidden = false;
+  console.debug('[mark-layer]', nodes.length, 'nodes', counts);
+}
+
 document.addEventListener('DOMContentLoaded', () => {
   wireTermPopovers();
+  wireMarkLayerNodeIndicator();
   if (window.__MARK_LAYER__ && typeof window.initMarkLayer === 'function') {
     wireVerdictButtons();
     wireReviewButtons();
@@ -4296,6 +4323,7 @@ def render_page(route_path, workspace=DEFAULT_WORKSPACE, view='classic'):
 <body{body_class}>
 <nav class="sidebar">
   <a href="{url_prefix}/page/{ws['home']}" style="font-weight:700;font-size:15px;color:#e6e6e6;">soma-review</a>
+  <span id="mark-layer-node-badge" class="mark-layer-node-badge" hidden></span>
   {render_view_toggle(view, route_path, workspace)}
   {render_workspace_switcher(workspace)}
   {render_sidebar(route_path, workspace)}

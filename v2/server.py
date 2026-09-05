@@ -2167,6 +2167,100 @@ V3_JS = r"""
       return esc;
     }).join('');
   }
+  function utf8ToB64(s){ return btoa(unescape(encodeURIComponent(s || ''))); }
+  // Approximate sentence splitter for PAINTING the diff only — it is not the
+  // binding boundary (that stays sentence_ranges() server-side / the
+  // .mark-sentence spans' own data-from/data-to). Good enough to decide where
+  // a <del>/<ins> run starts inside an open edit, not exact on abbreviations.
+  function splitSentencesApprox(text){
+    const t = (text || '').trim();
+    if (!t) return [];
+    const parts = t.match(/[^.!?]+[.!?]+(?:["'”’)\]]+)?(?:\s+|$)|[^.!?]+$/g) || [t];
+    return parts.map(s => s.trim()).filter(Boolean);
+  }
+  // Sentence-level LCS, same shape as v3WordDiff but aligning whole sentences
+  // (before = the block's existing .mark-sentence quotes, after = the
+  // proposed text's approximate sentences) so unchanged sentences keep their
+  // real span (data-from/data-to/data-quote, and their rendered links/HTML)
+  // and only the sentences that actually changed lose their binding.
+  function sentenceLCSDiff(a, b){
+    const dp = Array.from({length: a.length+1}, () => new Array(b.length+1).fill(0));
+    for (let i=a.length-1; i>=0; i--) for (let j=b.length-1; j>=0; j--)
+      dp[i][j] = a[i]===b[j] ? dp[i+1][j+1]+1 : Math.max(dp[i+1][j], dp[i][j+1]);
+    let i=0, j=0, out=[];
+    while (i<a.length && j<b.length) {
+      if (a[i]===b[j]) { out.push({t:'eq', ai:i, bj:j}); i++; j++; }
+      else if (dp[i+1][j] >= dp[i][j+1]) { out.push({t:'del', ai:i}); i++; }
+      else { out.push({t:'ins', bj:j}); j++; }
+    }
+    while (i<a.length) { out.push({t:'del', ai:i}); i++; }
+    while (j<b.length) { out.push({t:'ins', bj:j}); j++; }
+    return out;
+  }
+  // A del immediately followed by an ins at the same position is a rewritten
+  // sentence, not a removal-plus-addition — word-diff inside it so a small
+  // wording change doesn't paint the whole sentence red-then-green.
+  function mergeSentenceOps(ops){
+    const merged = [];
+    for (let k = 0; k < ops.length; k++) {
+      if (ops[k].t === 'del' && ops[k+1] && ops[k+1].t === 'ins') {
+        merged.push({t:'mod', ai: ops[k].ai, bj: ops[k+1].bj});
+        k++;
+      } else merged.push(ops[k]);
+    }
+    return merged;
+  }
+  // Renders a block's open edit/replace mark sentence-by-sentence, instead of
+  // v3RenderDiffHtml's flat whole-block word diff, so unchanged sentences keep
+  // a real .mark-sentence span (sentenceSpanInBlock() can still bind a
+  // selection on them) and only changed sentences carry <del>/<ins>. Returns
+  // null if the block has no real sentence units (heading/list/etc. — falls
+  // back to the flat diff, same as before this change).
+  //
+  // `body`'s existing .mark-sentence spans are the AFTER state, not the
+  // before state: apply_sentence_change() writes mark.proposed straight into
+  // the trunk file the moment the edit mark is created, so every render from
+  // then on parses the already-mutated document. That means body already has
+  // real, usable bindings (data-from/data-to) for the CURRENT text — passing
+  // mark.proposed as "after" here would diff the live document against
+  // itself and every sentence would land in the `eq` bucket, painting no
+  // diff at all (caught by Skip's adversarial pass, 2026-09-05, before this
+  // shipped). `beforeText` (mark.snapshot, plain source text, no bindings)
+  // is the side that gets word-diffed against the real spans.
+  function v3RenderSentenceDiffBody(body, beforeText){
+    const afterEls = Array.from(body.querySelectorAll('.mark-sentence'));
+    if (afterEls.length < 2) return null; // not a multi-sentence prose block
+    const afterUnits = afterEls.map(u => ({
+      from: u.dataset.from, to: u.dataset.to,
+      quote: b64ToUtf8(u.dataset.quote), html: u.outerHTML,
+    }));
+    const beforeSentences = splitSentencesApprox(beforeText);
+    const ops = mergeSentenceOps(sentenceLCSDiff(beforeSentences, afterUnits.map(u => u.quote)));
+    let lastTo = afterUnits.length ? afterUnits[0].from : '0';
+    const pieces = ops.map(op => {
+      if (op.t === 'eq') { lastTo = afterUnits[op.bj].to; return afterUnits[op.bj].html; }
+      if (op.t === 'ins') {
+        // Sentence is new relative to the pre-edit text, but it IS real
+        // content in the current document — it has a real span, use it.
+        const u = afterUnits[op.bj]; lastTo = u.to;
+        return `<span class="mark-sentence" data-from="${u.from}" data-to="${u.to}" data-quote="${utf8ToB64(u.quote)}"><ins>${escapeHtml(u.quote)}</ins></span>`;
+      }
+      if (op.t === 'del') {
+        // Sentence existed before the edit and is gone from the current
+        // document — it has no real position left to bind a fresh mark to,
+        // so (same treatment insertions used pre-fix) it is bound to the
+        // nearest preceding surviving boundary, zero-width.
+        const text = beforeSentences[op.ai];
+        return `<span class="mark-sentence" data-from="${lastTo}" data-to="${lastTo}" data-quote="${utf8ToB64(text)}"><del>${escapeHtml(text)}</del></span>`;
+      }
+      // mod: sentence changed. A fresh mark on it should bind to the CURRENT
+      // text, so keep the real after-span's coordinates and quote; only the
+      // painted content shows the word-level diff against the old text.
+      const u = afterUnits[op.bj]; lastTo = u.to;
+      return `<span class="mark-sentence" data-from="${u.from}" data-to="${u.to}" data-quote="${utf8ToB64(u.quote)}">${v3RenderDiffHtml(beforeSentences[op.ai], u.quote)}</span>`;
+    });
+    return pieces.join(' ');
+  }
   // Pointers render as real links (task spec item 2ii): a minimal
   // `[label](url)` -> `<a>` pass, applied to already-escaped text (so it must
   // run on the escaped string and re-open only the `()[]` sequences it
@@ -2378,7 +2472,13 @@ V3_JS = r"""
         if (!body.dataset.v3OrigBody) {
           try { body.dataset.v3OrigBody = btoa(unescape(encodeURIComponent(body.innerHTML))); } catch(_) {}
         }
-        body.innerHTML = v3RenderDiffHtml(mark.snapshot || '', mark.proposed || '');
+        // Sentence-aware first (keeps .mark-sentence spans on unchanged
+        // sentences alive so the mark bar still works on this block); the
+        // flat whole-block diff is the fallback for headings/lists/blocks
+        // that never had sentence units to begin with.
+        let painted = null;
+        try { painted = v3RenderSentenceDiffBody(body, mark.snapshot || ''); } catch(_) { painted = null; }
+        body.innerHTML = painted != null ? painted : v3RenderDiffHtml(mark.snapshot || '', mark.proposed || '');
         body.classList.add('v3-inline-diff');
         body.dataset.v3MarkId = mark.id;
       } else if (body.classList.contains('v3-inline-diff')) {

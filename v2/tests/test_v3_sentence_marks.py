@@ -208,6 +208,60 @@ class V3SentenceMarkTests(unittest.TestCase):
     def test_no_mark_bar_without_a_selection(self):
         self.assertEqual(0, self.page.eval_on_selector_all('.v3-markbar', 'e => e.length'))
 
+    def test_mark_bar_reaches_an_unchanged_sentence_in_a_revised_block(self):
+        """The named gap: v3PaintInlineDiffs used to replace the whole block's
+        innerHTML with a flat word diff carrying no .mark-sentence spans, so a
+        block with any open edit/replace mark could never take a sentence mark
+        again — exactly the blocks the ringer list exists for. An unchanged
+        sentence in a revised block must still be selectable and bindable."""
+        proposed = 'Alpha is the first sentence. Beta has been rewritten. Gamma is the third sentence.'
+        block_id = self.page.eval_on_selector_all(
+            '.block-wrap', 'els => els[1].dataset.blockId')
+        req = urllib.request.Request(
+            f'{self.base}/api/comments', method='POST',
+            headers={'Content-Type': 'application/json'},
+            data=json.dumps({'page': 'docs/page.md', 'type': 'edit', 'block_id': block_id,
+                              'anchor': None, 'quote': self.PARAGRAPH, 'from': 0, 'to': None,
+                              'snapshot': self.PARAGRAPH, 'proposed': proposed}).encode())
+        urllib.request.urlopen(req)
+        self.page.reload()
+        self.page.wait_for_selector('.v3-inline-diff')
+        # Gamma (sentence 3) never changed, so it must still carry a real
+        # .mark-sentence span with its original binding intact.
+        self.assertEqual(
+            3, self.page.eval_on_selector_all('.v3-inline-diff .mark-sentence', 'e => e.length'),
+            'the unrevised sentences must keep their spans, only the changed one is a diff')
+        # The changed sentence (Beta) must actually show as a diff — not just
+        # keep a span. `body`'s spans are the AFTER state (apply_sentence_change
+        # already wrote `proposed` into the trunk before this renders), so the
+        # function must be fed `mark.snapshot` (before) to diff against, not
+        # `mark.proposed` — passing `proposed` diffs the live document against
+        # itself and every sentence lands in the `eq` bucket, painting no
+        # diff at all (the bug Skip's adversarial pass caught, 2026-09-05).
+        middle_html = self.page.eval_on_selector_all(
+            '.v3-inline-diff .mark-sentence', 'els => els[1].innerHTML')
+        self.assertIn('<del>', middle_html, 'the revised sentence must show what changed')
+        self.assertIn('<ins>', middle_html, 'the revised sentence must show what changed')
+        # v3RenderDiffHtml diffs at word granularity, so the old/new words
+        # appear individually rather than as contiguous old/new sentences.
+        self.assertIn('second', middle_html)
+        self.assertIn('rewritten', middle_html)
+        self.page.eval_on_selector_all('.v3-inline-diff .mark-sentence', """els => {
+            const r = document.createRange();
+            r.selectNodeContents(els[2]);
+            const s = window.getSelection();
+            s.removeAllRanges();
+            s.addRange(r);
+            document.dispatchEvent(new Event('selectionchange'));
+        }""")
+        self.page.wait_for_selector('.v3-markbar')
+        self.page.click('.v3-markbar [data-v3-mark="ack"]')
+        self.page.wait_for_timeout(800)
+        marks = [r for r in self._rows() if r.get('type') == 'mark']
+        self.assertEqual(1, len(marks), 'the sentence mark must be accepted on a revised block')
+        self.assertEqual('Gamma is the third sentence.', marks[0]['quote'])
+        self.assertEqual([], self.errors)
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -1055,15 +1055,55 @@ Two things that are easy to get wrong here, both found by an adversarial pass be
   mark under a toast saying "one sentence" — a touch device dismisses the selection on
   `touchstart`, before any synthesized `mousedown`, and the phone is how Mike reads this.
 
-Bounds, stated rather than buried: `v3PaintInlineDiffs` replaces a revised block's innerHTML
-with a del/ins render carrying no `.mark-sentence` spans, so the bar **cannot appear on a block
-that has an open change** — the blocks the ringer list exists for. Not a regression, but the
-old failure still holds there. List blocks likewise: their per-item ranges live in
-`data-list-units` and are unused. The bar is mouse-only (no Tab+Enter) and touch is untested.
+**Fixed 2026-09-05: the mark bar now reaches a revised block.** `v3PaintInlineDiffs` used to
+replace a revised block's whole innerHTML with `v3RenderDiffHtml`'s flat word diff, which carries
+no `.mark-sentence` spans at all — so the bar could never appear on the blocks the ringer list
+exists for, and an ack there still spoke for everything. `v3RenderSentenceDiffBody` (V3_JS) now
+diffs the block **sentence by sentence** and keeps real bindings alive on every sentence that
+survives.
 
-Tests: `v2/tests/test_v3_sentence_marks.py` (8 cases) drives a real browser — a DOM selection
-becoming code-point offsets cannot be faked — and skips when Playwright or its Chromium build is
-absent. Note `sync_playwright().start()` hangs on this machine; `__enter__` does not.
+**The first version of this fix diffed the live document against itself and painted nothing —
+caught by Skip's adversarial pass before it shipped.** `apply_sentence_change` (`server.py`
+~:3652) writes `mark.proposed` straight into the trunk file the instant an edit mark is created,
+so by the time `v3PaintInlineDiffs` runs, `body`'s existing `.mark-sentence` spans are already the
+**after** state — passing `mark.proposed` in as "after" (the first draft did) diffs it against
+itself; every sentence lands in the `eq` bucket and no `<del>`/`<ins>` ever renders, though the
+binding survives by coincidence. The corrected call passes `mark.snapshot` (the **before** text,
+plain source, no bindings) as the side to diff against the real spans:
+`v3RenderSentenceDiffBody(body, mark.snapshot)`. `beforeSentences` (from `mark.snapshot`, via
+`splitSentencesApprox` — a simple regex, not the server's `sentence_ranges` abbreviation-aware
+splitter; it only decides where the *painted* diff breaks, never the persisted binding) is aligned
+against `afterUnits` (`body`'s real `.mark-sentence` elements, in document order) with a
+sentence-level LCS (`sentenceLCSDiff` + `mergeSentenceOps`, same shape as the existing word-level
+`v3WordDiff`). An unchanged sentence keeps its **real after-span verbatim** (links/formatting
+intact, real `data-from`/`data-to`/`data-quote`, so `sentenceSpanInBlock` can still bind a
+selection on it); a changed sentence keeps the real after-span's coordinates but paints
+`v3RenderDiffHtml`'s word-level del/ins *inside* it (a fresh mark on it binds to the current text,
+which is correct — the old text is gone); a sentence that existed before and is gone now has no
+real position left, so it is bound to the nearest preceding surviving boundary, zero-width (the
+same synthetic treatment the first draft gave *insertions*, now correctly applied to *deletions*
+instead, since the roles were swapped). `v3PaintInlineDiffs` tries this first and falls back to
+the old flat `v3RenderDiffHtml` only when the block has fewer than 2 sentence units (headings,
+lists, anything that never had spans to begin with — that bound is genuinely still open, see
+below).
+
+Still open, named rather than fixed here: **list blocks** (their per-item ranges live in
+`data-list-units` and are unused here or by the sentence-mark bar in general — a list item inside
+an open change is still whole-block-only); the bar is mouse-only (no Tab+Enter) and touch is
+untested; and **two or more consecutive deleted sentences collapse to the same zero-width
+coordinate** — a fresh mark on either would be ambiguous between them (latent, found by the same
+adversarial pass; not reachable today because deletions of that shape are rare in the real
+corpus, but real once this path sees more traffic).
+
+Tests: `v2/tests/test_v3_sentence_marks.py` (9 cases, was 8) drives a real browser — a DOM
+selection becoming code-point offsets cannot be faked — and skips when Playwright or its Chromium
+build is absent. Note `sync_playwright().start()` hangs on this machine; `__enter__` does not. The
+new case drives a real edit-as-comment write (via the API, same fields the real click-to-edit flow
+sends) that rewrites the middle of three sentences, then proves the unrevised third sentence still
+renders as a real `.mark-sentence` span and can take a fresh sentence-scoped mark, AND that the
+revised middle sentence actually shows `<del>`/`<ins>` content — the second assertion is what
+falsifies against the `mark.proposed`-vs-`mark.snapshot` bug (verified: reverting the call site
+back to `mark.proposed` turns this test red).
 
 ## Authorship
 

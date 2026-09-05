@@ -419,6 +419,16 @@ rendered list item receives its own exact child range; tables, code, film, and o
 blocks fall back to one addressable block unit. This preserves the original rendering while
 making the review binding precise enough to survive edits through `blockmap.py` reconciliation.
 
+**Table/code/film sub-split — checked, not needed (2026-09-05).** A parity audit found these
+three kinds cover 115 of 1993 real content blocks in `_estate/*.md` (5.8%: table 56, film 30,
+code 29) with comment-only, whole-block reach. Before building per-cell/per-line addressability,
+every mark/comment ever recorded against `_estate/review-feedback/*.jsonl` was checked against
+every table/code/film block id in the matching `*.blocks.json` sidecars (31 table blocks across
+12 files, 30 film blocks, 8 code blocks): zero non-deleted marks land on any of them. The only
+activity on a film-bearing page (`SCREENING-ROOM.md`) was four deleted 2026-07-04 smoke-test
+comments anchored to a paragraph, not a film block. Conclusion: this is a solved-problem-nobody-
+hit, not a real gap — don't build it until real usage says otherwise.
+
 Marks queue in `localStorage` until explicitly sent, the weighted threshold reaches 9, the
 page is idle for 60 seconds, or the reviewer leaves. Weights are clarify 3; rewrite, strike,
 and note 2; agree 1; acknowledge 0.5; ruling 9. Composing or editing pauses idle/leave sends.

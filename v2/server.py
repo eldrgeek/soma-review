@@ -27,6 +27,7 @@ from urllib.parse import urlparse, parse_qs, unquote
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mdblocks import (  # noqa: E402
     parse_markdown, render_inline, build_lexicon_index, strip_auto_lexicon_marker,
+    strip_front_matter,
     _esc, _esc_attr, _first_sentence, block_source_span, segment_sentences,
     _is_sentence_abbreviation,
 )
@@ -4185,6 +4186,25 @@ def render_page(route_path, workspace=DEFAULT_WORKSPACE, view='classic'):
                 }
     term_defs_json = json.dumps(term_defs)
 
+    # Mark-layer nodes, embedded additively (2026-09-05 mission-1 run) so an
+    # in-page mark-bar client can read the shared engine's node/fragment shape
+    # without a second round-trip to `GET /api/mark-layer` — the gap named by
+    # the 20:10:12Z and 20:40:28Z mission-1 runs that shipped that endpoint and
+    # its first (unlinked, debug-only) consumer. A page's other content is
+    # completely unaffected: this is a pure JSON-value addition to the existing
+    # bootstrap `<script>` block, never a new script tag, never a change to any
+    # other page byte. Wrapped in try/except like the tour asset build above —
+    # a mark-layer adapter bug must never break page render, since nothing on
+    # the page reads this value yet (same posture the debug preview route
+    # shipped with).
+    try:
+        _, mark_layer_src = strip_auto_lexicon_marker(src)
+        mark_layer_src = strip_front_matter(mark_layer_src)
+        mark_layer_nodes_json = json.dumps(to_mark_layer_nodes(mark_layer_src))
+    except Exception as e:  # noqa: BLE001 — additive value, must never 500 a page
+        sys.stderr.write(f'[mark-layer] node build failed for {route_path}: {e}\n')
+        mark_layer_nodes_json = 'null'
+
     # trailing newline keeps flagged-page head formatting tidy; empty string on
     # non-flagged pages keeps their rendered HTML byte-identical to pre-feature.
     chip_head = f'<style>{STATUS_CHIP_CSS}</style>\n' if badges_on else ''
@@ -4310,6 +4330,7 @@ window.__DISPATCH_TARGET__ = {json.dumps(dispatch_cfg['target'])};
 window.__DISPATCH_BUTTON__ = {json.dumps(dispatch_cfg['button'])};
 window.__MARK_LAYER__ = {json.dumps(mark_layer)}; window.__HAS_DISPATCH__ = {json.dumps(has_dispatch)};
 window.__TERM_DEFS__ = {term_defs_json};
+window.__MARK_LAYER_NODES__ = {mark_layer_nodes_json};
 window.__V3_VIEW__ = {json.dumps(view == 'v3')}; window.__LEVEL_LABEL__ = {json.dumps(level_label)};</script>
 <script>{PAGE_JS}</script>
 {f'<script>{MARK_LAYER_JS}</script>' if mark_layer else ''}

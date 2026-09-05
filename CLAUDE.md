@@ -1091,9 +1091,14 @@ Still open, named rather than fixed here: **list blocks** (their per-item ranges
 `data-list-units` and are unused here or by the sentence-mark bar in general — a list item inside
 an open change is still whole-block-only); the bar is mouse-only (no Tab+Enter) and touch is
 untested; and **two or more consecutive deleted sentences collapse to the same zero-width
-coordinate** — a fresh mark on either would be ambiguous between them (latent, found by the same
-adversarial pass; not reachable today because deletions of that shape are rare in the real
-corpus, but real once this path sees more traffic).
+coordinate** — a fresh mark on either would be ambiguous between them if one could ever bind to
+a del span at all (latent, found by the same adversarial pass). **Re-checked 2026-09-05: not
+exploitable today, for a different reason than "rare in the corpus."** `sentenceSpanInBlock`'s
+own `to <= from` guard refuses every zero-width selection before it reaches `from`/`to` at all —
+one deleted sentence or a run of colliding ones alike always falls back to a whole-block mark.
+The collision is real only if a future change deliberately lets a mark bind to a zero-width del
+span; until then this is a design note for that future work, not a live bug. See the comment at
+`v2/server.py`'s `v3RenderSentenceDiffBody` del branch.
 
 Tests: `v2/tests/test_v3_sentence_marks.py` (9 cases, was 8) drives a real browser — a DOM
 selection becoming code-point offsets cannot be faked — and skips when Playwright or its Chromium

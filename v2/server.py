@@ -2249,7 +2249,15 @@ V3_JS = r"""
         // Sentence existed before the edit and is gone from the current
         // document — it has no real position left to bind a fresh mark to,
         // so (same treatment insertions used pre-fix) it is bound to the
-        // nearest preceding surviving boundary, zero-width.
+        // nearest preceding surviving boundary, zero-width. Two consecutive
+        // deletions therefore share one (from, to) pair — CLAUDE.md's "Still
+        // open" note flagged this as an ambiguous-binding risk (2026-09-04
+        // adversarial pass), but it cannot fire today: sentenceSpanInBlock's
+        // `to <= from` guard refuses EVERY zero-width span before from/to
+        // ever reach the server, on one del or a run of them alike, so a
+        // selection here always falls back to a whole-block mark regardless
+        // of collision. Real once something binds a fresh mark to a
+        // zero-width span on purpose — not before.
         const text = beforeSentences[op.ai];
         return `<span class="mark-sentence" data-from="${lastTo}" data-to="${lastTo}" data-quote="${utf8ToB64(text)}"><del>${escapeHtml(text)}</del></span>`;
       }

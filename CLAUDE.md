@@ -1138,6 +1138,27 @@ The collision is real only if a future change deliberately lets a mark bind to a
 span; until then this is a design note for that future work, not a live bug. See the comment at
 `v2/server.py`'s `v3RenderSentenceDiffBody` del branch.
 
+**Fixed 2026-09-05: `sentence_ranges` (renders the addressable spans) and `segment_sentences`
+(locates an edit's before-text on disk) kept independent abbreviation lists and could disagree
+on a sentence boundary.** Found while tracing MDP item 6a ("Playmaker and soma-review are to
+share one engine") against Playmaker's already-extracted `mark-layer-engine` — its own
+abbreviation list is a third, separately-maintained set, which prompted checking whether
+soma-review's own two Python implementations (`mdblocks.segment_sentences`, `server.sentence_ranges`)
+already agreed with each other. They did not: 'op'/'cf'/month names were only in one list or the
+other, so a block like "ref. op. cit. section" rendered "op." as its own addressable
+`.mark-sentence` span (`sentence_ranges` didn't know 'op') while `apply_sentence_change`'s
+`_locate_change_span` (which re-splits with `segment_sentences`, which did know 'op') could never
+find that span standalone — any edit to a sentence the reader had just been shown as clickable
+raised `MergeConflict` on a block that had not drifted at all. Fixed by moving the abbreviation
+set and the abbreviation/single-letter check into one shared `mdblocks._is_sentence_abbreviation`,
+imported by `server.py`, and adding `segment_sentences`'s missing decimal-point guard (it split
+"$3.5 million" after "3." where `sentence_ranges` already did not). Not yet done: unifying with
+Playmaker's TypeScript list is real cross-repo work (item 1 of `docs/MARK-LAYER-ENGINE.md`'s
+"Next" — soma-review consumption of the shared engine) and stays open; this pass closed the
+same-repo divergence that was live today. Tests: `tests/test_mdp_mechanics.py` — the two new
+`SegmentSentencesTests` cases plus a `ChangeSettleRevertTests` case that drives the real edit-mark
+path end to end on the previously-conflicting sentence.
+
 Tests: `v2/tests/test_v3_sentence_marks.py` (9 cases, was 8) drives a real browser — a DOM
 selection becoming code-point offsets cannot be faked — and skips when Playwright or its Chromium
 build is absent. Note `sync_playwright().start()` hangs on this machine; `__enter__` does not. The

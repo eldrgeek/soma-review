@@ -89,6 +89,38 @@ class ChangeSettleRevertTests(unittest.TestCase):
         server.append_comment('docs/page.md', row)
         return row, change_result
 
+    def test_edit_mark_on_a_ui_rendered_sentence_does_not_falsely_conflict(self):
+        """server.sentence_ranges() decides which spans the mark layer renders
+        as addressable `.mark-sentence` units (mark_layer_inner -> the actual
+        page a reader marks); apply_sentence_change's own _locate_change_span
+        re-splits with mdblocks.segment_sentences to find where to splice the
+        write. Before this fix the two kept independent abbreviation lists —
+        'op' was only in mdblocks's set, not server's — so a block containing
+        "ref. op. cit. section" rendered "op." as its OWN addressable sentence
+        (server.sentence_ranges didn't know 'op' and split there) while
+        segment_sentences (which did know 'op') folded it into "op. cit." —
+        any edit on the sentence the UI actually showed the reader as
+        clickable raised MergeConflict for a block that had not drifted at
+        all. Assert the two functions now agree on where the boundary falls
+        (the actual defect), then assert the real edit path succeeds on the
+        unit they agree is one sentence."""
+        text = 'See the appendix, ref. op. cit. section, for details. It explains everything.'
+        ui_spans = [q for _, _, q in server.sentence_ranges(text)]
+        write_spans = [t.strip() for _, _, t in mdblocks.segment_sentences(text)]
+        self.assertEqual(
+            ui_spans, write_spans,
+            'sentence_ranges (what the mark layer renders) and segment_sentences '
+            '(what apply_sentence_change matches against) disagree on where a '
+            'sentence boundary falls — any span only one of them recognizes is '
+            'either unclickable or uneditable.')
+        self.assertIn('op. cit.', ui_spans, 'the abbreviation should stay merged, not split')
+        self.write_doc(f'# Title\n\n{text}\n')
+        self.commit_doc()
+        _mark, change_result = self.make_edit_mark('e-op', 'op. cit.', 'loc. cit.')
+        self.assertIsNotNone(change_result['commit'])
+        with open(self.doc, encoding='utf-8') as f:
+            self.assertIn('ref.loc. cit. section', f.read())
+
     def test_change_writes_file_and_commits_at_creation_time(self):
         self.write_doc('# Title\n\nOriginal typo sentence here.\n\nSecond paragraph.\n')
         self.commit_doc()
@@ -260,6 +292,43 @@ class SegmentSentencesTests(unittest.TestCase):
         spans = mdblocks.segment_sentences(text)
         self.assertEqual(1, len(spans))
         self.assertEqual(text, spans[0][2])
+
+    def test_does_not_split_on_decimal_points(self):
+        """Added with the 2026-09-05 abbreviation-list unification: server.py's
+        sentence_ranges already guarded digit.digit; segment_sentences did not,
+        so "$3.5 million" would have split after "3." here while the mark
+        layer (sentence_ranges) kept it together — the same class of
+        UI-vs-write divergence the unification fixed for word abbreviations."""
+        text = 'It cost $3.5 million total. The board approved it.'
+        spans = mdblocks.segment_sentences(text)
+        texts = [t.strip() for _, _, t in spans]
+        self.assertEqual(['It cost $3.5 million total.', 'The board approved it.'], texts)
+
+    def test_does_not_merge_across_a_quote_terminated_sentence(self):
+        """Skip's adversarial pass on the abbreviation-list unification found
+        a second, separate divergence: server.sentence_ranges's boundary
+        regex absorbs a trailing closing quote/bracket before checking for
+        whitespace ('He said "Stop." She left.' splits after the closing
+        quote), but segment_sentences's character-walk had no equivalent and
+        merged the two sentences into one. Same MergeConflict failure class
+        as the abbreviation bug, different trigger — fixed by absorbing
+        `_SENTENCE_CLOSERS` the same way before testing the boundary."""
+        text = 'He said "Stop." She left.'
+        spans = mdblocks.segment_sentences(text)
+        texts = [t.strip() for _, _, t in spans]
+        self.assertEqual(['He said "Stop."', 'She left.'], texts)
+        ui_spans = [q for _, _, q in server.sentence_ranges(text)]
+        self.assertEqual(ui_spans, texts)
+
+    def test_agrees_with_server_sentence_ranges_on_a_shared_word_list(self):
+        """The regression this run fixed: mdblocks.segment_sentences (used to
+        locate an edit's before-text on disk) and server.sentence_ranges
+        (used to render addressable spans in the mark layer) used to keep
+        independent abbreviation lists and could disagree on a boundary."""
+        text = 'See the appendix, ref. op. cit. section, for details. It explains everything.'
+        ui_spans = [q for _, _, q in server.sentence_ranges(text)]
+        write_spans = [t.strip() for _, _, t in mdblocks.segment_sentences(text)]
+        self.assertEqual(ui_spans, write_spans)
 
 
 class BlockSourceSpanTests(unittest.TestCase):

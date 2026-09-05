@@ -28,6 +28,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mdblocks import (  # noqa: E402
     parse_markdown, render_inline, build_lexicon_index, strip_auto_lexicon_marker,
     _esc, _esc_attr, _first_sentence, block_source_span, segment_sentences,
+    _is_sentence_abbreviation,
 )
 import blockmap  # noqa: E402
 from blockmap import norm  # noqa: E402
@@ -3313,13 +3314,6 @@ def wq_status_chip(block):
     return None
 
 
-_SENTENCE_ABBREVIATIONS = {
-    'mr', 'mrs', 'ms', 'dr', 'prof', 'sr', 'jr', 'st', 'vs', 'etc',
-    'e.g', 'i.e', 'no', 'fig', 'rev', 'sept', 'jan', 'feb', 'mar', 'apr',
-    'jun', 'jul', 'aug', 'oct', 'nov', 'dec',
-}
-
-
 def sentence_ranges(text):
     """Split normalized block text into conservative sentence ranges.
 
@@ -3328,6 +3322,16 @@ def sentence_ranges(text):
     abbreviations and decimal/version dots together; a false negative merely
     produces a slightly larger addressable unit, while a false positive makes a
     sentence fragment feel broken in the reading instrument.
+
+    The abbreviation check (`mdblocks._is_sentence_abbreviation`) is shared
+    with `mdblocks.segment_sentences` — the function `apply_sentence_change`'s
+    `_locate_change_span` uses to find where an edit's before-text lives on
+    disk. This function decides which spans the mark layer renders as
+    clickable/markable; until 2026-09-05 the two kept independent
+    abbreviation lists, so a block like "ref. op. cit. section" rendered
+    "op." as its own addressable sentence here while segment_sentences folded
+    it into its neighbour — any edit to a sentence the UI had just shown as
+    editable raised MergeConflict on a block that had not drifted at all.
     """
     normalized = blockmap.norm(text)
     if not normalized:
@@ -3341,7 +3345,7 @@ def sentence_ranges(text):
             prefix = normalized[start:punct_at]
             token_match = re.search(r'([A-Za-z](?:[A-Za-z.]*)?)$', prefix)
             token = (token_match.group(1).lower().rstrip('.') if token_match else '')
-            if token in _SENTENCE_ABBREVIATIONS or (len(token) == 1 and token.isalpha()):
+            if token and _is_sentence_abbreviation(token):
                 continue
             if (punct_at > 0 and punct_at + 1 < len(normalized)
                     and normalized[punct_at - 1].isdigit()

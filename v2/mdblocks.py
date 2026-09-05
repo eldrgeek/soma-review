@@ -276,10 +276,42 @@ def stripped_src_and_prefix_len(src):
     return normalized, after_fm, prefix_len
 
 
+# Single shared list: this used to be forked between here and server.py's
+# sentence_ranges() (the function that actually decides which spans the mark
+# layer renders as clickable/markable). The two lists disagreed on several
+# words ('op'/'cf'/'prof'/month names), so a block containing e.g. "op. cit."
+# rendered "op." as its own addressable sentence in the UI while this
+# function — the one apply_sentence_change's _locate_change_span uses to
+# find where to splice a write — refused to recognize that boundary at all,
+# raising MergeConflict on an edit to a sentence the reader had just been
+# shown. Union of both former lists; kept here as the one place either
+# function imports from.
+# Closing punctuation that can trail a sentence-ending mark before the real
+# whitespace/EOF boundary ("He said \"Stop.\" She left." — the sentence ends
+# after the closing quote, not at the period). server.sentence_ranges already
+# absorbed these into its boundary regex; segment_sentences did not, found by
+# Skip's adversarial pass on the abbreviation-list unification below (a
+# quote-terminated sentence merged with its neighbour here while
+# sentence_ranges correctly split them, reproducing the same MergeConflict
+# class of bug on a different trigger).
+_SENTENCE_CLOSERS = '"”’)]'
+
+
 _SENTENCE_ABBREVIATIONS = {
-    'e.g', 'i.e', 'etc', 'vs', 'mr', 'mrs', 'dr', 'ms', 'jr', 'sr',
-    'inc', 'ltd', 'no', 'st', 'approx', 'fig', 'vol', 'op', 'cf',
+    'e.g', 'i.e', 'etc', 'vs', 'mr', 'mrs', 'ms', 'dr', 'prof', 'jr', 'sr',
+    'inc', 'ltd', 'co', 'no', 'st', 'approx', 'fig', 'vol', 'op', 'cf',
+    'dept', 'univ', 'rev', 'sept', 'jan', 'feb', 'mar', 'apr', 'jun', 'jul',
+    'aug', 'oct', 'nov', 'dec',
 }
+
+
+def _is_sentence_abbreviation(word):
+    """True if `word` (lowercased, trailing dots stripped) is a known
+    abbreviation, or a single letter (an initial, e.g. "J. Smith"). Shared by
+    `segment_sentences` (here) and `server.sentence_ranges` so the two never
+    again decide a boundary differently."""
+    word = word.lower()
+    return word in _SENTENCE_ABBREVIATIONS or (len(word) == 1 and word.isalpha())
 
 
 def segment_sentences(text):
@@ -288,7 +320,8 @@ def segment_sentences(text):
     the block/paragraph"). A simple rule, not a full NLP sentence-boundary
     detector: an ending punctuation run is a boundary unless the word
     immediately before it is a known abbreviation (`e.g.`, `i.e.`, `etc.`,
-    `Mr.`, ...) or a single capital letter (an initial, e.g. "J. Smith").
+    `Mr.`, ...), a single letter (an initial, e.g. "J. Smith"), or a decimal
+    point between two digits.
 
     Returns a list of `(start, end, sentence_text)` character spans that
     exactly tile `text` with no gaps or overlaps — `''.join(t for _, _, t in
@@ -315,14 +348,22 @@ def segment_sentences(text):
             while k > 0 and (text[k - 1].isalnum() or text[k - 1] == '.'):
                 k -= 1
             word = text[k:i].strip('.')
-            is_abbrev = (
-                word.lower() in _SENTENCE_ABBREVIATIONS
-                or (len(word) == 1 and word.isupper())
+            is_abbrev = _is_sentence_abbreviation(word) if word else False
+            is_decimal = (
+                text[i] == '.' and j == i + 1
+                and k < i and text[i - 1].isdigit()
+                and j < n and text[j].isdigit()
             )
-            boundary_ok = j >= n or text[j] in ' \t\n'
-            if boundary_ok and not is_abbrev:
-                starts.append(j)
-            i = j
+            # Absorb trailing closing quotes/brackets into the boundary
+            # itself (matches server.sentence_ranges) so `He said "Stop."
+            # She left.` splits after the closing quote, not before it.
+            m = j
+            while m < n and text[m] in _SENTENCE_CLOSERS:
+                m += 1
+            boundary_ok = m >= n or text[m] in ' \t\n'
+            if boundary_ok and not is_abbrev and not is_decimal:
+                starts.append(m)
+            i = m
             continue
         i += 1
     starts.append(n)

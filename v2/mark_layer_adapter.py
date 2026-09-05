@@ -40,13 +40,15 @@ document maps to the same node id) — see
 `test_repeated_calls_on_identical_text_reuse_ids` and
 `test_duplicate_text_within_one_call_gets_distinct_ids`.
 
-**Still open: the JS adapter (`fromProseMarkdown`) was not given the same
-fix in this pass** — it is the "share one engine" side that would need to
-recompute the same `sha1(kind:text)[:10]` scheme in TypeScript for the two
-engines' ids to actually agree on identical input, which is a real
-prerequisite for the eventual client-side diffing this fix names, and is
-called out explicitly rather than assumed done because both files use the
-word "parity."
+**Closed the same day (mission-1, second pass): the JS adapter
+(`fromProseMarkdown`, `playmaker/src/mark-layer-engine/adapters/proseMarkdown.ts`)
+now ports the identical `sha1(prefix:text)[:10]` scheme** (a vendored,
+synchronous SHA-1 — this file runs in the browser, so neither Node's
+`crypto` nor Web Crypto's async `subtle.digest` fit a sync parse). Verified
+with a pinned cross-engine test (`tests/mark-layer-engine-extraction.test.ts`)
+that runs both engines on `'Alpha is first. Beta is second.'` and asserts
+the literal id strings match — not just that both use sha1, but that they
+mint the SAME ids on the SAME input.
 
 **Named, not fixed, by the same pass (Skip's adversarial review, 2026-09-05):
 the fix above is real but narrower than "stable for diffing" implies — it

@@ -267,6 +267,86 @@ class V3SentenceMarkTests(unittest.TestCase):
         self.assertEqual('Gamma is the third sentence.', marks[0]['quote'])
         self.assertEqual([], self.errors)
 
+    def test_mark_bar_reaches_an_unchanged_sentence_in_a_revised_heading(self):
+        """Headings gained sentence spans on 2026-09-05, but
+        v3RenderSentenceDiffBody (the fix that keeps a mark bar reachable on a
+        block under an open edit/replace mark) had only ever been exercised
+        against a paragraph. A 2+-sentence heading must diff and bind the
+        same way: an unchanged sentence stays a real, markable span; a
+        changed one shows del/ins. The default fixture heading (`# Demo`) is
+        one word, so this test replaces it with a real 3-sentence heading
+        before exercising the edit. Two different strings both describe
+        "before": `quote` is validated against the block's RENDERED text
+        (`block['text']`, `#` marker stripped, via `validated_binding`/
+        `blockmap.resolve`) while `snapshot` is matched against the exact
+        SOURCE line (`#` marker intact, via `block_source_span` inside
+        `apply_sentence_change`) — a paragraph never surfaces this split
+        because its source and rendered text are the same string, but a
+        heading's are not."""
+        heading_text = ('Alpha heading sentence. Beta heading sentence. '
+                        'Gamma heading sentence.')
+        heading_src = f'# {heading_text}'
+        page_path = os.path.join(self.root, 'docs', 'page.md')
+        with open(page_path, 'w', encoding='utf-8') as handle:
+            handle.write(f'{heading_src}\n\n{self.PARAGRAPH}\n')
+        self.page.goto(f'{self.base}/page/docs/page.md?view=v3')
+        self.page.wait_for_selector('.mark-sentence')
+        heading_after = ('# Alpha heading sentence. Beta heading sentence has '
+                         'changed. Gamma heading sentence.')
+        block_id = self.page.eval_on_selector_all(
+            '.block-wrap', 'els => els[0].dataset.blockId')
+        req = urllib.request.Request(
+            f'{self.base}/api/comments', method='POST',
+            headers={'Content-Type': 'application/json'},
+            data=json.dumps({'page': 'docs/page.md', 'type': 'edit', 'block_id': block_id,
+                              'anchor': None, 'quote': heading_text, 'from': 0, 'to': None,
+                              'snapshot': heading_src, 'proposed': heading_after}).encode())
+        urllib.request.urlopen(req)
+        self.page.reload()
+        self.page.wait_for_selector('.v3-inline-diff')
+        # A known, accepted limitation (CLAUDE.md, "Checked 2026-09-05"): both
+        # the sentence-diff and flat-diff paths drop the <h#> tag while a mark
+        # is open (self-heals on resolve) — so the spans are asserted against
+        # `.v3-inline-diff .mark-sentence` directly, not `h1 .mark-sentence`.
+        # All three of the heading's sentences must carry a real
+        # .mark-sentence span — this is what the fix protects; the old flat
+        # word-diff wiped them entirely.
+        self.assertEqual(
+            3, self.page.eval_on_selector_all(
+                '.v3-inline-diff .mark-sentence', 'e => e.length'),
+            'a revised heading must keep all three sentences addressable')
+        # The first and third sentences never changed, so they must render
+        # verbatim, with no del/ins — this is what pins the `#`-marker-strip
+        # fix (without it, the mismatched first "before" sentence bogusly
+        # diffs the whole heading instead of just the one changed sentence).
+        first_html = self.page.eval_on_selector_all(
+            '.v3-inline-diff .mark-sentence', 'els => els[0].innerHTML')
+        self.assertNotIn('<del>', first_html)
+        self.assertNotIn('<ins>', first_html)
+        self.assertEqual('Alpha heading sentence.', first_html)
+        # The middle sentence changed, so it must show the diff.
+        middle_html = self.page.eval_on_selector_all(
+            '.v3-inline-diff .mark-sentence', 'els => els[1].innerHTML')
+        self.assertIn('<del>', middle_html)
+        self.assertIn('<ins>', middle_html)
+        # The third sentence never changed, so it must still bind a fresh
+        # mark exactly like an unrevised paragraph sentence does.
+        self.page.eval_on_selector_all('.v3-inline-diff .mark-sentence', """els => {
+            const r = document.createRange();
+            r.selectNodeContents(els[2]);
+            const s = window.getSelection();
+            s.removeAllRanges();
+            s.addRange(r);
+            document.dispatchEvent(new Event('selectionchange'));
+        }""")
+        self.page.wait_for_selector('.v3-markbar')
+        self.page.click('.v3-markbar [data-v3-mark="ack"]')
+        self.page.wait_for_timeout(800)
+        marks = [r for r in self._rows() if r.get('type') == 'mark']
+        self.assertEqual(1, len(marks), 'the unrevised heading sentence must be markable')
+        self.assertEqual('Gamma heading sentence.', marks[0]['quote'])
+        self.assertEqual([], self.errors)
+
 
 @unittest.skipIf(sync_playwright is None, 'playwright not installed')
 class V3ListItemMarkTests(unittest.TestCase):

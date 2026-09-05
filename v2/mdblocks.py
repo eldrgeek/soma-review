@@ -976,24 +976,24 @@ def parse_markdown(src, link_resolver=None, terms_out=None, lexicon=None):
                 terms_section_level[0] = None
             heading_id = make_id(slugify(text))
             html_body = f'<h{level} id="{heading_id}">{render_inline(text, link_resolver, terms=terms, lexicon=lexicon)}</h{level}>'
+            i += 1
             blocks.append({
                 'line_start': blk_line_start, 'line_end': i,
                 'kind': 'heading', 'level': level, 'heading_path': heading_path()[:-1],
                 'index': idx, 'text': text, 'html': html_body, 'heading_id': heading_id,
             })
             idx += 1
-            i += 1
             continue
 
         # Horizontal rule
         if re.match(r'^(-{3,}|\*{3,}|_{3,})$', stripped):
+            i += 1
             blocks.append({
                 'line_start': blk_line_start, 'line_end': i,
                 'kind': 'hr', 'level': None, 'heading_path': heading_path(),
                 'index': idx, 'text': '---', 'html': '<hr/>',
             })
             idx += 1
-            i += 1
             continue
 
         # Table (GFM pipe table): header line, separator line, body lines

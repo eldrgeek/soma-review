@@ -2263,14 +2263,25 @@ V3_JS = r"""
   // diff at all (caught by Skip's adversarial pass, 2026-09-05, before this
   // shipped). `beforeText` (mark.snapshot, plain source text, no bindings)
   // is the side that gets word-diffed against the real spans.
-  function v3RenderSentenceDiffBody(body, beforeText){
+  function v3RenderSentenceDiffBody(body, beforeText, blockKind){
     const afterEls = Array.from(body.querySelectorAll('.mark-sentence'));
     if (afterEls.length < 2) return null; // not a multi-sentence prose block
     const afterUnits = afterEls.map(u => ({
       from: u.dataset.from, to: u.dataset.to,
       quote: b64ToUtf8(u.dataset.quote), html: u.outerHTML,
     }));
-    const beforeSentences = splitSentencesApprox(beforeText);
+    // A heading's `mark.snapshot` is the exact SOURCE line (block_source_span
+    // keeps the `#` marker, since apply_sentence_change writes this same
+    // string back into the raw file) but afterUnits' quotes are RENDERED
+    // text (the marker already stripped by the heading parser). Left
+    // unstripped, the LCS below never matches the first sentence and paints
+    // a spurious whole-heading del/ins. Scoped to kind === 'heading' only
+    // (Skip's adversarial pass, 2026-09-05): a blockquote's raw text can
+    // legitimately start with a literal '# ' (e.g. `> # not actually a
+    // heading`, never re-parsed as ATX inside a blockquote) and stripping it
+    // there would misalign that block's diff instead of fixing it.
+    const beforeSentences = splitSentencesApprox(
+      blockKind === 'heading' ? beforeText.replace(/^#{1,6}\s+/, '') : beforeText);
     const ops = mergeSentenceOps(sentenceLCSDiff(beforeSentences, afterUnits.map(u => u.quote)));
     let lastTo = afterUnits.length ? afterUnits[0].from : '0';
     const pieces = ops.map(op => {
@@ -2521,7 +2532,7 @@ V3_JS = r"""
         // flat whole-block diff is the fallback for headings/lists/blocks
         // that never had sentence units to begin with.
         let painted = null;
-        try { painted = v3RenderSentenceDiffBody(body, mark.snapshot || ''); } catch(_) { painted = null; }
+        try { painted = v3RenderSentenceDiffBody(body, mark.snapshot || '', el.dataset.kind); } catch(_) { painted = null; }
         // A list block (hydrateListUnits, 2026-09-05) has real per-item
         // .mark-block-unit bindings on its <li> elements, not .mark-sentence
         // spans, so v3RenderSentenceDiffBody always bails here — but the flat

@@ -3454,7 +3454,7 @@ def mark_layer_inner(block, link_resolver=None, terms=None, lexicon=None, auto_l
             for start, end, quote in list_item_ranges(block['text'])
         ]
         return block['html'], bool(block['mark_layer_list_units'])
-    if kind not in ('paragraph', 'blockquote'):
+    if kind not in ('paragraph', 'blockquote', 'heading'):
         return block['html'], False
     pieces = []
     auto_seen = set()
@@ -3467,6 +3467,11 @@ def mark_layer_inner(block, link_resolver=None, terms=None, lexicon=None, auto_l
             f'</span>'
         )
     content = ' '.join(pieces)
+    if kind == 'heading':
+        level = block.get('level') or 1
+        heading_id = block.get('heading_id') or ''
+        id_attr = f' id="{heading_id}"' if heading_id else ''
+        return f'<h{level}{id_attr}>{content}</h{level}>', bool(pieces)
     tag = 'blockquote' if kind == 'blockquote' else 'p'
     return f'<{tag}>{content}</{tag}>', True
 

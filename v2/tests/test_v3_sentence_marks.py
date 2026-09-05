@@ -90,6 +90,10 @@ class V3SentenceMarkTests(unittest.TestCase):
 
     # --- helpers ---------------------------------------------------------
     def _select_sentence(self, index):
+        # The `# Demo` heading is now sentence-addressable too (headings gained
+        # .mark-sentence spans alongside paragraph/blockquote), so it occupies
+        # global index 0. Every caller here means "sentence `index` of
+        # PARAGRAPH", so offset past the heading's one span.
         self.page.eval_on_selector_all('.mark-sentence', """(els, i) => {
             const r = document.createRange();
             r.selectNodeContents(els[i]);
@@ -97,7 +101,7 @@ class V3SentenceMarkTests(unittest.TestCase):
             s.removeAllRanges();
             s.addRange(r);
             document.dispatchEvent(new Event('selectionchange'));
-        }""", index)
+        }""", index + 1)
 
     def _payload(self):
         return json.loads(self.page.evaluate(
@@ -110,8 +114,9 @@ class V3SentenceMarkTests(unittest.TestCase):
     # --- tests -----------------------------------------------------------
     def test_v3_renders_sentence_spans(self):
         """The spans are server-rendered in every view; only the classic dwell
-        layer's behaviour is view-gated. This is what makes the fix possible."""
-        self.assertEqual(3, self.page.eval_on_selector_all('.mark-sentence', 'e => e.length'))
+        layer's behaviour is view-gated. This is what makes the fix possible.
+        4, not 3: the `# Demo` heading is now sentence-addressable too."""
+        self.assertEqual(4, self.page.eval_on_selector_all('.mark-sentence', 'e => e.length'))
 
     def test_no_selection_still_posts_the_whole_block(self):
         payload = self._payload()

@@ -4944,6 +4944,70 @@ def render_waiting(workspace=DEFAULT_WORKSPACE):
 </body></html>"""
 
 
+def render_mark_layer_preview(route_path, workspace=DEFAULT_WORKSPACE):
+    """First real consumer of `GET /api/mark-layer` (shipped 2026-09-05,
+    20:10:12Z mission-1 run) — that endpoint was proven live via `curl` but
+    read by no page or script, the same "staged, unconsumed" state the
+    Python/JS adapters themselves were in before the endpoint existed. A
+    debug view rather than a production one: renders `to_mark_layer_nodes`'s
+    flat node list (paragraph, its sentence children as SIBLING nodes, blank
+    separators — see `mark_layer_adapter.to_mark_layer_nodes`'s own
+    docstring) as a plain readable list, so a human can look at a page and
+    confirm the node/fragment shape the shared engine emits actually matches
+    what a mark-bar client would receive, before any client is built. Not
+    wired into the mark bar itself — that is still the next step named by
+    the run that shipped the endpoint."""
+    ws = get_workspace(workspace)
+    fs_path = resolve_page(route_path, workspace)
+    with open(fs_path, 'rb') as handle:
+        src = handle.read().decode('utf-8')
+    nodes = to_mark_layer_nodes(src)
+
+    def node_html(node):
+        kind = node['kind']
+        text = ''.join(f.get('text', '') for f in node.get('fragments', []))
+        indent = ' mlp-indent' if kind == 'sentence' else ''
+        shown = _html.escape(text.strip()) or '<span class="mlp-empty">(blank)</span>'
+        return (f'<div class="mlp-node mlp-{kind}{indent}">'
+                f'<span class="mlp-kind">{kind}</span>'
+                f'<span class="mlp-id">{_html.escape(node["id"])}</span>'
+                f'<div class="mlp-text">{shown}</div></div>')
+
+    url_prefix = workspace_url_prefix(workspace)
+    counts = {}
+    for n in nodes:
+        counts[n['kind']] = counts.get(n['kind'], 0) + 1
+    summary = ' · '.join(f'{v} {k}' for k, v in sorted(counts.items()))
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Mark-layer preview — {_html.escape(route_path)}</title>
+<style>{PAGE_CSS}
+.mlp-wrap {{ max-width: 860px; margin: 0 auto; padding: 24px; }}
+.mlp-node {{ padding: 6px 10px; border-bottom: 1px solid #2a2d33; display: flex; gap: 10px; align-items: baseline; }}
+.mlp-indent {{ margin-left: 28px; opacity: 0.85; }}
+.mlp-kind {{ font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; color: #8a8f98;
+  min-width: 64px; }}
+.mlp-id {{ font-size: 11px; color: #5a5f68; font-family: monospace; min-width: 130px; }}
+.mlp-text {{ flex: 1; white-space: pre-wrap; }}
+.mlp-empty {{ color: #5a5f68; font-style: italic; }}
+</style></head>
+<body>
+<nav class="sidebar">
+  <a href="{url_prefix}/waiting" style="font-weight:700;font-size:15px;color:#e6e6e6;">soma-review</a>
+  {render_workspace_switcher(workspace)}
+  {render_sidebar('', workspace)}
+</nav>
+<main class="main">
+  <div class="mlp-wrap">
+    <h1>Mark-layer preview</h1>
+    <p class="waiting-sub">Live consumer of <code>GET {url_prefix}/api/mark-layer?page={_html.escape(route_path)}</code>
+    &mdash; the node/fragment shape SOMA agreed-model item 6a defines, rendered node-by-node so it
+    can be eyeballed against the real page. {len(nodes)} nodes ({summary}).</p>
+    {''.join(node_html(n) for n in nodes)}
+  </div>
+</main>
+</body></html>"""
+
+
 # --- Ringer list (agreed model 12b, 2026-09-04, COO run) --------------------
 #
 # Fork Q1 closed as Alternative B (Mike, 2026-09-03): a bracket of assent
@@ -6318,6 +6382,14 @@ class Handler(BaseHTTPRequestHandler):
             view = qs.get('view', [None])[0]
             try:
                 self._send_html(render_page(route_path, workspace, view=view))
+            except NotFoundError:
+                self._send_html(render_404(route_path, workspace), status=404)
+            return
+
+        if path.startswith('/mark-layer-preview/'):
+            route_path = path[len('/mark-layer-preview/'):]
+            try:
+                self._send_html(render_mark_layer_preview(route_path, workspace))
             except NotFoundError:
                 self._send_html(render_404(route_path, workspace), status=404)
             return

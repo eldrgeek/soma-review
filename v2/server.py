@@ -3172,6 +3172,10 @@ V3_JS = r"""
     hideMarkBar();
     const bar = markBar = document.createElement('div');
     markBar.className = 'v3-markbar';
+    // Remembered so the Tab-interceptor below can tell "focus is still where
+    // this selection was made" from "focus has since moved to an unrelated
+    // input/textarea elsewhere on the page" — see wireSentenceMarks.
+    markBar._wrap = wrap;
     markBar.innerHTML = MARKBAR_KINDS
       .map(([k, label]) => `<button data-v3-mark="${k}">${KIND_META[k].glyph} ${label}</button>`)
       .join('');
@@ -3210,6 +3214,14 @@ V3_JS = r"""
       };
       btn.addEventListener('mousedown', fire);
       btn.addEventListener('touchstart', fire, {passive: false});
+      // A native <button> fires 'click' on Enter/Space when it holds focus —
+      // no synthesized mousedown precedes a keyboard activation, so without
+      // this listener the bar was visible but keyboard-inert. The `fired`
+      // guard above already makes this safe alongside mousedown/touchstart:
+      // a real mouse click sets `fired` from mousedown before its trailing
+      // click event reaches here, and preventDefault() on touchstart
+      // suppresses the browser's synthesized click on touch devices.
+      btn.addEventListener('click', fire);
     });
   }
 
@@ -3227,6 +3239,33 @@ V3_JS = r"""
       showMarkBar(wrap, range.getBoundingClientRect());
     });
     window.addEventListener('scroll', hideMarkBar, {passive: true});
+    // Keyboard path into the bar: a selection made with Shift+Arrow (no
+    // mouse, no touch) raises the bar same as any other selection, but the
+    // bar lives at the end of <body> in DOM order, so plain Tab from wherever
+    // focus already is could take many presses to reach it — effectively
+    // unreachable by keyboard. Intercept the FIRST Tab after such a
+    // selection and jump focus straight into the bar's first button; once
+    // focus is inside the bar, later Tabs walk its own buttons natively and
+    // are left alone (Shift+Tab is also left alone — leaving the bar by
+    // going backward is not a case this needs to own).
+    document.addEventListener('keydown', (e) => {
+      if (e.key !== 'Tab' || e.shiftKey || !markBar) return;
+      if (markBar.contains(document.activeElement)) return;
+      // Skip's adversarial pass (2026-09-05): `markBar` only clears on scroll
+      // or a later selectionchange, neither of which fires when a keyboard
+      // user leaves the selected block by clicking into an unrelated
+      // <input>/<textarea> (a comment box, the always-open discussion box) —
+      // those don't touch the document Selection API at all. Without this
+      // check, every later Tab anywhere on the page — not just the first one
+      // after the selection — would be hijacked into the stale bar. Only
+      // intercept when focus is still inside the block the bar belongs to.
+      const active = document.activeElement;
+      if (!markBar._wrap || !(active === markBar._wrap || markBar._wrap.contains(active))) return;
+      const first = markBar.querySelector('button');
+      if (!first) return;
+      e.preventDefault();
+      first.focus();
+    });
   }
 
   document.addEventListener('DOMContentLoaded', async () => {

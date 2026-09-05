@@ -232,6 +232,65 @@ class V3SentenceMarkTests(unittest.TestCase):
         self.assertFalse(marks[0].get('unresolved'))
         self.assertEqual([], self.errors)
 
+    def test_tab_after_a_selection_focuses_the_bar_and_enter_marks(self):
+        """The other named gap: the bar had no keyboard path. A selection made
+        with no mouse and no touch (simulated here the same way — the point
+        under test is what happens after the selection exists, not how it was
+        made) raised a bar that only 'mousedown'/'touchstart' could press, and
+        the bar lives at the end of <body> so plain Tab from the selection
+        could take many presses to reach it. Tab must jump straight into the
+        bar's first button, and a native button must then fire on Enter."""
+        # A real keyboard-made selection lives inside a focused element (the
+        # block's tabindex="0" body) — focus it first so the interceptor's
+        # "is focus still inside the bar's block" check sees a real case,
+        # not a selection with no focus anywhere (Skip's adversarial pass,
+        # 2026-09-05: the interceptor must NOT fire when focus has moved to
+        # an unrelated input elsewhere, and this is what tells them apart).
+        # `.block-wrap:nth-of-type(2)` counts the 2nd child of MAIN with tag
+        # `div` among ALL of MAIN's div children, not the 2nd `.block-wrap` —
+        # with a non-block-wrap div sibling in between (e.g. a rail element)
+        # it silently focuses the wrong block. Index into the real
+        # `.block-wrap` list instead, same approach `_payload()` already uses.
+        self.page.evaluate(
+            "document.querySelectorAll('.block-wrap')[1].querySelector('.block-body').focus()")
+        self._select_sentence(1)
+        self.page.wait_for_selector('.v3-markbar')
+        self.page.keyboard.press('Tab')
+        focused_is_bar_button = self.page.evaluate(
+            "document.activeElement && document.activeElement.matches('.v3-markbar button')")
+        self.assertTrue(focused_is_bar_button, 'Tab must focus a mark-bar button, not skip past it')
+        self.assertEqual('agree', self.page.evaluate(
+            "document.activeElement.dataset.v3Mark"), 'the first button is Agree')
+        self.page.keyboard.press('Enter')
+        self.page.wait_for_timeout(800)
+        marks = [r for r in self._rows() if r.get('type') == 'mark']
+        self.assertEqual(1, len(marks), 'Enter on the focused button must record the mark')
+        self.assertEqual('agree', marks[0]['mark_kind'])
+        self.assertEqual('Beta is the second sentence.', marks[0]['quote'])
+        self.assertEqual([], self.errors)
+
+    def test_tab_does_not_hijack_focus_from_an_unrelated_textarea(self):
+        """Skip's adversarial pass (2026-09-05): `markBar` only clears on
+        scroll or a later selectionchange. Clicking into the always-open
+        page-discussion textarea to write an unrelated comment does neither —
+        form controls have their own internal selection model, invisible to
+        the document Selection API, so the sentence Range stays live and
+        `markBar` stays non-null. Without scoping the interceptor to "focus
+        is still inside the block the bar belongs to", every later Tab
+        anywhere on the page — not just the first one — would be hijacked
+        into the stale bar, breaking normal keyboard use of an unrelated
+        field."""
+        self.page.evaluate(
+            "document.querySelectorAll('.block-wrap')[1].querySelector('.block-body').focus()")
+        self._select_sentence(1)
+        self.page.wait_for_selector('.v3-markbar')
+        self.page.eval_on_selector('.page-discussion textarea', 'el => el.focus()')
+        self.page.keyboard.press('Tab')
+        focused_is_bar_button = self.page.evaluate(
+            "document.activeElement && document.activeElement.matches('.v3-markbar button')")
+        self.assertFalse(focused_is_bar_button,
+                          'Tab from an unrelated field must not be hijacked into the stale bar')
+
     def test_no_mark_bar_without_a_selection(self):
         self.assertEqual(0, self.page.eval_on_selector_all('.v3-markbar', 'e => e.length'))
 

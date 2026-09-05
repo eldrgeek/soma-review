@@ -470,6 +470,7 @@ a.external-link::after { content: " \2197"; font-size: 11px; opacity: .6; }
                           font-size: 10px; font-weight: 600; background: #1c2230; color: #8a93a3;
                           border: 1px solid #262b33; vertical-align: middle; cursor: default; }
 .mark-layer-node-badge:not([hidden]) { display: inline-block; }
+.mark-layer-node-badge-changed { background: #3a2d12; color: #e0b04b; border-color: #6b4f14; }
 .sidebar a { display: block; padding: 6px 8px; border-radius: 6px; text-decoration: none; font-size: 14px; color: #cbd3e0; }
 .sidebar a:hover { background: #1e2430; }
 .sidebar a.active { background: #22344a; color: #9cc7ff; }
@@ -1595,6 +1596,34 @@ function wireMarkLayerNodeIndicator() {
   badge.title = breakdown;
   badge.hidden = false;
   console.debug('[mark-layer]', nodes.length, 'nodes', counts);
+
+  // "Changed since last view" — compares this page's node id SEQUENCE against
+  // the one recorded on a PRIOR visit (localStorage, keyed by pathname), so a
+  // rewrite that keeps the node COUNT the same (edit a sentence in place)
+  // still surfaces, not just a count delta. Ids are already content-hash
+  // stable (mark_layer_adapter.py's `_content_id` / this file's `sha1Hex`
+  // port), so an unchanged sequence means unchanged content and order — this
+  // does NOT imply the converse: a changed sequence can also mean nodes were
+  // only reordered (their own content untouched). First-ever visit to a page
+  // records a baseline and shows nothing — "changed" needs a prior state to
+  // differ from, and claiming a change against no history would be exactly
+  // the false claim this badge is built to avoid. `JSON.stringify` (not
+  // `.join(',')`) so a future change to `_content_id`'s id format can never
+  // reintroduce a delimiter collision here.
+  try {
+    const key = 'markLayerNodeIds:' + location.pathname;
+    const currentIds = JSON.stringify(nodes.map(n => (n && n.id) || ''));
+    const previousIds = window.localStorage.getItem(key);
+    if (previousIds !== null && previousIds !== currentIds) {
+      badge.textContent += ' (changed)';
+      badge.title = 'changed since your last view here · ' + breakdown;
+      badge.classList.add('mark-layer-node-badge-changed');
+    }
+    window.localStorage.setItem(key, currentIds);
+  } catch (e) {
+    // localStorage unavailable (private browsing, quota, disabled) — the
+    // badge still shows the plain count above; the diff is best-effort only.
+  }
 }
 
 document.addEventListener('DOMContentLoaded', () => {

@@ -131,6 +131,41 @@ class ServerAnchoringTests(unittest.TestCase):
         html = server.render_page('docs/page.md')
         self.assertIn('data-list-units="', html)
 
+    def test_list_item_ranges_disambiguates_duplicate_item_text(self):
+        # Line-1 next item (20260905T045607Z-mission-1): does the monotonic
+        # `cursor` in list_item_ranges() resolve a later mark to the wrong
+        # item when two items share identical text? It does not: cursor only
+        # ever advances, so each duplicate is matched at the first occurrence
+        # AT OR AFTER the previous item's end, never re-matching an earlier,
+        # already-claimed position.
+        text = '- Buy milk\n- Buy milk\n- Something else\n- Buy milk'
+        normalized = blockmap.norm(text)
+        ranges = server.list_item_ranges(text)
+        self.assertEqual(4, len(ranges))
+        quotes = [normalized[start:end] for start, end, _quote in ranges]
+        self.assertEqual(['Buy milk', 'Buy milk', 'Something else', 'Buy milk'], quotes)
+        starts = [start for start, _end, _quote in ranges]
+        self.assertEqual(starts, sorted(starts))
+        self.assertEqual(len(starts), len(set(starts)), 'each duplicate must get its own offset')
+
+    def test_stale_offsets_on_ambiguous_duplicate_quote_refuse_not_misbind(self):
+        # Complement to the ranges test above: once a mark's own (from, to)
+        # offsets no longer match the live text (block edited elsewhere,
+        # `_resolve_on_block` falls through to `_all_occurrences`), an
+        # ambiguous quote — shared by two list items — must refuse (409 /
+        # BindingConflict) rather than silently rebind to whichever
+        # occurrence happens to be found. Safety-by-refusal, not by luck.
+        self.write_doc('# Title\n\n- Buy milk\n- Buy milk\n- Buy eggs\n')
+        server.render_page('docs/page.md')
+        mapping = blockmap.load_map(server.block_map_path('docs/page.md'))
+        list_block = next(row for row in mapping['blocks'] if 'Buy milk' in row.get('text', ''))
+        with self.assertRaises(server.BindingConflict):
+            server.validated_binding('docs/page.md', 'estate', {
+                'block_id': list_block['id'],
+                'from': 9999, 'to': 9999 + len('Buy milk'),  # stale, forces quote fallback
+                'quote': 'Buy milk',
+            })
+
     def test_post_mark_persists_review_metadata(self):
         self.write_doc('# Review title\n\nA focused sentence for review.\n')
         server.render_page('docs/page.md')

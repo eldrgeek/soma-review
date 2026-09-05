@@ -1110,6 +1110,19 @@ addressable rendering instead, with no inline diff overlay for that one block sh
 `tests/test_v3_sentence_marks.py::V3ListItemMarkTests` (5 cases, including the open-edit
 regression case).
 
+**Checked 2026-09-05: duplicate list-item text does not misbind.** The 2026-09-05 mission-1 run
+that shipped `hydrateListUnits()` left this open as unverified: `list_item_ranges()`'s `cursor`
+advances monotonically and was believed but not traced to correctly separate two items with
+identical text rather than re-matching an earlier, already-claimed position. Traced and tested:
+`cursor` only ever moves forward, so a later duplicate is matched at the first occurrence at or
+after the previous item's end — never behind it (`test_list_item_ranges_disambiguates_duplicate_item_text`).
+Separately, `blockmap._resolve_on_block`'s fallback path (reached when a mark's own stale
+`from`/`to` no longer match the live text) requires `len(_all_occurrences(text, quote)) == 1` and
+returns unresolved otherwise — an ambiguous quote across duplicate list items refuses
+(`BindingConflict`/409) rather than silently rebinding to whichever occurrence is found first
+(`test_stale_offsets_on_ambiguous_duplicate_quote_refuse_not_misbind`). Both paths were already
+safe by construction; this closes the open question with tests rather than leaving it unverified.
+
 Still open, named rather than fixed here: a soft-wrapped list-item continuation line is invisible
 to `list_item_ranges()` (it only ranges the item's first physical line, splitting on
 `text.splitlines()`), so a wrapped item's bound quote is shorter than its full rendered text —

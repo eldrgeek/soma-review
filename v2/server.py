@@ -36,7 +36,7 @@ from blockmap import norm  # noqa: E402
 import tours as tour_engine  # noqa: E402  (Quinn tours of completed jobs — see tours.py)
 import cursor_intake  # noqa: E402  (Grok/Cursor intake — see SOMA/cursor-intake/README.md)
 from mark_layer_adapter import (  # noqa: E402  (SOMA agreed model item 6a)
-    to_mark_layer_nodes, attach_mark_layer_node_ids,
+    to_mark_layer_nodes, attach_mark_layer_node_ids, MarkLayerDomStamper,
 )
 
 PROJECTS_ROOT = os.path.expanduser('~/Projects')
@@ -846,9 +846,11 @@ function escapeHtml(s) {
 }
 
 // Additive 6a UI helper: display / jump via a stored mark_layer_node_id.
-// Old block_id + quote remain the default create/render path. A missing
-// id is a no-op (no chip, no throw). Looks up window.__MARK_LAYER_NODES__
-// and scrolls/highlights the matching .mark-sentence or .block-wrap.
+// Default jump is id→DOM (querySelector the stamped data-mark-layer-node-id
+// on the rendered sentence/block). Text-occurrence lookup is fallback only
+// when the id or stamp is missing — counted on __MARK_LAYER_JUMP_STATS__.
+// Old block_id + quote remain the default create path. A missing id is a
+// no-op (no chip, no throw).
 function markLayerNodeText(node) {
   if (!node || !Array.isArray(node.fragments)) return '';
   return node.fragments.map(f => (f && f.text) || '').join('').trim();
@@ -875,7 +877,36 @@ function markLayerBlockText(el) {
   return ((el.textContent || '')).trim();
 }
 
-function findMarkLayerNodeEl(nodeId, opts) {
+window.__MARK_LAYER_JUMP_STATS__ = {id: 0, fallback: 0};
+
+function markLayerJumpStats() {
+  if (!window.__MARK_LAYER_JUMP_STATS__) {
+    window.__MARK_LAYER_JUMP_STATS__ = {id: 0, fallback: 0};
+  }
+  return window.__MARK_LAYER_JUMP_STATS__;
+}
+
+function markLayerNodeIdEscape(nodeId) {
+  const id = String(nodeId);
+  if (typeof CSS !== 'undefined' && typeof CSS.escape === 'function') {
+    return CSS.escape(id);
+  }
+  return id.replace(/["\\]/g, '\\$&');
+}
+
+function findStampedMarkLayerNodeEl(nodeId, root) {
+  if (!nodeId) return null;
+  const scope = root || document;
+  const esc = markLayerNodeIdEscape(nodeId);
+  // Content stamps only — chip buttons also carry data-mark-layer-node-id.
+  return scope.querySelector(
+    '.mark-sentence[data-mark-layer-node-id="' + esc + '"],' +
+    '.block-wrap[data-mark-layer-node-id="' + esc + '"],' +
+    '.mark-block-unit[data-mark-layer-node-id="' + esc + '"]'
+  );
+}
+
+function findMarkLayerNodeElByText(nodeId, opts) {
   const options = opts || {};
   const nodes = options.nodes || window.__MARK_LAYER_NODES__;
   const root = options.root || document;
@@ -902,15 +933,35 @@ function findMarkLayerNodeEl(nodeId, opts) {
   return candidates[occurrence] || null;
 }
 
+function findMarkLayerNodeEl(nodeId, opts) {
+  const options = opts || {};
+  const root = options.root || document;
+  return findStampedMarkLayerNodeEl(nodeId, root) || findMarkLayerNodeElByText(nodeId, options);
+}
+
 function jumpToMarkLayerNode(nodeId, opts) {
-  if (!nodeId) return {ok: false, reason: 'missing-id'};
+  if (!nodeId) return {ok: false, reason: 'missing-id', via: null};
   let el = null;
+  let via = null;
   try {
-    el = findMarkLayerNodeEl(nodeId, opts);
+    const options = opts || {};
+    const root = options.root || document;
+    el = findStampedMarkLayerNodeEl(nodeId, root);
+    if (el) {
+      via = 'id';
+      markLayerJumpStats().id += 1;
+    } else {
+      el = findMarkLayerNodeElByText(nodeId, options);
+      if (el) {
+        via = 'text';
+        markLayerJumpStats().fallback += 1;
+        try { console.info('[mark-layer] jump fallback to text-occurrence', nodeId); } catch (_) {}
+      }
+    }
   } catch (_) {
-    return {ok: false, reason: 'error'};
+    return {ok: false, reason: 'error', via: null};
   }
-  if (!el) return {ok: false, reason: 'not-found'};
+  if (!el) return {ok: false, reason: 'not-found', via: null};
   const options = opts || {};
   document.querySelectorAll('.mark-layer-node-flash').forEach(n => {
     n.classList.remove('mark-layer-node-flash');
@@ -926,7 +977,7 @@ function jumpToMarkLayerNode(nodeId, opts) {
       el.classList.remove('mark-layer-node-flash');
     }, flashMs);
   }
-  return {ok: true, el};
+  return {ok: true, el, via};
 }
 
 function markLayerNodeIdButton(nodeId) {
@@ -950,6 +1001,8 @@ function wireMarkLayerNodeIdButtons(root) {
 
 window.jumpToMarkLayerNode = jumpToMarkLayerNode;
 window.findMarkLayerNodeEl = findMarkLayerNodeEl;
+window.findStampedMarkLayerNodeEl = findStampedMarkLayerNodeEl;
+window.findMarkLayerNodeElByText = findMarkLayerNodeElByText;
 window.markLayerNodeIdButton = markLayerNodeIdButton;
 
 // Minimal word-level diff (LCS-based) for rendering suggested-edit comments inline.
@@ -2104,7 +2157,7 @@ window.initMarkLayer = function initMarkLayer() {
   function jump(){render();const meta=currentMeta();if(meta)meta.el.scrollIntoView({block:'center',behavior:'smooth'});}
 
   document.addEventListener('click',async e=>{
-    const nodeBtn=e.target.closest('[data-mark-layer-node-id]');
+    const nodeBtn=e.target.closest('button.mark-layer-node-id');
     if(nodeBtn){jumpToMarkLayerNode(nodeBtn.dataset.markLayerNodeId);return;}
     const drop=e.target.closest('[data-ml-drop]');
     if(drop){
@@ -3712,14 +3765,29 @@ def _auto_local_for(block, terms_out):
     return title != 'terms'
 
 
+def _mark_layer_node_dom_attrs(node_id, *, as_html_id=False):
+    """Stamp a MarkLayerNode id onto a rendered sentence/block. Empty if missing."""
+    if not node_id:
+        return ''
+    esc = _html_attr_escape(str(node_id))
+    attrs = f' data-mark-layer-node-id="{esc}"'
+    if as_html_id:
+        attrs += f' id="{esc}"'
+    return attrs
+
+
 def mark_layer_inner(block, link_resolver=None, terms=None, lexicon=None, auto_lexicon=False,
-                     auto_local_terms=False):
+                     auto_local_terms=False, stamper=None):
     """Render prose as sentence-addressable spans without disturbing rich blocks.
 
     Each sentence is a separate render_inline() call, but auto-lexicon linking's
     "first occurrence" rule is scoped to the whole BLOCK (paragraph), not the
     sentence — a single `auto_seen` set is created once here and threaded into
     every sentence's render_inline() call so occurrence-tracking spans the block.
+
+    When `stamper` is a MarkLayerDomStamper, each sentence span also carries
+    that occurrence's `data-mark-layer-node-id` (and `id=`) so jump can
+    querySelector the node rather than search by quote text.
     """
     kind = block['kind']
     if kind == 'list':
@@ -3734,9 +3802,13 @@ def mark_layer_inner(block, link_resolver=None, terms=None, lexicon=None, auto_l
     auto_seen = set()
     for start, end, quote in sentence_ranges(block['text']):
         quote_b64 = __import__('base64').b64encode(quote.encode('utf-8')).decode('ascii')
+        node_attr = _mark_layer_node_dom_attrs(
+            stamper.next_sentence(quote) if stamper is not None else None,
+            as_html_id=True,
+        )
         pieces.append(
             f'<span class="mark-sentence" data-from="{start}" data-to="{end}" '
-            f'data-quote="{quote_b64}">'
+            f'data-quote="{quote_b64}"{node_attr}>'
             f'{render_inline(quote, link_resolver, terms=terms, lexicon=lexicon, auto_lexicon=auto_lexicon, auto_seen=auto_seen, auto_local_terms=auto_local_terms)}'
             f'</span>'
         )
@@ -3751,16 +3823,18 @@ def mark_layer_inner(block, link_resolver=None, terms=None, lexicon=None, auto_l
 
 
 def render_block_html(block, route_path, status_chip=None, link_resolver=None, terms=None,
-                       lexicon=None, auto_lexicon=False, auto_local_terms=False):
+                       lexicon=None, auto_lexicon=False, auto_local_terms=False, stamper=None):
     kind = block['kind']
     anchor = block['anchor']
     block_id = _html_attr_escape(block['id'])
     block_sha = _html_attr_escape(blockmap.block_text_sha(block))
     snapshot = _html_attr_escape(block['snapshot'])
+    para_id = stamper.bind_block(block.get('text') or '') if stamper is not None else None
     inner, has_sentence_units = mark_layer_inner(
         block, link_resolver, terms=terms, lexicon=lexicon,
         auto_lexicon=auto_lexicon and kind != 'heading',
         auto_local_terms=auto_local_terms and kind != 'heading',
+        stamper=stamper,
     )
     # Raw markdown source, base64'd, so the client can swap rendered HTML for an
     # editable <textarea> pre-filled with the exact source text (edit-as-comment,
@@ -3797,7 +3871,8 @@ def render_block_html(block, route_path, status_chip=None, link_resolver=None, t
             inner = chip_html + inner
     unit_cls = ' mark-block-unit' if not has_sentence_units and kind != 'heading' else ''
     list_units_attr = f' data-list-units="{list_units_b64}"' if list_units_b64 else ''
-    return f'''<div class="block-wrap{edit_cls}{title_cls}{decision_cls}" data-block-id="{block_id}" data-block-sha="{block_sha}" data-norm-text="{norm_b64}" data-anchor="{anchor}" data-snapshot="{snapshot}" data-kind="{kind}" data-source="{source_b64}" data-section-id="{section_id}" data-section-title="{section_title}" data-decision="{'1' if decision else '0'}"{list_units_attr}>
+    node_attr = _mark_layer_node_dom_attrs(para_id)
+    return f'''<div class="block-wrap{edit_cls}{title_cls}{decision_cls}" data-block-id="{block_id}" data-block-sha="{block_sha}" data-norm-text="{norm_b64}" data-anchor="{anchor}" data-snapshot="{snapshot}" data-kind="{kind}" data-source="{source_b64}" data-section-id="{section_id}" data-section-title="{section_title}" data-decision="{'1' if decision else '0'}"{list_units_attr}{node_attr}>
   <button class="comment-affordance" title="Comment on this block (Enter)">+</button>
   <div class="block-body{unit_cls}"{' tabindex="0"' if editable else ''}>{inner}</div>
   <div class="comment-box">
@@ -3861,8 +3936,9 @@ def maybe_attach_mark_layer_nodes(comment, page, workspace):
 
     Uses the same page-source bytes `GET /api/mark-layer` feeds
     `to_mark_layer_nodes`. A miss, empty node list, or adapter error is a
-    no-op — the old mark path still writes. Live UI may display/jump via
-    the id; old block-parser fields remain the default read/render path.
+    no-op — the old mark path still writes. Live jump prefers this id
+    when the rendered DOM carries a matching stamp; old block-parser
+    fields remain the default create path and the jump fallback.
     """
     try:
         fs_path = resolve_page(page, workspace)
@@ -4045,12 +4121,24 @@ def _rerender_block(route_path, workspace, fs_path, new_src, block_id, old_block
     terms_out = {}
     parse_markdown(new_src, link_resolver=resolver, terms_out=terms_out, lexicon=lexicon)
     badges_on = route_path in (ws.get('status_badges') or [])
+    stamper = None
+    try:
+        _, ml_src = strip_auto_lexicon_marker(new_src)
+        ml_src = strip_front_matter(ml_src)
+        stamper = MarkLayerDomStamper(to_mark_layer_nodes(ml_src))
+        for prior in new_blocks:
+            if prior is new_block:
+                break
+            stamper.skip_block(prior.get('text') or '')
+    except Exception:  # noqa: BLE001 — stamp is additive; never fail a rerender
+        stamper = None
     html = render_block_html(
         new_block, route_path,
         status_chip=(wq_status_chip(new_block) if badges_on else None),
         link_resolver=resolver, terms=terms_out, lexicon=lexicon,
         auto_lexicon=auto_lexicon_page,
         auto_local_terms=_auto_local_for(new_block, terms_out),
+        stamper=stamper,
     )
     return {'block_id': new_block['id'], 'html': html}
 
@@ -4435,6 +4523,21 @@ def render_page(route_path, workspace=DEFAULT_WORKSPACE, view='classic'):
         )
 
     badges_on = route_path in (ws.get('status_badges') or [])
+    # Build adapter nodes before HTML so each sentence/block can carry its
+    # MarkLayerNode id. Same strip as the embed below; a stamp miss is
+    # silent (old text-occurrence jump remains).
+    mark_layer_stamper = None
+    mark_layer_nodes_json = 'null'
+    try:
+        _, mark_layer_src = strip_auto_lexicon_marker(src)
+        mark_layer_src = strip_front_matter(mark_layer_src)
+        mark_layer_nodes = to_mark_layer_nodes(mark_layer_src)
+        mark_layer_nodes_json = json.dumps(mark_layer_nodes)
+        mark_layer_stamper = MarkLayerDomStamper(mark_layer_nodes)
+    except Exception as e:  # noqa: BLE001 — additive value, must never 500 a page
+        sys.stderr.write(f'[mark-layer] node build failed for {route_path}: {e}\n')
+        mark_layer_nodes_json = 'null'
+        mark_layer_stamper = None
     block_htmls = [
         render_block_html(
             b, route_path,
@@ -4444,6 +4547,7 @@ def render_page(route_path, workspace=DEFAULT_WORKSPACE, view='classic'):
             lexicon=lexicon,
             auto_lexicon=auto_lexicon_page,
             auto_local_terms=_auto_local_for(b, terms_out),
+            stamper=mark_layer_stamper,
         )
         for b in blocks]
     if view == 'v3':
@@ -4472,24 +4576,9 @@ def render_page(route_path, workspace=DEFAULT_WORKSPACE, view='classic'):
                 }
     term_defs_json = json.dumps(term_defs)
 
-    # Mark-layer nodes, embedded additively (2026-09-05 mission-1 run) so an
-    # in-page mark-bar client can read the shared engine's node/fragment shape
-    # without a second round-trip to `GET /api/mark-layer` — the gap named by
-    # the 20:10:12Z and 20:40:28Z mission-1 runs that shipped that endpoint and
-    # its first (unlinked, debug-only) consumer. A page's other content is
-    # completely unaffected: this is a pure JSON-value addition to the existing
-    # bootstrap `<script>` block, never a new script tag, never a change to any
-    # other page byte. Wrapped in try/except like the tour asset build above —
-    # a mark-layer adapter bug must never break page render, since nothing on
-    # the page reads this value yet (same posture the debug preview route
-    # shipped with).
-    try:
-        _, mark_layer_src = strip_auto_lexicon_marker(src)
-        mark_layer_src = strip_front_matter(mark_layer_src)
-        mark_layer_nodes_json = json.dumps(to_mark_layer_nodes(mark_layer_src))
-    except Exception as e:  # noqa: BLE001 — additive value, must never 500 a page
-        sys.stderr.write(f'[mark-layer] node build failed for {route_path}: {e}\n')
-        mark_layer_nodes_json = 'null'
+    # Mark-layer nodes JSON was built above (same parse as the DOM stamps).
+    # Embedded additively so the client can still read the node list without
+    # a second round-trip; text-occurrence jump uses it as fallback only.
 
     # trailing newline keeps flagged-page head formatting tidy; empty string on
     # non-flagged pages keeps their rendered HTML byte-identical to pre-feature.

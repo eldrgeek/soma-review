@@ -1277,6 +1277,15 @@ comment/dwell cards can display `mark_layer_node_id` and jump to the matching se
 no crash). Old block-parser / v3 / classic mark path remains the default create/render
 path. Twin emitter stays. 6a stays open.
 
+**6a beside (2026-09-06), id→DOM default jump, not closed:** rendered `.mark-sentence` /
+`.block-wrap` now carry `data-mark-layer-node-id` (sentences also `id=`) from
+`MarkLayerDomStamper` walking `to_mark_layer_nodes` in document order. Default
+`jumpToMarkLayerNode` is `querySelector` on that stamp — not quote-text /
+occurrence-index. Missing id or missing stamp falls back to the old text path and
+increments `window.__MARK_LAYER_JUMP_STATS__.fallback`. Old `block_id` / quote
+create path and dual-write stay until a parity gate retires them. Twin emitter
+stays. 6a stays open.
+
 ## Authorship
 
 v2 built 2026-07-02 by Dee (Claude Sonnet 5, engineering-lead/COO role) per Mike's spec

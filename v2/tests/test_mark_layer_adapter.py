@@ -12,6 +12,7 @@ sys.path.insert(0, V2_DIR)
 
 from mark_layer_adapter import (  # noqa: E402
     to_mark_layer_nodes, match_mark_layer_nodes, attach_mark_layer_node_ids,
+    MarkLayerDomStamper,
 )
 from mdblocks import norm  # noqa: E402
 
@@ -285,6 +286,71 @@ class MatchMarkLayerNodesTests(unittest.TestCase):
         matched = match_mark_layer_nodes(nodes, quote='Beta is')
         self.assertTrue(matched)
         self.assertEqual(expected['id'], matched[0]['id'])
+
+
+class MarkLayerDomStamperTests(unittest.TestCase):
+    """Render-time walker: repeated sentences get their occurrence id, not first-hit."""
+
+    def test_repeated_sentence_consumes_occurrence_ids_in_order(self):
+        text = 'Ready. Unique first context.\n\nReady. Unique second context.'
+        nodes = to_mark_layer_nodes(text)
+        ready = [
+            n for n in nodes
+            if n['kind'] == 'sentence' and n['fragments'][0]['text'].strip() == 'Ready.'
+        ]
+        self.assertEqual(2, len(ready))
+        self.assertNotEqual(ready[0]['id'], ready[1]['id'])
+
+        stamper = MarkLayerDomStamper(nodes)
+        first_para = stamper.bind_block('Ready. Unique first context.')
+        first_ready = stamper.next_sentence('Ready.')
+        first_ctx = stamper.next_sentence('Unique first context.')
+        second_para = stamper.bind_block('Ready. Unique second context.')
+        second_ready = stamper.next_sentence('Ready.')
+        second_ctx = stamper.next_sentence('Unique second context.')
+
+        self.assertEqual(ready[0]['id'], first_ready)
+        self.assertEqual(ready[1]['id'], second_ready)
+        self.assertNotEqual(first_ready, second_ready)
+        self.assertTrue(first_para and first_para.startswith('pmpara-'))
+        self.assertTrue(second_para and second_para.startswith('pmpara-'))
+        self.assertNotEqual(first_para, second_para)
+        self.assertTrue(first_ctx and first_ctx.startswith('pmsent-'))
+        self.assertTrue(second_ctx and second_ctx.startswith('pmsent-'))
+
+    def test_skip_block_preserves_later_duplicate_occurrence(self):
+        text = 'Ready. Unique first context.\n\nReady. Unique second context.'
+        nodes = to_mark_layer_nodes(text)
+        ready = [
+            n for n in nodes
+            if n['kind'] == 'sentence' and n['fragments'][0]['text'].strip() == 'Ready.'
+        ]
+        stamper = MarkLayerDomStamper(nodes)
+        stamper.skip_block('Ready. Unique first context.')
+        stamper.bind_block('Ready. Unique second context.')
+        self.assertEqual(ready[1]['id'], stamper.next_sentence('Ready.'))
+
+    def test_heading_block_text_matches_hashed_source(self):
+        nodes = to_mark_layer_nodes('# Review title\n\nAlpha is first.')
+        stamper = MarkLayerDomStamper(nodes)
+        heading_id = stamper.bind_block('Review title')
+        self.assertTrue(heading_id and heading_id.startswith('pmpara-'))
+        # Adapter does not sentence-split headings; sentence stamp is a miss.
+        self.assertIsNone(stamper.next_sentence('Review title'))
+        para_id = stamper.bind_block('Alpha is first.')
+        self.assertTrue(para_id and para_id.startswith('pmpara-'))
+        sent_id = stamper.next_sentence('Alpha is first.')
+        expected = next(
+            n for n in nodes
+            if n['kind'] == 'sentence'
+            and n['fragments'][0]['text'].strip() == 'Alpha is first.'
+        )
+        self.assertEqual(expected['id'], sent_id)
+
+    def test_empty_stamper_is_noop(self):
+        stamper = MarkLayerDomStamper([])
+        self.assertIsNone(stamper.bind_block('Ready.'))
+        self.assertIsNone(stamper.next_sentence('Ready.'))
 
 
 if __name__ == '__main__':

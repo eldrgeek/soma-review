@@ -15,11 +15,15 @@ produce it.
 
 Write-side beside-step (2026-09-06): `POST /api/comments` type=mark now
 calls `attach_mark_layer_node_ids` so a new mark can carry the matching
-node id. UI may display/jump via that id; the live comment/mark *read*
-path still uses the old block-parser / `mark_layer_inner` / v3 path — this
-module is not the default renderer.
-Wiring `server.py`'s actual block-parse response to emit this shape is the
-cutover (agreed-model 6a + item 15), still open.
+node id. Default jump/render prefers that stored id when the live DOM
+carries a matching `data-mark-layer-node-id` stamp (`MarkLayerDomStamper`
+walks these nodes in document order while `mark_layer_inner` renders).
+Text-occurrence lookup remains the fallback, not the default, when the
+id or stamp is missing. The live comment/mark *create* path is still the
+old block-parser / `block_id` / quote fields — this module is not the
+default writer. Wiring the live block-parse response itself to *emit*
+this shape (and retiring dual-write) is the remaining cutover
+(agreed-model 6a + item 15), still open.
 
 **Fixed 2026-09-05 (mission-1, same day as the module's first slice): node
 ids are now content-derived, not a call-scoped counter.** `_next_id` used to
@@ -68,7 +72,7 @@ unrelated sibling with the same text was inserted earlier in the doc. This
 is the same failure SHAPE Anchoring v2 exists to prevent (`blockmap.py`),
 one layer down: content-hash ids are stable, but the occurrence COUNTER
 layered on top to break ties is itself position-derived. **UI can display/jump via a stored id** (additive chip +
-`jumpToMarkLayerNode`); the default create/render path is still the old
+`jumpToMarkLayerNode`); the default create path is still the old
 block-parser fields — but whoever wires the real cross-edit
 diffing use case (as opposed to idempotent re-parse of one static document,
 e.g. on server restart) MUST solve real disambiguation first, or two runs
@@ -316,6 +320,92 @@ def attach_mark_layer_node_ids(record: dict[str, Any], page_src: str) -> dict[st
     except Exception:  # noqa: BLE001 — attach is beside-only; never fail a write
         return record
     return record
+
+
+class MarkLayerDomStamper:
+    """Assign adapter node ids to rendered blocks/sentences in document order.
+
+    Live HTML is produced by `parse_markdown` + `sentence_ranges`; adapter
+    nodes come from `to_mark_layer_nodes` (blank-line split +
+    `segment_sentences`). This walker lines the two up by stripped / normed
+    text and consumes matches so a repeated sentence in a later block gets
+    that occurrence's id (`pmsent-…-1`), not the first hit.
+
+    `bind_block` stamps the paragraph node on `.block-wrap`.
+    `next_sentence` stamps the sentence node on `.mark-sentence`.
+    A miss returns None — the renderer omits the attribute and jump falls
+    back to the old text-occurrence path.
+    """
+
+    def __init__(self, nodes: list[dict[str, Any]] | None = None):
+        self._groups = _paragraph_groups(list(nodes or []))
+        self._next_group = 0
+        self._current_sentences: list[dict[str, Any]] = []
+        self._next_sentence = 0
+        self._used_sentence_ids: set[str] = set()
+
+    def bind_block(self, block_text: str) -> str | None:
+        """Consume the next unused paragraph group matching `block_text`."""
+        needle = (block_text or '').strip()
+        if not needle:
+            self._current_sentences = []
+            self._next_sentence = 0
+            return None
+        needle_norm = norm(needle)
+        for i in range(self._next_group, len(self._groups)):
+            para, sents = self._groups[i]
+            if para is None:
+                continue
+            text = _node_text(para).strip()
+            heading_stripped = _HEADING_RE.sub('', text).strip()
+            if not (
+                text == needle
+                or heading_stripped == needle
+                or norm(text) == needle_norm
+                or (heading_stripped and norm(heading_stripped) == needle_norm)
+            ):
+                continue
+            self._next_group = i + 1
+            self._current_sentences = sents
+            self._next_sentence = 0
+            return para.get('id')
+        self._current_sentences = []
+        self._next_sentence = 0
+        return None
+
+    def skip_block(self, block_text: str) -> None:
+        """Consume a prior block so a later duplicate keeps its occurrence id."""
+        if self.bind_block(block_text):
+            self._next_sentence = len(self._current_sentences)
+            for sent in self._current_sentences:
+                sid = sent.get('id')
+                if sid:
+                    self._used_sentence_ids.add(sid)
+
+    def next_sentence(self, quote: str) -> str | None:
+        """Consume the next unused sentence whose stripped text equals `quote`."""
+        needle = (quote or '').strip()
+        if not needle:
+            return None
+        for i in range(self._next_sentence, len(self._current_sentences)):
+            sent = self._current_sentences[i]
+            sid = sent.get('id')
+            if sid in self._used_sentence_ids:
+                continue
+            if _node_text(sent).strip() == needle:
+                self._next_sentence = i + 1
+                if sid:
+                    self._used_sentence_ids.add(sid)
+                return sid
+        for _para, sents in self._groups:
+            for sent in sents:
+                sid = sent.get('id')
+                if not sid or sid in self._used_sentence_ids:
+                    continue
+                if _node_text(sent).strip() == needle:
+                    self._used_sentence_ids.add(sid)
+                    return sid
+        return None
 
 
 def to_mark_layer_nodes(md: str) -> list[dict[str, Any]]:

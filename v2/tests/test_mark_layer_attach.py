@@ -322,7 +322,8 @@ class MarkLayerAttachHTTPTests(unittest.TestCase):
         self.assertEqual(expected['id'], row['mark_layer_node_id'])
         self.assertEqual('mark_layer_node_id', row.get('mark_layer_primary'))
         self.assertIsNone(row.get('block_id'))
-        self.assertIsNone(row.get('quote'))
+        # Id-only create still records the node's text as the selected span.
+        self.assertEqual('Beta is second.', row.get('quote'))
         saved = [c for c in server.read_comments('docs/page.md') if c['id'] == row['id']]
         self.assertEqual(expected['id'], saved[0]['mark_layer_node_id'])
         self.assertIsNone(saved[0].get('block_id'))

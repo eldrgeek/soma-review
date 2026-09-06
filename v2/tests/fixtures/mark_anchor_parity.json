@@ -59,7 +59,7 @@
   "edit_applies": [
     {
       "id": "edit-unique-reattach",
-      "before": "# Review title\n\nAlpha is first. Beta is second. Gamma is third.\n",
+      "before": "# Review title\n\nAlpha is first.\n\nBeta is second.\n\nGamma is third.\n",
       "mark_quote": "Beta is second.",
       "mark_snapshot": "Beta is second.",
       "proposed": "Beta is precise.",

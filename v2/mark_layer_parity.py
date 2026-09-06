@@ -587,7 +587,21 @@ def compare_edit_cutover(case: dict[str, Any]) -> dict[str, Any]:
                 mark['mark_layer_primary'] = 'mark_layer_node_id'
         server.maybe_strip_legacy_anchor_fields(mark)
         server.append_comment(ws.route, dict(mark))
-        html_after = change_result.get('html') or ws.render()
+        if not change_result.get('html'):
+            unaccounted.append(_diff_row(
+                page_id=page_id, mark_id=mark['id'],
+                old={'status': 'bound', 'quote': snapshot},
+                new={'status': 'unresolved', 'reason': 'no-rerender'},
+                reason=None,
+                detail='apply_sentence_change returned no block html',
+            ))
+            return {
+                'page_id': page_id,
+                'matches': matches,
+                'accounted': accounted,
+                'unaccounted': unaccounted,
+            }
+        html_after = ws.render()
         stamps_after = extract_stamps(html_after)
         live_id = mark.get('mark_layer_node_id')
         new_hit = resolve_stamp(live_id, stamps_after)

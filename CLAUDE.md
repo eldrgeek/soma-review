@@ -1252,9 +1252,12 @@ depends on it yet:
 None of this is wired into the *live* block-parser response that `/page/*` and the existing
 comment system actually read. The fork is closed (Rook program ruling 2026-09-06; agreed-model
 items 6a and 15): live marks migrate onto the shared `MarkLayerNode` shape — Playmaker's engine,
-soma-review supplying blocks and the mark record. The old block-parser mark path stays live and
-default until the new path proves itself with a view-diff / parity gate (zero diffs, or every
-diff accounted). The Python twin emitter is a **bridge during migration only**, then dies — not
+soma-review supplying blocks and the mark record. The old block-parser mark path stays live beside the id path.
+Item-15 view-diff / parity is a named gate (`v2/mark_layer_parity.py`,
+`v2/tests/test_mark_layer_parity.py`): zero unaccounted landing diffs
+on the fixture set, or every diff listed with reason (remap ledger /
+occurrence-suffix-shift / unpaired-miss / heading-no-sentence-node).
+The Python twin emitter is a **bridge during migration only**, then dies — not
 a permanent parallel or debug-only option.
 
 **6a beside (2026-09-06), first step, not closed:** `POST /api/comments` with `type: mark` now
@@ -1262,8 +1265,8 @@ resolves the best matching `MarkLayerNode` via `to_mark_layer_nodes` on the page
 additively stores `mark_layer_node_id` / `mark_layer_node_ids` on the new sidecar row
 (`v2/mark_layer_adapter.attach_mark_layer_node_ids`). Existing anchor/quote/snapshot/`block_id`
 fields are unchanged and remain the default read/render path. No match or adapter failure is a
-no-op — the mark still writes as today. Twin emitter stays. 6a stays open until the live UI
-rides nodes as the default path and the item-15 view-diff / parity gate is green.
+no-op — the mark still writes as today. Twin emitter stays. 6a stays open
+(gate green; create/edit residuals accepted, not a cutover).
 
 **Skip 2026-09-06 nit 1 (load-bearing before any UI rides `mark_layer_node_id`):**
 `match_mark_layer_nodes` now unique-matches only. A repeated sentence plus a snapshot that
@@ -1321,14 +1324,21 @@ sibling — unpaired old ids miss. `commitChange` uses explicit
 cannot wipe new stamps.
 Residuals, named not hidden: (1) `_content_id` occurrence-suffix minting
 stays the Playmaker twin (accepted mint; identity is the remap ledger);
-(2) **item-15 view-diff / parity gate is not run here**; (3) unpaired
-weak-neighbor duplicates still miss rather than guess. Twin emitter
-stays. Out of scope: Playmaker Fountain `[[SCENE:]]` / P1 Doc export;
-P2 rrweb harness.
-**6a stays open** until edit-rebind is proven against the item-15 gate.
-Do not claim 6a closed. block_id identity dual-write is off on location
-create; quote/from/to stay as the selected span; type=edit still writes
-`block_id` + `snapshot`.
+(2) **item-15 view-diff / parity gate is green** on
+`v2/tests/fixtures/mark_anchor_parity.json` (Ready. repeats, unique
+sentences, suffix-shift edits, weak-neighbor unpaired miss, heading
+spans without a sentence node). Run:
+`python3 -m unittest v2.tests.test_mark_layer_parity` or
+`python3 v2/mark_layer_parity.py` (exit 1 on any new unaccounted
+landing mismatch). (3) unpaired weak-neighbor duplicates still miss
+rather than guess — the gate lists that as `unpaired-miss`, not a
+silent pass. Twin emitter stays. Out of scope: Playmaker Fountain
+`[[SCENE:]]` / P1 Doc export; P2 rrweb harness; unbounded ledger prune.
+**6a stays open.** The item-15 gate is green and the create/edit
+residuals are accepted (named, not closed as a cutover): block_id
+identity dual-write is off on location create; quote/from/to stay as
+the selected span; type=edit still writes `block_id` + `snapshot`.
+The Python twin is still the live bridge — do not claim 6a closed.
 
 ## Fold (SOMA agreed model item 10) — wired into the v3 panel (2026-09-06)
 

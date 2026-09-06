@@ -1,0 +1,59 @@
+{
+  "description": "Item-15 view-diff / parity fixture set. Old-path resolve (block_id/quote/snapshot) vs mark_layer_node_id → DOM stamp. Repeated Ready. cases from prior 6a tests are required.",
+  "pages": [
+    {
+      "id": "unique-sentences",
+      "source": "# Review title\n\nAlpha is first. Beta is second. Gamma is third.\n"
+    },
+    {
+      "id": "ready-repeats",
+      "source": "# Review title\n\nReady. Unique first context.\n\nReady. Unique second context.\n"
+    },
+    {
+      "id": "ready-bare-with-other",
+      "source": "Ready.\n\nOther.\n\nReady.\n"
+    },
+    {
+      "id": "weak-neighbor-ready",
+      "source": "Ready.\n\nReady.\n"
+    },
+    {
+      "id": "abbrev-and-quotes",
+      "source": "Dr. Smith said hi. He left.\n\nHe said \"Stop.\" She left.\n"
+    },
+    {
+      "id": "soft-wrap",
+      "source": "This line wraps\nacross a soft break. The next sentence stays whole.\n"
+    },
+    {
+      "id": "heading-and-prose",
+      "source": "## A Heading. With A Period.\n\nOne sentence after the heading.\n"
+    }
+  ],
+  "edits": [
+    {
+      "id": "ready-insert-earlier-duplicate",
+      "before": "# Review title\n\nReady. Unique first context.\n\nReady. Unique second context.\n",
+      "after": "# Review title\n\nReady. Brand new context.\n\nReady. Unique first context.\n\nReady. Unique second context.\n",
+      "mark_quote": "Ready.",
+      "mark_snapshot": "Ready. Unique second context.",
+      "expect_accounted": ["occurrence-suffix-shift"]
+    },
+    {
+      "id": "unique-gains-suffix",
+      "before": "# Review title\n\nAlpha is first. Unique context.\n\nBeta is second.\n",
+      "after": "# Review title\n\nAlpha is first. Brand new context.\n\nAlpha is first. Unique context.\n\nBeta is second.\n",
+      "mark_quote": "Alpha is first.",
+      "mark_snapshot": "Alpha is first. Unique context.",
+      "expect_accounted": ["occurrence-suffix-shift"]
+    },
+    {
+      "id": "weak-neighbor-insert",
+      "before": "Ready.\n\nReady.\n",
+      "after": "Ready.\n\nReady.\n\nReady.\n",
+      "mark_quote": "Ready.",
+      "mark_occurrence": 1,
+      "expect_accounted": ["unpaired-miss"]
+    }
+  ]
+}

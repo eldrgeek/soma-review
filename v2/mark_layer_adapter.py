@@ -27,8 +27,9 @@ Old `block_id` / quote / snapshot are not written on unique-match
 creates unless `SOMA_REVIEW_MARK_LAYER_DUAL_WRITE` is explicitly on
 (compat bridge, default off). Readers use the stored id when present
 and fall back to those fields only for legacy rows. 6a stays open
-until edit-rebind is proven against the item-15 view-diff / parity
-gate. Twin `-{n}` mint is the permanent Playmaker mint (unique
+Item-15 view-diff / parity (`mark_layer_parity.py`) is the named
+gate; 6a stays open while the twin emitter is the live bridge.
+Twin `-{n}` mint is the permanent Playmaker mint (unique
 (kind, text) already has no suffix); identity across duplicate-insert
 edits is the remap ledger. Weak-neighbor pairing no longer
 position-pairs identical lone paragraphs; unpaired old ids miss.
@@ -99,8 +100,9 @@ identity is the remap ledger (`align_mark_layer_nodes` + sidecar
 rebind + persisted `remap_ledger`), not a change to `_content_id`
 minting — the suffix still shifts in the twin emitter; the ledger
 accounts that remap so a stored id keeps querySelector-hitting the
-same sentence (or a named unpaired residual). Do not claim 6a closed
-while the item-15 view-diff / parity gate remains.
+same sentence (or a named unpaired residual). Do not claim 6a closed:
+the item-15 gate is green; dual-write/create/edit residuals stay
+accepted, not a cutover.
 
 **Known gap, still flagged rather than fixed:**
 

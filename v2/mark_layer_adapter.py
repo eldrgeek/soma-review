@@ -13,11 +13,12 @@ prerequisite named in `playmaker/docs/MARK-LAYER-ENGINE.md` "Next" item 1
 ("soma-review consumption") before the live block parser can be rewired to
 produce it.
 
-Deliberately not wired into any live server route yet — same staged state
-the JS adapter itself documents ("Not consumed anywhere yet"). Wiring
-`server.py`'s actual block-parse response to use this shape is the next,
-larger step (changes the wire format multiple live consumers read) and is
-out of scope for this pass.
+Write-side beside-step (2026-09-06): `POST /api/comments` type=mark now
+calls `attach_mark_layer_node_ids` so a new mark can carry the matching
+node id. The live comment/mark *read* path still uses the old block-parser
+/ `mark_layer_inner` / v3 path — this module is not the default renderer.
+Wiring `server.py`'s actual block-parse response to emit this shape is the
+cutover (agreed-model 6a + item 15), still open.
 
 **Fixed 2026-09-05 (mission-1, same day as the module's first slice): node
 ids are now content-derived, not a call-scoped counter.** `_next_id` used to
@@ -65,13 +66,14 @@ would read two untouched nodes as deleted-and-recreated, purely because an
 unrelated sibling with the same text was inserted earlier in the doc. This
 is the same failure SHAPE Anchoring v2 exists to prevent (`blockmap.py`),
 one layer down: content-hash ids are stable, but the occurrence COUNTER
-layered on top to break ties is itself position-derived. **Not exploitable
-today** because nothing consumes this module's output yet (see "Deliberately
-not wired" above) — but whoever wires the real cross-edit diffing use case
-(as opposed to idempotent re-parse of one static document, e.g. on server
-restart) MUST solve real disambiguation first, or two runs of identical
-content anywhere in the same document will falsely appear to move/change
-across every edit that happens to touch an EARLIER occurrence of that text.
+layered on top to break ties is itself position-derived. **Not a live
+read-path consumer yet** (new marks store the id beside the old anchor
+fields; UI still ignores it) — but whoever wires the real cross-edit
+diffing use case (as opposed to idempotent re-parse of one static document,
+e.g. on server restart) MUST solve real disambiguation first, or two runs
+of identical content anywhere in the same document will falsely appear to
+move/change across every edit that happens to touch an EARLIER occurrence
+of that text.
 
 **Known gap, still flagged rather than fixed:**
 
@@ -151,6 +153,139 @@ def _sentence_nodes(seen: dict[str, int], paragraph_text: str) -> list[dict[str,
         })
         offset += len(text)
     return nodes
+
+
+def _node_text(node: dict[str, Any]) -> str:
+    return ''.join(str(frag.get('text') or '') for frag in (node.get('fragments') or []))
+
+
+def _paragraph_groups(nodes: list[dict[str, Any]]) -> list[tuple[dict[str, Any] | None, list[dict[str, Any]]]]:
+    """Walk the adapter's flat list into (paragraph, following sentences) groups.
+
+    `to_mark_layer_nodes` emits a paragraph, then its sentence siblings, then
+    a blank (or the next paragraph). Grouping lets a mark's `snapshot` (the
+    block text) scope which duplicate sentence we attach when the same quote
+    appears more than once.
+    """
+    groups: list[tuple[dict[str, Any] | None, list[dict[str, Any]]]] = []
+    paragraph: dict[str, Any] | None = None
+    sentences: list[dict[str, Any]] = []
+
+    def flush() -> None:
+        nonlocal paragraph, sentences
+        if paragraph is not None or sentences:
+            groups.append((paragraph, sentences))
+        paragraph = None
+        sentences = []
+
+    for node in nodes:
+        kind = node.get('kind')
+        if kind == 'blank':
+            flush()
+            continue
+        if kind == 'paragraph':
+            flush()
+            paragraph = node
+            continue
+        if kind == 'sentence':
+            sentences.append(node)
+    flush()
+    return groups
+
+
+def match_mark_layer_nodes(
+    nodes: list[dict[str, Any]],
+    *,
+    quote: str | None = None,
+    snapshot: str | None = None,
+) -> list[dict[str, Any]]:
+    """Best-matching MarkLayerNode(s) for a mark's quote (and optional snapshot).
+
+    Prefer an exact sentence-text match (whitespace-stripped — adapter
+    sentence fragments keep the leading space `segment_sentences` tiles with,
+    while live mark quotes come from `sentence_ranges` which strips), then an
+    exact paragraph match, then containment. When `snapshot` uniquely names a
+    paragraph group, matching is scoped to that group so a repeated sentence
+    attaches the occurrence in that block. Returns [] when nothing matches.
+    """
+    needle = (quote or '').strip() or (snapshot or '').strip()
+    if not needle or not nodes:
+        return []
+
+    groups = _paragraph_groups(nodes)
+    snapshot_stripped = (snapshot or '').strip()
+    scoped = groups
+    if snapshot_stripped:
+        narrowed = [
+            (para, sents) for para, sents in groups
+            if para is not None and _node_text(para).strip() == snapshot_stripped
+        ]
+        if narrowed:
+            scoped = narrowed
+
+    exact_sentences: list[tuple[dict[str, Any], dict[str, Any] | None]] = []
+    exact_paragraphs: list[dict[str, Any]] = []
+    contain_sentences: list[tuple[dict[str, Any], dict[str, Any] | None]] = []
+    contain_paragraphs: list[dict[str, Any]] = []
+
+    for para, sents in scoped:
+        for sent in sents:
+            text = _node_text(sent).strip()
+            if not text:
+                continue
+            if text == needle:
+                exact_sentences.append((sent, para))
+            elif needle in text or text in needle:
+                contain_sentences.append((sent, para))
+        if para is not None:
+            text = _node_text(para).strip()
+            if not text:
+                continue
+            if text == needle:
+                exact_paragraphs.append(para)
+            elif needle in text or text in needle:
+                contain_paragraphs.append(para)
+
+    def with_parent(sent: dict[str, Any], para: dict[str, Any] | None) -> list[dict[str, Any]]:
+        out = [sent]
+        if para is not None and para.get('id') and para.get('id') != sent.get('id'):
+            out.append(para)
+        return out
+
+    if exact_sentences:
+        return with_parent(*exact_sentences[0])
+    if exact_paragraphs:
+        return [exact_paragraphs[0]]
+    if contain_sentences:
+        return with_parent(*contain_sentences[0])
+    if contain_paragraphs:
+        return [contain_paragraphs[0]]
+    return []
+
+
+def attach_mark_layer_node_ids(record: dict[str, Any], page_src: str) -> dict[str, Any]:
+    """Additively stamp `mark_layer_node_id` / `mark_layer_node_ids` on a mark.
+
+    Best-effort and never load-bearing: any adapter failure, empty node list,
+    or unmatched quote leaves `record` unchanged (no new keys). Does not
+    raise. Existing anchor/quote/snapshot/block_id fields are not touched.
+    """
+    try:
+        if not isinstance(record, dict) or not isinstance(page_src, str):
+            return record
+        matched = match_mark_layer_nodes(
+            to_mark_layer_nodes(page_src),
+            quote=record.get('quote'),
+            snapshot=record.get('snapshot'),
+        )
+        ids = [node['id'] for node in matched if node.get('id')]
+        if not ids:
+            return record
+        record['mark_layer_node_id'] = ids[0]
+        record['mark_layer_node_ids'] = ids
+    except Exception:  # noqa: BLE001 — attach is beside-only; never fail a write
+        return record
+    return record
 
 
 def to_mark_layer_nodes(md: str) -> list[dict[str, Any]]:

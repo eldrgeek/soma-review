@@ -35,7 +35,9 @@ import blockmap  # noqa: E402
 from blockmap import norm  # noqa: E402
 import tours as tour_engine  # noqa: E402  (Quinn tours of completed jobs — see tours.py)
 import cursor_intake  # noqa: E402  (Grok/Cursor intake — see SOMA/cursor-intake/README.md)
-from mark_layer_adapter import to_mark_layer_nodes  # noqa: E402  (SOMA agreed model item 6a)
+from mark_layer_adapter import (  # noqa: E402  (SOMA agreed model item 6a)
+    to_mark_layer_nodes, attach_mark_layer_node_ids,
+)
 
 PROJECTS_ROOT = os.path.expanduser('~/Projects')
 DISPATCH_PROMPT_TEMPLATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dispatch-prompt-template.md')
@@ -3727,6 +3729,23 @@ class BindingConflict(Exception):
     pass
 
 
+def maybe_attach_mark_layer_nodes(comment, page, workspace):
+    """6a beside: stamp MarkLayerNode ids onto a new mark. Never raises.
+
+    Uses the same page-source bytes `GET /api/mark-layer` feeds
+    `to_mark_layer_nodes`. A miss, empty node list, or adapter error is a
+    no-op — the old mark path still writes. Live UI does not read these
+    fields yet.
+    """
+    try:
+        fs_path = resolve_page(page, workspace)
+        with open(fs_path, 'rb') as handle:
+            src = handle.read().decode('utf-8')
+        attach_mark_layer_node_ids(comment, src)
+    except Exception:  # noqa: BLE001 — beside-only; never fail a mark write
+        return
+
+
 def validated_binding(route_path, workspace, candidate):
     """Validate client/thread anchoring against the current parse.
 
@@ -6852,6 +6871,10 @@ class Handler(BaseHTTPRequestHandler):
                         comment['read_states'] = {
                             str(k): str(v) for k, v in read_states.items()
                         }
+                # 6a beside (first step, not cutover): additively store the
+                # matching MarkLayerNode id(s). Old anchor/quote/snapshot
+                # fields stay the default read/render path.
+                maybe_attach_mark_layer_nodes(comment, page, workspace)
             if ctype == 'verdict':
                 comment['verdict'] = data.get('verdict')
                 comment['row_id'] = row_id

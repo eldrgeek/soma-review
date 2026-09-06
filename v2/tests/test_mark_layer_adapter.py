@@ -10,7 +10,9 @@ import unittest
 V2_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, V2_DIR)
 
-from mark_layer_adapter import to_mark_layer_nodes  # noqa: E402
+from mark_layer_adapter import (  # noqa: E402
+    to_mark_layer_nodes, match_mark_layer_nodes, attach_mark_layer_node_ids,
+)
 from mdblocks import norm  # noqa: E402
 
 
@@ -162,6 +164,43 @@ class MarkLayerAdapterTests(unittest.TestCase):
         # assertEqual and the module docstring's gap note should be removed.
         self.assertNotEqual(before_ids[2], after_ids[3])
 
+
+class MatchMarkLayerNodesTests(unittest.TestCase):
+    """6a beside: resolve a mark quote to the adapter's node id(s)."""
+
+    def test_known_sentence_matches_adapter_sentence_id(self):
+        text = 'Alpha is first. Beta is second. Gamma is third.'
+        nodes = to_mark_layer_nodes(text)
+        expected = next(
+            n for n in nodes
+            if n['kind'] == 'sentence' and n['fragments'][0]['text'].strip() == 'Beta is second.'
+        )
+        matched = match_mark_layer_nodes(nodes, quote='Beta is second.')
+        self.assertTrue(matched)
+        self.assertEqual(expected['id'], matched[0]['id'])
+        self.assertEqual('sentence', matched[0]['kind'])
+
+    def test_empty_nodes_or_quote_is_no_match(self):
+        text = 'Alpha is first. Beta is second.'
+        nodes = to_mark_layer_nodes(text)
+        self.assertEqual([], match_mark_layer_nodes([], quote='Beta is second.'))
+        self.assertEqual([], match_mark_layer_nodes(nodes, quote=''))
+        self.assertEqual([], match_mark_layer_nodes(nodes, quote='no such sentence'))
+
+    def test_attach_is_noop_when_there_are_no_nodes(self):
+        record = {
+            'type': 'mark', 'quote': 'Beta is second.',
+            'snapshot': 'Beta is second.', 'anchor': None,
+        }
+        before = dict(record)
+        attach_mark_layer_node_ids(record, '')
+        self.assertEqual(before, record)
+        self.assertNotIn('mark_layer_node_id', record)
+
+    def test_attach_does_not_raise_on_bad_source(self):
+        record = {'type': 'mark', 'quote': 'Beta is second.'}
+        self.assertIs(record, attach_mark_layer_node_ids(record, None))
+        self.assertNotIn('mark_layer_node_id', record)
 
 
 if __name__ == '__main__':

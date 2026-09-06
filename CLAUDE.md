@@ -1255,6 +1255,15 @@ default until the new path proves itself with a view-diff / parity gate (zero di
 diff accounted). The Python twin emitter is a **bridge during migration only**, then dies — not
 a permanent parallel or debug-only option.
 
+**6a beside (2026-09-06), first step, not closed:** `POST /api/comments` with `type: mark` now
+resolves the best matching `MarkLayerNode` via `to_mark_layer_nodes` on the page source and
+additively stores `mark_layer_node_id` / `mark_layer_node_ids` on the new sidecar row
+(`v2/mark_layer_adapter.attach_mark_layer_node_ids`). Existing anchor/quote/snapshot/`block_id`
+fields are unchanged and remain the default read/render path. No match or adapter failure is a
+no-op — the mark still writes as today. Live comment/mark UI does not read these ids yet; the
+twin emitter stays. 6a stays open until the live UI rides nodes and the item-15 view-diff /
+parity gate is green.
+
 ## Authorship
 
 v2 built 2026-07-02 by Dee (Claude Sonnet 5, engineering-lead/COO role) per Mike's spec

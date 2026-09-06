@@ -8,8 +8,9 @@ Parity:
   (e) create with only the node id jumps via id while dual-write is off
   (f) legacy marks without an id still jump via block_id
 
-Does not claim 6a closed — occurrence-suffix mint and the item-15
-gate remain. block_id identity dual-write is off on location create;
+Does not claim 6a closed — twin `-{n}` mint and the item-15
+gate remain. Remap ledger is the identity model for suffix drift.
+block_id identity dual-write is off on location create;
 edit type still carries block_id+snapshot. Quote/from/to stay as the
 selected span.
 """
@@ -64,6 +65,29 @@ class MarkLayerUiSourceTests(unittest.TestCase):
         self.assertIn('window.jumpToMarkLayerNode = jumpToMarkLayerNode', server.PAGE_JS)
         # Not a v3-prefixed leak into the shared bundle.
         self.assertNotIn('function v3JumpToMarkLayerNode', server.PAGE_JS)
+
+    def test_commit_change_skip_restore_on_success_is_explicit(self):
+        # Skip #8 nit: success that restamps sets skipRestore rather than
+        # early-returning past `body.innerHTML = originalHtml` — that wipe
+        # would drop newly applied later-block stamps.
+        js = server.PAGE_JS
+        start = js.find('const commitChange = async (commit)')
+        self.assertGreater(start, 0)
+        end = js.find('ta.addEventListener', start)
+        body = js[start:end]
+        self.assertIn('let skipRestore = false', body)
+        self.assertIn('skipRestore = true', body)
+        self.assertIn('if (!skipRestore)', body)
+        self.assertIn('body.innerHTML = originalHtml', body)
+        apply_idx = body.find('applyRerenderedBlocks')
+        restore_guard = body.find('if (!skipRestore)')
+        self.assertGreater(apply_idx, 0)
+        self.assertGreater(restore_guard, apply_idx)
+        # Success sets the flag; the only return before the guard is the
+        # catch path (done = false), not an early-return-as-guard.
+        between = body[apply_idx:restore_guard]
+        self.assertIn('skipRestore = true', between)
+        self.assertNotRegex(between, r'skipRestore = true;\s*return;')
 
     def test_classic_chip_click_does_not_match_stamped_sentences(self):
         # Stamped .mark-sentence also carries data-mark-layer-node-id.
@@ -538,6 +562,17 @@ class MarkLayerUiBrowserTests(unittest.TestCase):
         ]
         self.assertEqual(ready_after[2], rebound_id)
         self.assertNotEqual(original_id, rebound_id)
+        self.assertEqual(
+            'occurrence-suffix-shift',
+            saved[0].get('mark_layer_node_rebound', {}).get('reason'),
+        )
+        ledger = server.load_mark_layer_remap_ledger('docs/page.md')
+        self.assertTrue(any(
+            row.get('from') == original_id
+            and row.get('to') == rebound_id
+            and row.get('reason') == 'occurrence-suffix-shift'
+            for row in ledger
+        ), ledger)
 
         result = self.page.evaluate(
             """(id) => {

@@ -8,8 +8,9 @@ Parity / success gate:
   (e) SOMA_REVIEW_MARK_LAYER_DUAL_WRITE=1 still writes the old fields
   (f) create with only mark_layer_node_id is enough
 
-Does not claim 6a closed — occurrence-suffix mint and the item-15 gate
-remain. block_id identity dual-write is off on location create.
+Does not claim 6a closed — twin `-{n}` mint and the item-15 gate
+remain. Remap ledger is the identity model for suffix drift.
+block_id identity dual-write is off on location create.
 """
 import json
 import os

@@ -1220,11 +1220,13 @@ depends on it yet:
    sentences as sibling nodes, blank-line separators. Ids are `{prefix}-{sha1(kind:text)[:10]}`,
    content-derived so re-parsing unmodified text always yields the same ids (a prerequisite for
    client-side diffing) — verified to mint the literal same ids as the JS adapter on identical
-   input (`tests/mark-layer-engine-extraction.test.ts`). Known limit, named not fixed: the
+   input (`tests/mark-layer-engine-extraction.test.ts`). Accepted Playmaker twin mint: the
    occurrence-index suffix for duplicate text is assigned by each duplicate's position among its
    own duplicates, so inserting a new duplicate earlier in the document can still reassign a
    *later* duplicate's id — stable across re-parses of the same document, not across edits that
-   add/remove duplicate content.
+   add/remove duplicate content. Unique `(kind, text)` in one parse already has no `-{n}`.
+   Changing the duplicate disambiguator (parent-scope hash, neighbor hash) would break
+   Playmaker twin parity; cross-edit identity is the remap ledger, not a stable-id claim.
 2. **`GET /api/mark-layer?page=<route>`** (`v2/server.py`, `do_GET`) — the first live surface of
    the adapter's output. Deliberately a new endpoint, not a change to any existing route's wire
    format, so it shipped with no live-consumer migration. Loopback-only: absent from
@@ -1269,7 +1271,9 @@ names one paragraph group attaches that occurrence; when the snapshot does not u
 narrow, attach misses (no node id) rather than first-hit containment. Exact-match happy
 path is unchanged. 6a is still open.
 
-**Skip 2026-09-06 nit 2 (named, not fixed):** the occurrence-suffix residual is now persisted on new marks.
+**Skip 2026-09-06 nit 2 (accepted mint, identity via ledger):** the occurrence-suffix
+residual is persisted on new marks. Twin `-{n}` mint stays; stored ids move through
+the remap ledger (`occurrence-suffix-shift` when only the index moved).
 
 **6a beside (2026-09-06), UI-on-node-id, not closed:** v3 marks panel/dialog and classic
 comment/dwell cards can display `mark_layer_node_id` and jump to the matching sentence via
@@ -1303,17 +1307,27 @@ fields only for legacy rows. GET `/api/comments` hydrates a derived
 `block_text_sha` — stale must not see a current hash).
 After a content edit, `align_mark_layer_nodes` + `rebind_mark_layer_node_ids`
 rewrite sidecar ids so a later `querySelector` still hits the same sentence.
-`_rerender_block` restamps subsequent blocks on the same edit (later-html)
-so a jump mark on a later duplicate stays `via: id` without waiting for a
-full-page render. Weak-neighbor pairing no longer position-pairs identical
-one-sentence paragraphs with no unique sibling — unpaired old ids miss.
-Residuals, named not hidden: (1) `_content_id` occurrence-suffix minting is
-unchanged (Playmaker twin); (2) item-15 view-diff / parity gate is not run
-here. Twin emitter stays. Out of scope: Playmaker Fountain `[[SCENE:]]` /
-P1 Doc export; P2 rrweb harness.
-**6a stays open** until edit-rebind is proven against that gate. Do not
-claim 6a closed. block_id identity dual-write is off on location create;
-quote/from/to stay as the selected span; type=edit still writes
+Applied remaps append to `.mark-layer-nodes.json` `remap_ledger` (and
+`mark_layer_node_rebind_history` on the row), reason-tagged
+`occurrence-suffix-shift` when only the twin `-{n}` moved. That ledger is
+the permanent identity model for suffix drift — unique `(kind, text)`
+already has no suffix; a different mint would break Playmaker
+`fromProseMarkdown` parity. `_rerender_block` restamps subsequent blocks
+on the same edit (later-html) so a jump mark on a later duplicate stays
+`via: id` without waiting for a full-page render. Weak-neighbor pairing
+no longer position-pairs identical one-sentence paragraphs with no unique
+sibling — unpaired old ids miss. `commitChange` uses explicit
+`skipRestore` on a successful restamp (Skip #8 nit) so the restore line
+cannot wipe new stamps.
+Residuals, named not hidden: (1) `_content_id` occurrence-suffix minting
+stays the Playmaker twin (accepted mint; identity is the remap ledger);
+(2) **item-15 view-diff / parity gate is not run here**; (3) unpaired
+weak-neighbor duplicates still miss rather than guess. Twin emitter
+stays. Out of scope: Playmaker Fountain `[[SCENE:]]` / P1 Doc export;
+P2 rrweb harness.
+**6a stays open** until edit-rebind is proven against the item-15 gate.
+Do not claim 6a closed. block_id identity dual-write is off on location
+create; quote/from/to stay as the selected span; type=edit still writes
 `block_id` + `snapshot`.
 
 ## Fold (SOMA agreed model item 10) — wired into the v3 panel (2026-09-06)

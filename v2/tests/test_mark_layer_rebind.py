@@ -1,11 +1,13 @@
-"""6a edit-rebind: stored mark_layer_node_id survives a mid-doc edit.
+"""6a remap-ledger: stored mark_layer_node_id survives a mid-doc edit.
 
 After an earlier-paragraph insert that would shift occurrence suffixes,
 render_page remaps the stored id onto the new parse so jump can still
-querySelector the stamp. `_rerender_block` restamps subsequent blocks
-on the same edit so later marks do not keep stale live stamps.
-Does not claim 6a closed — the occurrence-suffix mint and item-15
-gate remain. block_id identity dual-write is off on location create.
+querySelector the stamp. The remap is persisted on the page ledger
+(`.mark-layer-nodes.json`) and on the row. `_rerender_block` restamps
+subsequent blocks on the same edit so later marks do not keep stale
+live stamps.
+Does not claim 6a closed — twin `-{n}` mint and the item-15 gate
+remain. block_id identity dual-write is off on location create.
 """
 import json
 import os
@@ -19,7 +21,9 @@ sys.path.insert(0, V2_DIR)
 
 import blockmap  # noqa: E402
 import server  # noqa: E402
-from mark_layer_adapter import to_mark_layer_nodes  # noqa: E402
+from mark_layer_adapter import (  # noqa: E402
+    to_mark_layer_nodes, occurrence_suffix, OCCURRENCE_SUFFIX_REASON,
+)
 
 
 BEFORE = (
@@ -105,10 +109,17 @@ class MarkLayerEditRebindTests(unittest.TestCase):
         saved = server.read_comments('docs/page.md')
         self.assertEqual(1, len(saved))
         self.assertEqual(ready_after[2], saved[0]['mark_layer_node_id'])
-        self.assertEqual(
-            {'from': ready_before[1], 'to': ready_after[2]},
-            saved[0].get('mark_layer_node_rebound'),
-        )
+        hop = {
+            'from': ready_before[1], 'to': ready_after[2],
+            'reason': OCCURRENCE_SUFFIX_REASON,
+        }
+        self.assertEqual(hop, saved[0].get('mark_layer_node_rebound'))
+        self.assertEqual([hop], saved[0].get('mark_layer_node_rebind_history'))
+        ledger = server.load_mark_layer_remap_ledger('docs/page.md')
+        self.assertIn(hop | {'record_id': 'mark-second-ready'}, [
+            {k: row.get(k) for k in ('from', 'to', 'reason', 'record_id')}
+            for row in ledger
+        ])
 
         stamped = re.findall(
             r'<span class="mark-sentence"[^>]*data-mark-layer-node-id="([^"]+)"[^>]*>Ready\.</span>',
@@ -151,6 +162,7 @@ class MarkLayerEditRebindTests(unittest.TestCase):
         self.assertEqual(beta_id, saved[0]['mark_layer_node_id'])
         self.assertNotIn('mark_layer_node_rebound', saved[0])
         self.assertIn(f'data-mark-layer-node-id="{beta_id}"', html)
+        self.assertEqual([], server.load_mark_layer_remap_ledger('docs/page.md'))
 
     def test_early_block_edit_restamps_later_duplicate(self):
         # Residual close: edit the first Ready. paragraph so a new Ready.
@@ -188,6 +200,21 @@ class MarkLayerEditRebindTests(unittest.TestCase):
                  if c['id'] == 'mark-second-ready']
         self.assertEqual(1, len(saved))
         self.assertEqual(ready_after[2], saved[0]['mark_layer_node_id'])
+        self.assertEqual(
+            OCCURRENCE_SUFFIX_REASON,
+            saved[0].get('mark_layer_node_rebound', {}).get('reason'),
+        )
+        ledger = server.load_mark_layer_remap_ledger('docs/page.md')
+        self.assertTrue(
+            any(
+                row.get('from') == ready_before[1]
+                and row.get('to') == ready_after[2]
+                and row.get('reason') == OCCURRENCE_SUFFIX_REASON
+                and row.get('record_id') == 'mark-second-ready'
+                for row in ledger
+            ),
+            ledger,
+        )
         self.assertIn(
             f'data-mark-layer-node-id="{ready_after[2]}"',
             later[0]['html'],
@@ -196,6 +223,68 @@ class MarkLayerEditRebindTests(unittest.TestCase):
             f'data-mark-layer-node-id="{ready_before[1]}"',
             later[0]['html'],
         )
+
+    def test_unique_sentence_gains_accounted_suffix_when_earlier_duplicate_lands(self):
+        # Unique (kind, text) minted with no suffix. Inserting an earlier
+        # twin (same sentence, unique sibling paragraph) forces the
+        # Playmaker `-{n}` mint onto the later sentence; the stored id
+        # remaps and the ledger accounts the suffix shift.
+        before = (
+            '# Review title\n\n'
+            'Alpha is first. Unique context.\n\n'
+            'Beta is second.\n'
+        )
+        after = (
+            '# Review title\n\n'
+            'Alpha is first. Brand new context.\n\n'
+            'Alpha is first. Unique context.\n\n'
+            'Beta is second.\n'
+        )
+        self.write_doc(before)
+        server.render_page('docs/page.md')
+        mapping = blockmap.load_map(server.block_map_path('docs/page.md'))
+        alpha_block = next(
+            row for row in mapping['blocks']
+            if 'Unique context.' in (row.get('text') or '')
+        )
+        alpha_before = next(
+            n['id'] for n in to_mark_layer_nodes(before)
+            if n['kind'] == 'sentence'
+            and n['fragments'][0]['text'].strip() == 'Alpha is first.'
+        )
+        self.assertIsNone(occurrence_suffix(alpha_before))
+        server.append_comment('docs/page.md', {
+            'id': 'mark-alpha', 'page': 'docs/page.md', 'type': 'mark',
+            'mark_kind': 'ack', 'block_id': alpha_block['id'],
+            'quote': 'Alpha is first.',
+            'snapshot': 'Alpha is first. Unique context.',
+            'mark_layer_node_id': alpha_before, 'deleted': False,
+        })
+        self.write_doc(after)
+        html = server.render_page('docs/page.md')
+        alpha_after = [
+            n['id'] for n in to_mark_layer_nodes(after)
+            if n['kind'] == 'sentence'
+            and n['fragments'][0]['text'].strip() == 'Alpha is first.'
+        ]
+        self.assertEqual(2, len(alpha_after))
+        self.assertEqual(alpha_before, alpha_after[0])  # first occ keeps stem
+        self.assertNotEqual(alpha_before, alpha_after[1])
+        saved = server.read_comments('docs/page.md')
+        self.assertEqual(alpha_after[1], saved[0]['mark_layer_node_id'])
+        self.assertEqual(
+            OCCURRENCE_SUFFIX_REASON,
+            saved[0]['mark_layer_node_rebound']['reason'],
+        )
+        ledger = server.load_mark_layer_remap_ledger('docs/page.md')
+        self.assertTrue(any(
+            row.get('from') == alpha_before
+            and row.get('to') == alpha_after[1]
+            and row.get('reason') == OCCURRENCE_SUFFIX_REASON
+            for row in ledger
+        ), ledger)
+        self.assertIn(f'data-mark-layer-node-id="{alpha_after[1]}"', html)
+        self.assertIn(f'id="{alpha_after[1]}"', html)
 
 
 if __name__ == '__main__':

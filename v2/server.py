@@ -4112,9 +4112,11 @@ def maybe_strip_legacy_anchor_fields(comment):
     """Drop block_id/quote/snapshot as the live identity after a unique attach.
 
     Dual-write stays only behind SOMA_REVIEW_MARK_LAYER_DUAL_WRITE (default
-    off). Snapshot/proposed stay on type=edit — they are the MDP change
-    record, not the location. A miss (no node id) keeps the legacy fields
-    so unmatched / page-level / legacy-shaped writes still persist.
+    off). Snapshot/proposed and block_id stay on type=edit — they are the
+    MDP change record (content-hash ids do not survive the trunk write).
+    Location marks keep quote/from/to as the selected span and drop
+    block_id. A miss (no node id) keeps the legacy fields so unmatched /
+    page-level / legacy-shaped writes still persist.
     """
     if not isinstance(comment, dict):
         return
@@ -4122,10 +4124,19 @@ def maybe_strip_legacy_anchor_fields(comment):
         return
     if not comment.get('mark_layer_node_id'):
         return
-    for key in _LEGACY_ANCHOR_KEYS:
-        comment[key] = None
-    if comment.get('type') != 'edit':
-        comment['snapshot'] = ''
+    if comment.get('type') == 'edit':
+        # Change record: content-hash ids do not survive the trunk write
+        # (fingerprint is the new sentence). Keep block_id + snapshot so
+        # revert/ringer can fall back. Quote/from/to stay as the span.
+        comment['block_text_sha'] = None
+        comment['origin_quote'] = None
+        return
+    # Location mark: node id is the identity. Keep quote/from/to as the
+    # selected span (ringer coverage). Drop the old block identity.
+    comment['block_id'] = None
+    comment['block_text_sha'] = None
+    comment['origin_quote'] = None
+    comment['snapshot'] = ''
 
 
 def load_page_mark_layer_nodes(route_path, workspace=DEFAULT_WORKSPACE):
@@ -5757,15 +5768,16 @@ def _ringer_row_block_id(row, blocks, nodes, cache):
 def _ringer_span_text(row, nodes=None):
     """The text a row actually covers, normalized, plus whether it covers the
     whole block. Returns (text, whole). Prefers the stored MarkLayerNode."""
+    quote = blockmap.norm(row.get('quote') or row.get('origin_quote') or '')
+    if quote:
+        return quote, row.get('to') is None
     node_id = row.get('mark_layer_node_id')
     if node_id and nodes:
         node = find_mark_layer_node(nodes, node_id)
         if node is not None:
             text = blockmap.norm(mark_layer_node_text(node))
             return text, node.get('kind') == 'paragraph'
-    whole = row.get('to') is None
-    quote = blockmap.norm(row.get('quote') or row.get('origin_quote') or '')
-    return quote, whole
+    return '', row.get('to') is None
 
 
 def _ringer_revision_texts(row):
@@ -7376,6 +7388,18 @@ class Handler(BaseHTTPRequestHandler):
                     comment['commit_error'] = change_result['commit_error']
                 if change_result.get('sentence_index') is not None:
                     comment['sentence_index'] = change_result['sentence_index']
+                # The pre-write node id is the before-text hash. Re-attach
+                # against the text now on disk so jump/stale see a live stamp.
+                if comment.get('proposed'):
+                    probe = {
+                        'quote': comment.get('proposed'),
+                        'snapshot': comment.get('proposed'),
+                    }
+                    maybe_attach_mark_layer_nodes(probe, page, workspace)
+                    if probe.get('mark_layer_node_id'):
+                        comment['mark_layer_node_id'] = probe['mark_layer_node_id']
+                        comment['mark_layer_node_ids'] = probe.get('mark_layer_node_ids')
+                        comment['mark_layer_primary'] = 'mark_layer_node_id'
                 # Not persisted to the sidecar (would bloat every row with a
                 # full block-html blob) — only returned in THIS response so
                 # postComment()'s caller can redraw reactively.

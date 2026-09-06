@@ -246,8 +246,10 @@ class ChangeSettleRevertTests(unittest.TestCase):
         self.write_doc('# Title\n\nOriginal typo sentence here.\n')
         self.commit_doc()
         server.render_page('docs/page.md', view='v3')
+        with open(self.doc, encoding='utf-8') as handle:
+            src = handle.read()
         node_id = next(
-            n['id'] for n in to_mark_layer_nodes(open(self.doc, encoding='utf-8').read())
+            n['id'] for n in to_mark_layer_nodes(src)
             if n['kind'] == 'sentence'
             and n['fragments'][0]['text'].strip() == 'Original typo sentence here.'
         )

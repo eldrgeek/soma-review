@@ -171,10 +171,10 @@ class MarkLayerAttachHTTPTests(unittest.TestCase):
         self.assertIn('mark_layer_node_id', row)
         self.assertEqual('mark_layer_node_id', row.get('mark_layer_primary'))
         self.assertIsNone(row['block_id'])
-        self.assertIsNone(row['quote'])
+        self.assertEqual('Beta is second.', row['quote'])
         self.assertEqual('', row['snapshot'])
-        self.assertIsNone(row['from'])
-        self.assertIsNone(row['to'])
+        self.assertEqual(16, row['from'])
+        self.assertEqual(31, row['to'])
         saved = [c for c in server.read_comments('docs/page.md') if c['id'] == row['id']]
         self.assertEqual(1, len(saved))
         self.assertIsNone(saved[0].get('block_id'))
@@ -237,9 +237,9 @@ class MarkLayerAttachHTTPTests(unittest.TestCase):
         saved = [c for c in server.read_comments('docs/page.md') if c['id'] == row['id']]
         self.assertEqual(1, len(saved))
         self.assertEqual(expected[1]['id'], saved[0]['mark_layer_node_id'])
-        # Dual-write off: legacy anchors are not the persisted identity.
+        # Dual-write off: block_id is not the persisted identity; quote is the span.
         self.assertIsNone(row['block_id'])
-        self.assertIsNone(row['quote'])
+        self.assertEqual('Ready.', row['quote'])
         self.assertEqual('', row['snapshot'])
 
     def test_repeated_sentence_misses_when_snapshot_does_not_narrow(self):

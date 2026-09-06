@@ -1292,12 +1292,15 @@ required anchoring write for a unique match (`mark_layer_primary:
 mark_layer_node_id`). The client sends the DOM stamp from `blockPayload`;
 the server prefers that id when it still exists **and** agrees with a
 supplied quote (Skip 2026-09-06 nit 1), else unique quote/snapshot match.
-Old `block_id` / quote / snapshot are not persisted on unique-match creates
-unless `SOMA_REVIEW_MARK_LAYER_DUAL_WRITE` is explicitly on (compat bridge,
-default off). `apply_sentence_change`, the ringer list, and v3 stale use
-the stored id when present and fall back to those fields only for legacy
-rows. GET `/api/comments` hydrates a derived `block_id`/`quote` for UI
-grouping (not `block_text_sha` — stale must not see a current hash).
+Old `block_id` is not persisted on unique-match location marks unless
+`SOMA_REVIEW_MARK_LAYER_DUAL_WRITE` is explicitly on (compat bridge,
+default off). Quote/from/to stay as the selected span (ringer coverage).
+type=edit keeps `block_id` + `snapshot` because a content-hash id does
+not survive the trunk write. `apply_sentence_change`, the ringer list,
+and v3 stale use the stored id when present and fall back to those
+fields only for legacy rows. GET `/api/comments` hydrates a derived
+`block_id` for UI grouping when the sidecar has only an id (not
+`block_text_sha` — stale must not see a current hash).
 After a content edit, `align_mark_layer_nodes` + `rebind_mark_layer_node_ids`
 rewrite sidecar ids so a later `querySelector` still hits the same sentence.
 Residuals, named not hidden: (1) `_content_id` occurrence-suffix minting is

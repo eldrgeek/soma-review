@@ -91,7 +91,8 @@ class MarkLayerAttachHTTPTests(unittest.TestCase):
         server.render_page('docs/page.md')
         mapping = blockmap.load_map(server.block_map_path('docs/page.md'))
         target = next(row for row in mapping['blocks'] if 'Beta is second.' in row.get('text', ''))
-        src = open(self.doc, encoding='utf-8').read()
+        with open(self.doc, encoding='utf-8') as handle:
+            src = handle.read()
         expected = next(
             n for n in to_mark_layer_nodes(src)
             if n['kind'] == 'sentence'

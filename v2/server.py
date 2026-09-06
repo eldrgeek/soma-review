@@ -1051,9 +1051,6 @@ function applyMergedBlockHtml(wrap, html) {
   const body = wrap.querySelector('.block-body');
   if (freshBody && body) {
     body.innerHTML = freshBody.innerHTML;
-    body.classList.remove('v3-inline-diff');
-    delete body.dataset.v3OrigBody;
-    delete body.dataset.v3MarkId;
   }
 }
 
@@ -3280,6 +3277,13 @@ V3_JS = r"""
   // the wrong sentence.
   function v3ApplyMergedBlockHtml(wrap, html){
     applyMergedBlockHtml(wrap, html);
+    if (!wrap) return;
+    const body = wrap.querySelector('.block-body');
+    if (body) {
+      body.classList.remove('v3-inline-diff');
+      delete body.dataset.v3OrigBody;
+      delete body.dataset.v3MarkId;
+    }
   }
   function v3ApplyRerenderedBlocks(data){
     applyRerenderedBlocks(data);

@@ -164,7 +164,10 @@ class MarkLayerEditRebindTests(unittest.TestCase):
         mark = {
             'id': 'edit-early', 'page': 'docs/page.md', 'type': 'edit',
             'snapshot': 'Ready. Unique first context.',
-            'proposed': 'Ready. Ready. Unique first context.',
+            # A new Ready. *paragraph* (not a same-block second sentence —
+            # those get a leading space and a different hash) so the later
+            # occurrence suffix actually shifts.
+            'proposed': 'Ready. Unique first context.\n\nReady. Inserted earlier.',
             'block_id': first['id'], 'deleted': False,
         }
         result = server.apply_sentence_change(
@@ -175,7 +178,8 @@ class MarkLayerEditRebindTests(unittest.TestCase):
         self.assertTrue(later, 'subsequent Ready. block must be restamped')
         ready_after = self._ready_ids(
             '# Review title\n\n'
-            'Ready. Ready. Unique first context.\n\n'
+            'Ready. Unique first context.\n\n'
+            'Ready. Inserted earlier.\n\n'
             'Ready. Unique second context.\n'
         )
         self.assertEqual(3, len(ready_after))

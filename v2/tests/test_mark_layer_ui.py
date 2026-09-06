@@ -666,7 +666,7 @@ class MarkLayerUiBrowserTests(unittest.TestCase):
             'page': 'docs/page.md', 'type': 'edit',
             'block_id': first['id'],
             'snapshot': 'Ready. Unique first context.',
-            'proposed': 'Ready. Ready. Unique first context.',
+            'proposed': 'Ready. Unique first context.\n\nReady. Inserted earlier.',
         })
         self.assertEqual(201, status)
         self.assertTrue(edit.get('later_html'))

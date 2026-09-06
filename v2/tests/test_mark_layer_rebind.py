@@ -6,7 +6,7 @@ querySelector the stamp. The remap is persisted on the page ledger
 (`.mark-layer-nodes.json`) and on the row. `_rerender_block` restamps
 subsequent blocks on the same edit so later marks do not keep stale
 live stamps.
-Does not claim 6a closed — twin still stamps live DOM. block_id
+Live stamps are from_prose_markdown (twin is debug-only). block_id
 identity dual-write is off on location create and type=edit.
 """
 import json

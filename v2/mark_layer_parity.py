@@ -14,11 +14,12 @@ Accounted reasons (named, not hidden):
   - edit-id-reattach — type=edit identity is the re-attached id; old
     block_id+snapshot is not the live landing after apply
 
-Create/resolve live path is mark_layer_node_id. Twin quote-matching
-is fallback minting. type=edit no longer dual-writes block_id as
+Create/resolve live path is mark_layer_node_id. Unique quote/snapshot
+match is fallback minting. type=edit no longer dual-writes block_id as
 identity (snapshot/proposed stay as the change record). Old
-block_id/quote resolve is off when an id is present. 6a stays open
-while the twin still stamps live DOM.
+block_id/quote resolve is off when an id is present. Live stamps come
+from from_prose_markdown (Playmaker fromProseMarkdown port). Twin is
+debug-only (SOMA_REVIEW_MARK_LAYER_TWIN, default off).
 
 Run:
   python3 v2/mark_layer_parity.py
@@ -43,6 +44,9 @@ import server  # noqa: E402
 from mark_layer_adapter import (  # noqa: E402
     OCCURRENCE_SUFFIX_REASON, ALIGN_REASON,
     attach_mark_layer_node_ids,
+)
+from mark_layer_engine import (  # noqa: E402
+    last_live_emitter_source, mark_layer_twin_enabled,
 )
 
 ACCOUNTABLE_REASONS = frozenset({
@@ -695,6 +699,9 @@ def run_gate(fixture: dict[str, Any] | None = None) -> dict[str, Any]:
     unaccounted.extend(unknown)
     accounted = [row for row in accounted if row.get('reason') in ACCOUNTABLE_REASONS]
 
+    twin_on = mark_layer_twin_enabled()
+    emitter = last_live_emitter_source()
+    six_a_closed = (not twin_on) and emitter.startswith('fromProseMarkdown')
     return {
         'ok': not unaccounted,
         'pages': pages,
@@ -712,15 +719,22 @@ def run_gate(fixture: dict[str, Any] | None = None) -> dict[str, Any]:
             'twin -{n} mint stays (Playmaker fromProseMarkdown parity)',
             'unpaired weak-neighbor duplicates miss rather than guess',
             'heading sentences have no MarkLayerNode sentence id (heading kept whole)',
-            'twin emitter still stamps live DOM (not Playmaker fromProseMarkdown as the sole live path)',
+            'Playmaker TS package is not a runtime dependency; live path is the in-repo fromProseMarkdown port',
         ],
-        'six_a_status': 'open',
+        'live_emitter': emitter,
+        'twin_enabled': twin_on,
+        'six_a_status': 'closed' if six_a_closed else 'open',
         'six_a_reason': (
-            'Item-15 gate is this report. Cutover proven for create/resolve '
-            '(id-first; old beside off when id present) and type=edit identity '
-            '(no block_id dual-write; id re-attached after apply). 6a stays '
-            'open: the Python twin emitter still stamps live DOM — not '
-            'Playmaker\'s engine as the sole live path.'
+            'Item-15 gate is this report. Live node emission is '
+            'from_prose_markdown (Playmaker fromProseMarkdown shared-model '
+            'port). The Python twin is debug-only '
+            '(SOMA_REVIEW_MARK_LAYER_TWIN, default off) and does not stamp '
+            'live DOM. Create/resolve is id-first; type=edit identity is '
+            'the re-attached id. Playmaker TS is optional verify, not the '
+            'live bridge.'
+            if six_a_closed else
+            'Twin is on or the live emitter is not fromProseMarkdown; '
+            '6a stays open while the twin can stamp live DOM.'
         ),
     }
 

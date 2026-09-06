@@ -8,7 +8,7 @@ Parity:
   (e) create with only the node id jumps via id while dual-write is off
   (f) legacy marks without an id still jump via block_id
 
-Does not claim 6a closed — twin still stamps live DOM. Remap ledger
+Live stamps are from_prose_markdown (twin is debug-only). Remap ledger
 is the identity model for suffix drift. block_id identity dual-write
 is off on location create and type=edit. Quote/from/to stay as the
 selected span. Old beside is off when an id is present.

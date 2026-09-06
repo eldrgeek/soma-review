@@ -168,7 +168,11 @@ class MarkLayerAdapterTests(unittest.TestCase):
 
 
 class AlignMarkLayerNodesTests(unittest.TestCase):
-    """Edit-rebind: neighborhood align accounts occurrence-suffix remaps."""
+    """Edit-rebind: unique-neighbor align accounts occurrence-suffix remaps.
+
+    Identical lone paragraphs with no unique sibling stay unpaired (miss).
+    Occurrence-suffix mint is unchanged and still a named residual.
+    """
 
     def test_unique_sentences_identity_map(self):
         text = 'Alpha is first. Beta is second.'
@@ -222,6 +226,50 @@ class AlignMarkLayerNodesTests(unittest.TestCase):
         remap = align_mark_layer_nodes(prev, nxt)
         self.assertEqual(next_ready[1], remap[prev_ready[0]])
         self.assertEqual(next_ready[2], remap[prev_ready[1]])
+
+    def test_identical_lone_paragraphs_do_not_position_pair(self):
+        # Weak-neighbor: two identical one-sentence paragraphs have only
+        # each other (and start/end-of-doc Nones) as neighbors. Uniqueness
+        # fails; do not pair by position. Unpaired old ids miss.
+        before = 'Ready.\n\nReady.'
+        after = 'Ready.\n\nReady.\n\nReady.'
+        prev = to_mark_layer_nodes(before)
+        nxt = to_mark_layer_nodes(after)
+        prev_ready_paras = [
+            n['id'] for n in prev if n['kind'] == 'paragraph'
+            and n['fragments'][0]['text'].strip() == 'Ready.'
+        ]
+        prev_ready_sents = [
+            n['id'] for n in prev if n['kind'] == 'sentence'
+            and n['fragments'][0]['text'].strip() == 'Ready.'
+        ]
+        self.assertEqual(2, len(prev_ready_paras))
+        self.assertEqual(2, len(prev_ready_sents))
+        remap = align_mark_layer_nodes(prev, nxt)
+        for old_id in prev_ready_paras + prev_ready_sents:
+            self.assertNotIn(
+                old_id, remap,
+                f'{old_id} must miss — position-only pairing is forbidden '
+                'when two identical lone paragraphs have no unique sibling',
+            )
+
+    def test_identical_lone_paragraphs_identity_reparse_is_unpaired_or_same_id(self):
+        # Same two lone Ready. paragraphs re-parsed: uniqueness still fails.
+        # Identity ids may appear if pass-1 never fires; they must not be
+        # invented by position. Explicitly account every Ready. id.
+        text = 'Ready.\n\nReady.'
+        prev = to_mark_layer_nodes(text)
+        nxt = to_mark_layer_nodes(text)
+        remap = align_mark_layer_nodes(prev, nxt)
+        ready_ids = [
+            n['id'] for n in prev
+            if n['kind'] in ('paragraph', 'sentence')
+            and n['fragments'][0]['text'].strip() == 'Ready.'
+        ]
+        self.assertEqual(4, len(ready_ids))
+        for old_id in ready_ids:
+            if old_id in remap:
+                self.assertEqual(old_id, remap[old_id], old_id)
 
     def test_rebind_updates_stored_ids_and_skips_identity(self):
         records = [

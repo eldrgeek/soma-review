@@ -1303,14 +1303,18 @@ fields only for legacy rows. GET `/api/comments` hydrates a derived
 `block_text_sha` — stale must not see a current hash).
 After a content edit, `align_mark_layer_nodes` + `rebind_mark_layer_node_ids`
 rewrite sidecar ids so a later `querySelector` still hits the same sentence.
+`_rerender_block` restamps subsequent blocks on the same edit (later-html)
+so a jump mark on a later duplicate stays `via: id` without waiting for a
+full-page render. Weak-neighbor pairing no longer position-pairs identical
+one-sentence paragraphs with no unique sibling — unpaired old ids miss.
 Residuals, named not hidden: (1) `_content_id` occurrence-suffix minting is
-unchanged (Playmaker twin); (2) identical one-sentence paragraphs with no
-distinguishing sibling can still pair by position (weak-neighbor); (3)
-later-block stamps stay until the next full-page rebind; (4) item-15
-view-diff / parity gate is not run here. Twin emitter stays. Out of scope:
-Playmaker Fountain `[[SCENE:]]` / P1 Doc export; P2 rrweb harness.
+unchanged (Playmaker twin); (2) item-15 view-diff / parity gate is not run
+here. Twin emitter stays. Out of scope: Playmaker Fountain `[[SCENE:]]` /
+P1 Doc export; P2 rrweb harness.
 **6a stays open** until edit-rebind is proven against that gate. Do not
-claim 6a closed.
+claim 6a closed. block_id identity dual-write is off on location create;
+quote/from/to stay as the selected span; type=edit still writes
+`block_id` + `snapshot`.
 
 ## Fold (SOMA agreed model item 10) — wired into the v3 panel (2026-09-06)
 

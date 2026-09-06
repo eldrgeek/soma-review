@@ -2,9 +2,10 @@
 
 After an earlier-paragraph insert that would shift occurrence suffixes,
 render_page remaps the stored id onto the new parse so jump can still
-querySelector the stamp. Does not claim 6a closed — the suffix mint,
-weak-neighbor pairing, and later-block stamps until full-page rebind
-remain.
+querySelector the stamp. `_rerender_block` restamps subsequent blocks
+on the same edit so later marks do not keep stale live stamps.
+Does not claim 6a closed — the occurrence-suffix mint and item-15
+gate remain. block_id identity dual-write is off on location create.
 """
 import json
 import os
@@ -150,6 +151,51 @@ class MarkLayerEditRebindTests(unittest.TestCase):
         self.assertEqual(beta_id, saved[0]['mark_layer_node_id'])
         self.assertNotIn('mark_layer_node_rebound', saved[0])
         self.assertIn(f'data-mark-layer-node-id="{beta_id}"', html)
+
+    def test_early_block_edit_restamps_later_duplicate(self):
+        # Residual close: edit the first Ready. paragraph so a new Ready.
+        # occurrence is inserted there. The later mark's suffix shifts;
+        # _rerender_block must rebind the sidecar AND restamp the later
+        # block in later_html — not wait for a full-page render.
+        ready_before = self._create_mark_on_second_ready()
+        mapping = blockmap.load_map(server.block_map_path('docs/page.md'))
+        first = [row for row in mapping['blocks']
+                 if (row.get('text') or '').startswith('Ready.')][0]
+        mark = {
+            'id': 'edit-early', 'page': 'docs/page.md', 'type': 'edit',
+            'snapshot': 'Ready. Unique first context.',
+            # A new Ready. *paragraph* (not a same-block second sentence —
+            # those get a leading space and a different hash) so the later
+            # occurrence suffix actually shifts.
+            'proposed': 'Ready. Unique first context.\n\nReady. Inserted earlier.',
+            'block_id': first['id'], 'deleted': False,
+        }
+        result = server.apply_sentence_change(
+            'docs/page.md', 'estate', mark, author_label='claude',
+        )
+        later = [item for item in (result.get('later_html') or [])
+                 if 'Unique second context' in (item.get('html') or '')]
+        self.assertTrue(later, 'subsequent Ready. block must be restamped')
+        ready_after = self._ready_ids(
+            '# Review title\n\n'
+            'Ready. Unique first context.\n\n'
+            'Ready. Inserted earlier.\n\n'
+            'Ready. Unique second context.\n'
+        )
+        self.assertEqual(3, len(ready_after))
+        self.assertNotEqual(ready_before[1], ready_after[2])
+        saved = [c for c in server.read_comments('docs/page.md')
+                 if c['id'] == 'mark-second-ready']
+        self.assertEqual(1, len(saved))
+        self.assertEqual(ready_after[2], saved[0]['mark_layer_node_id'])
+        self.assertIn(
+            f'data-mark-layer-node-id="{ready_after[2]}"',
+            later[0]['html'],
+        )
+        self.assertNotIn(
+            f'data-mark-layer-node-id="{ready_before[1]}"',
+            later[0]['html'],
+        )
 
 
 if __name__ == '__main__':

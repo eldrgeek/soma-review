@@ -1038,6 +1038,46 @@ function findMarkLayerNodeEl(nodeId, opts) {
   return findStampedMarkLayerNodeEl(nodeId, root) || findMarkLayerNodeElByText(nodeId, options);
 }
 
+function applyMergedBlockHtml(wrap, html) {
+  // Keep the existing .block-wrap/.block-body ELEMENTS so already-bound
+  // listeners survive; refresh data-* and the body's innerHTML (stamps).
+  if (!wrap || !html) return;
+  const tmp = document.createElement('div');
+  tmp.innerHTML = html;
+  const fresh = tmp.firstElementChild;
+  if (!fresh) return;
+  Object.keys(fresh.dataset).forEach(k => { wrap.dataset[k] = fresh.dataset[k]; });
+  const freshBody = fresh.querySelector('.block-body');
+  const body = wrap.querySelector('.block-body');
+  if (freshBody && body) {
+    body.innerHTML = freshBody.innerHTML;
+  }
+}
+
+function applyRerenderedBlocks(data) {
+  // After a mid-doc edit: restamp the edited wrap plus subsequent blocks
+  // so a later duplicate's jump stays via:id. Also refresh the embedded
+  // node list used by the text-occurrence fallback.
+  if (!data) return;
+  if (data.html) {
+    let wrap = null;
+    if (data.block_id) {
+      wrap = document.querySelector('.block-wrap[data-block-id="' + markLayerNodeIdEscape(data.block_id) + '"]');
+    }
+    if (wrap) applyMergedBlockHtml(wrap, data.html);
+  }
+  (data.later_html || []).forEach(item => {
+    if (!item || !item.block_id || !item.html) return;
+    const wrap = document.querySelector('.block-wrap[data-block-id="' + markLayerNodeIdEscape(item.block_id) + '"]');
+    applyMergedBlockHtml(wrap, item.html);
+  });
+  if (Array.isArray(data.mark_layer_nodes)) {
+    window.__MARK_LAYER_NODES__ = data.mark_layer_nodes;
+  }
+}
+window.applyMergedBlockHtml = applyMergedBlockHtml;
+window.applyRerenderedBlocks = applyRerenderedBlocks;
+
 function jumpToMarkLayerNode(nodeId, opts) {
   if (!nodeId) return {ok: false, reason: 'missing-id', via: null};
   let el = null;
@@ -1525,12 +1565,21 @@ function enterEditMode(el, body) {
     const after = ta.value;
     if (commit && after.trim() !== before.trim()) {
       try {
-        await postComment({
+        const created = await postComment({
           anchor: el.dataset.anchor, snapshot: before, proposed: after,
           text: 'Sentence change', type: 'edit', ...blockPayload(el),
         });
         toast('Change applied and committed.');
         loadThreadsIntoDOM();
+        if (created && (created.html || (created.later_html && created.later_html.length))) {
+          applyRerenderedBlocks({
+            block_id: created.block_id || el.dataset.blockId,
+            html: created.html,
+            later_html: created.later_html,
+            mark_layer_nodes: created.mark_layer_nodes,
+          });
+          return;
+        }
       } catch (err) {
         alert('Change refused — this text changed on disk since you started editing. Reload and try again.');
         done = false;
@@ -3227,20 +3276,17 @@ V3_JS = r"""
   // not genuinely "before" — trusting it after a revert would silently show
   // the wrong sentence.
   function v3ApplyMergedBlockHtml(wrap, html){
-    if (!wrap || !html) return;
-    const tmp = document.createElement('div');
-    tmp.innerHTML = html;
-    const fresh = tmp.firstElementChild;
-    if (!fresh) return;
-    Object.keys(fresh.dataset).forEach(k => { wrap.dataset[k] = fresh.dataset[k]; });
-    const freshBody = fresh.querySelector('.block-body');
+    applyMergedBlockHtml(wrap, html);
+    if (!wrap) return;
     const body = wrap.querySelector('.block-body');
-    if (freshBody && body) {
-      body.innerHTML = freshBody.innerHTML;
+    if (body) {
       body.classList.remove('v3-inline-diff');
       delete body.dataset.v3OrigBody;
       delete body.dataset.v3MarkId;
     }
+  }
+  function v3ApplyRerenderedBlocks(data){
+    applyRerenderedBlocks(data);
   }
   async function settleOrRevertMark(m, action){
     const res = await fetch(`${API_BASE}/api/marks/merge`, {method:'POST', headers:{'Content-Type':'application/json'},
@@ -3248,10 +3294,7 @@ V3_JS = r"""
     let data = {};
     try { data = await res.json(); } catch(_) {}
     if (!res.ok) { alert(data.error || (action + ' failed')); return false; }
-    if (data.html) {
-      const wrap = document.querySelector(`.block-wrap[data-block-id="${CSS.escape(commentBlockId(m))}"]`);
-      v3ApplyMergedBlockHtml(wrap, data.html);
-    }
+    v3ApplyRerenderedBlocks(data);
     await fetchMarks();
     paintBlockIndicators(); v3PaintInlineDiffs(); v3WireInlineDiffClicks(); updateCountBadge();
     if (panelOpen) renderPanel();
@@ -3281,10 +3324,7 @@ V3_JS = r"""
     let data = {};
     try { data = await res.json(); } catch(_) {}
     if (!res.ok) { alert(data.error || 'fold failed'); return false; }
-    if (data.html) {
-      const wrap = document.querySelector(`.block-wrap[data-block-id="${CSS.escape(commentBlockId(m))}"]`);
-      v3ApplyMergedBlockHtml(wrap, data.html);
-    }
+    v3ApplyRerenderedBlocks(data);
     await fetchMarks();
     paintBlockIndicators(); v3PaintInlineDiffs(); v3WireInlineDiffClicks(); updateCountBadge();
     if (panelOpen) renderPanel();
@@ -3683,7 +3723,8 @@ V3_JS = r"""
     // This is also how a Mike-typed edit (enterEditMode -> postComment,
     // PAGE_JS) picks up its own inline diff: postComment fires
     // soma-comment-saved on save, same as any other mark.
-    document.addEventListener('soma-comment-saved', async () => {
+    document.addEventListener('soma-comment-saved', async (ev) => {
+      applyRerenderedBlocks((ev && ev.detail) || {});
       await fetchMarks(); paintBlockIndicators(); v3PaintInlineDiffs(); v3WireInlineDiffClicks(); updateCountBadge(); wirePointerTooltips(); if (panelOpen) renderPanel();
     });
   });
@@ -4354,6 +4395,20 @@ def _locate_change_span(route_path, workspace, block_id, expected_text):
     )
 
 
+def _render_one_block_html(block, route_path, workspace, resolver, terms_out,
+                           lexicon, auto_lexicon_page, badges_on, stamper):
+    """One `render_block_html` call with the usual page-render extras."""
+    ws = get_workspace(workspace)
+    return render_block_html(
+        block, route_path,
+        status_chip=(wq_status_chip(block) if badges_on else None),
+        link_resolver=resolver, terms=terms_out, lexicon=lexicon,
+        auto_lexicon=auto_lexicon_page,
+        auto_local_terms=_auto_local_for(block, terms_out),
+        stamper=stamper,
+    )
+
+
 def _rerender_block(route_path, workspace, fs_path, new_src, block_id, old_block,
                     prev_src=None):
     """Re-render one block fresh from `new_src` (the file content just
@@ -4362,26 +4417,30 @@ def _rerender_block(route_path, workspace, fs_path, new_src, block_id, old_block
     matching on the same line_start if the id genuinely changed.
 
     When `prev_src` is the pre-write page text, stored mark_layer_node_id
-    values that belong to this restamped block are rebound onto the new
-    parse (neighborhood align). Later blocks keep their live stamps, so
-    their sidecar ids are left alone until the next full-page render.
+    values are rebound onto the new parse (neighborhood align) for the
+    whole page — not just the edited block. Subsequent blocks are restamped
+    in the same walk so later marks do not keep stale live stamps until a
+    full-page render. Returns `later_html` so the client can apply those
+    stamps without a reload.
     """
     _src2, new_blocks, _map2, _report2 = current_page_blocks(route_path, workspace)
     new_block = next((b for b in new_blocks if b['id'] == block_id), None)
     if new_block is None:
         new_block = next((b for b in new_blocks if b.get('line_start') == old_block.get('line_start')), None)
     if new_block is None:
-        return {'block_id': block_id, 'html': None}
-    ws = get_workspace(workspace)
+        return {'block_id': block_id, 'html': None, 'later_html': []}
     resolver = make_link_resolver(fs_path, route_path, workspace)
     lexicon = get_lexicon_index()
     auto_lexicon_page, _ = strip_auto_lexicon_marker(new_src)
     terms_out = {}
     parse_markdown(new_src, link_resolver=resolver, terms_out=terms_out, lexicon=lexicon)
+    ws = get_workspace(workspace)
     badges_on = route_path in (ws.get('status_badges') or [])
     stamper = None
     rebound = []
     remap = {}
+    later_html = []
+    next_nodes = []
     try:
         next_nodes = to_mark_layer_nodes(_mark_layer_source(new_src))
         stamper = MarkLayerDomStamper(next_nodes)
@@ -4391,36 +4450,41 @@ def _rerender_block(route_path, workspace, fs_path, new_src, block_id, old_block
             stamper.skip_block(prior.get('text') or '')
         if prev_src is not None:
             prev_nodes = to_mark_layer_nodes(_mark_layer_source(prev_src))
-            probe = MarkLayerDomStamper(next_nodes)
-            for prior in new_blocks:
-                if prior is new_block:
-                    break
-                probe.skip_block(prior.get('text') or '')
-            para_id = probe.bind_block(new_block.get('text') or '')
-            only_ids = set(probe.bound_node_ids())
-            if para_id:
-                only_ids.add(para_id)
             remap = align_mark_layer_nodes(prev_nodes, next_nodes)
-            only_old = {
-                old for old, new in remap.items()
-                if old in only_ids or new in only_ids
-            }
             rebound = rebind_page_mark_layer_nodes(
-                route_path, workspace, prev_nodes, next_nodes, only_old or None,
-            ) if only_old else []
+                route_path, workspace, prev_nodes, next_nodes,
+            )
+            save_mark_layer_nodes_cache(route_path, next_nodes, workspace)
     except Exception:  # noqa: BLE001 — stamp/rebind is additive; never fail a rerender
         stamper = None
         remap = {}
-    html = render_block_html(
-        new_block, route_path,
-        status_chip=(wq_status_chip(new_block) if badges_on else None),
-        link_resolver=resolver, terms=terms_out, lexicon=lexicon,
-        auto_lexicon=auto_lexicon_page,
-        auto_local_terms=_auto_local_for(new_block, terms_out),
-        stamper=stamper,
+        next_nodes = []
+    html = _render_one_block_html(
+        new_block, route_path, workspace, resolver, terms_out,
+        lexicon, auto_lexicon_page, badges_on, stamper,
     )
+    if stamper is not None:
+        started = False
+        try:
+            for block in new_blocks:
+                if block is new_block:
+                    started = True
+                    continue
+                if not started:
+                    continue
+                later_html.append({
+                    'block_id': block['id'],
+                    'html': _render_one_block_html(
+                        block, route_path, workspace, resolver, terms_out,
+                        lexicon, auto_lexicon_page, badges_on, stamper,
+                    ),
+                })
+        except Exception:  # noqa: BLE001 — later restamp is additive
+            later_html = []
     return {
         'block_id': new_block['id'], 'html': html,
+        'later_html': later_html,
+        'mark_layer_nodes': next_nodes,
         'mark_layer_rebound': rebound, 'mark_layer_remap': remap,
     }
 
@@ -7259,6 +7323,8 @@ class Handler(BaseHTTPRequestHandler):
             page = data.get('page', '')
             ctype = data.get('type', 'comment')
             response_extra_html = None
+            response_later_html = None
+            response_mark_layer_nodes = None
             if ctype not in ('comment', 'edit', 'verdict', 'mark'):
                 self._send_json({'error': 'invalid type'}, status=400)
                 return
@@ -7402,8 +7468,11 @@ class Handler(BaseHTTPRequestHandler):
                         comment['mark_layer_primary'] = 'mark_layer_node_id'
                 # Not persisted to the sidecar (would bloat every row with a
                 # full block-html blob) — only returned in THIS response so
-                # postComment()'s caller can redraw reactively.
+                # postComment()'s caller can redraw reactively. later_html
+                # restamps subsequent blocks so a later duplicate keep via:id.
                 response_extra_html = change_result.get('html')
+                response_later_html = change_result.get('later_html') or []
+                response_mark_layer_nodes = change_result.get('mark_layer_nodes')
             if ctype == 'mark':
                 comment['mark_kind'] = mark_kind
                 comment['strength'] = strength
@@ -7460,6 +7529,10 @@ class Handler(BaseHTTPRequestHandler):
             response = dict(comment)
             if response_extra_html is not None:
                 response['html'] = response_extra_html
+            if response_later_html:
+                response['later_html'] = response_later_html
+            if response_mark_layer_nodes:
+                response['mark_layer_nodes'] = response_mark_layer_nodes
             self._send_json(response, status=201)
             return
 
@@ -7541,7 +7614,10 @@ class Handler(BaseHTTPRequestHandler):
                                                'resolved_by': resolver_author}, workspace)
                 self._send_json({
                     'ok': True, 'settled': True,
-                    'block_id': result['block_id'], 'html': result['html'], 'commit': result['commit'],
+                    'block_id': result['block_id'], 'html': result['html'],
+                    'later_html': result.get('later_html') or [],
+                    'mark_layer_nodes': result.get('mark_layer_nodes') or [],
+                    'commit': result['commit'],
                 })
                 return
             try:
@@ -7563,7 +7639,10 @@ class Handler(BaseHTTPRequestHandler):
             update_comment(page, mark_id, revert_patch, workspace)
             self._send_json({
                 'ok': True, 'reverted': True,
-                'block_id': result['block_id'], 'html': result['html'], 'commit': result['commit'],
+                'block_id': result['block_id'], 'html': result['html'],
+                'later_html': result.get('later_html') or [],
+                'mark_layer_nodes': result.get('mark_layer_nodes') or [],
+                'commit': result['commit'],
             })
             return
 
@@ -7592,7 +7671,10 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._send_json({
                 'ok': True, 'folded': True, 'term': term,
-                'block_id': result['block_id'], 'html': result['html'], 'commit': result['commit'],
+                'block_id': result['block_id'], 'html': result['html'],
+                'later_html': result.get('later_html') or [],
+                'mark_layer_nodes': result.get('mark_layer_nodes') or [],
+                'commit': result['commit'],
             })
             return
 

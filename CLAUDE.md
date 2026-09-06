@@ -1206,6 +1206,53 @@ revised middle sentence actually shows `<del>`/`<ins>` content — the second as
 falsifies against the `mark.proposed`-vs-`mark.snapshot` bug (verified: reverting the call site
 back to `mark.proposed` turns this test red).
 
+## Shared mark-layer engine (SOMA agreed model item 6a) — Python emitter, debug route, sidebar badge
+
+A second, parallel arc to the v3 view above, built across several 2026-09-05 mission-1 runs and
+undocumented here until this pass. Agreed model item 6a says "Playmaker and soma-review are to
+share one engine, Playmaker's, with soma-review supplying blocks and the mark record." This arc
+is the emitter half of that, staged in additive, never-load-bearing steps so nothing existing
+depends on it yet:
+
+1. **`v2/mark_layer_adapter.py`** — `to_mark_layer_nodes(src)` parses markdown into the same
+   flat `MarkLayerNode`/`MarkLayerFragment` shape Playmaker's `fromProseMarkdown`
+   (`playmaker/src/mark-layer-engine/adapters/proseMarkdown.ts`) already emits: paragraphs, their
+   sentences as sibling nodes, blank-line separators. Ids are `{prefix}-{sha1(kind:text)[:10]}`,
+   content-derived so re-parsing unmodified text always yields the same ids (a prerequisite for
+   client-side diffing) — verified to mint the literal same ids as the JS adapter on identical
+   input (`tests/mark-layer-engine-extraction.test.ts`). Known limit, named not fixed: the
+   occurrence-index suffix for duplicate text is assigned by each duplicate's position among its
+   own duplicates, so inserting a new duplicate earlier in the document can still reassign a
+   *later* duplicate's id — stable across re-parses of the same document, not across edits that
+   add/remove duplicate content.
+2. **`GET /api/mark-layer?page=<route>`** (`v2/server.py`, `do_GET`) — the first live surface of
+   the adapter's output. Deliberately a new endpoint, not a change to any existing route's wire
+   format, so it shipped with no live-consumer migration. Loopback-only: absent from
+   `TUNNEL_ALLOWED_GET` by design until a real tunnel consumer needs it.
+3. **`render_mark_layer_preview`** (`v2/server.py`) — a debug-only page (not linked from any
+   production UI) that lists a page's nodes one per line, so a human can eyeball the shape against
+   the real document before any client consumes it.
+4. **In-page embed** — every rendered page additively JSON-embeds its own node list
+   (`window.__MARK_LAYER_NODES__`) in the existing bootstrap `<script>` block, wrapped in
+   try/except so an adapter bug can never break page render (nothing depends on the value yet).
+5. **Sidebar node-count badge + "(changed)" signal** (`wireMarkLayerNodeIndicator`, `v2/server.py`
+   PAGE_JS) — reads that embed and shows a passive `"N mark-layer nodes"` pill. It also compares
+   the current node-id *sequence* against the sequence from the reader's last visit to that same
+   page (`localStorage`, keyed by `location.pathname`); a difference appends `(changed)`. This
+   comparison is **per-browser `localStorage`, not server-authoritative** — it is a second, weaker
+   "have you seen this" signal living beside the ringer list's real read-state
+   (`/api/read-state`), and the two will disagree across Mike's two reading surfaces (Mac loopback
+   vs. the Pixel tailnet tunnel). Treat the badge as a personal-device hint, not the read-state
+   source of truth. It is also one-shot: the stored baseline is overwritten on every page load
+   regardless of whether the "(changed)" flag was seen, so a second visit before acting on a
+   flagged change clears the signal with no way to recover what changed.
+
+None of this is wired into the *live* block-parser response that `/page/*` and the existing
+comment system actually read — doing that is agreed-model item 6a's larger remaining step,
+correctly left unscoped (it changes a wire format multiple live consumers depend on) rather than
+attempted as a drive-by. The natural next decision, when someone takes it on: migrate the old wire
+format onto this shape, or keep this permanently parallel and debug-only.
+
 ## Authorship
 
 v2 built 2026-07-02 by Dee (Claude Sonnet 5, engineering-lead/COO role) per Mike's spec

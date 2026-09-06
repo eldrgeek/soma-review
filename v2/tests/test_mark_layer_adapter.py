@@ -202,6 +202,90 @@ class MatchMarkLayerNodesTests(unittest.TestCase):
         self.assertIs(record, attach_mark_layer_node_ids(record, None))
         self.assertNotIn('mark_layer_node_id', record)
 
+    def test_repeated_sentence_snapshot_scopes_to_the_correct_occurrence(self):
+        # Skip 2026-09-06 nit 1: duplicate sentences rely on snapshot
+        # scoping. Two one-sentence-plus-context paragraphs share "Ready.";
+        # the second block's snapshot must attach that occurrence's id, not
+        # the first hit in document order.
+        text = 'Ready. Unique first context.\n\nReady. Unique second context.'
+        nodes = to_mark_layer_nodes(text)
+        ready = [
+            n for n in nodes
+            if n['kind'] == 'sentence' and n['fragments'][0]['text'].strip() == 'Ready.'
+        ]
+        self.assertEqual(2, len(ready))
+        self.assertNotEqual(ready[0]['id'], ready[1]['id'])
+        second_para = [
+            n for n in nodes
+            if n['kind'] == 'paragraph'
+            and n['fragments'][0]['text'].strip() == 'Ready. Unique second context.'
+        ][0]
+        matched = match_mark_layer_nodes(
+            nodes, quote='Ready.', snapshot='Ready. Unique second context.',
+        )
+        self.assertTrue(matched)
+        self.assertEqual(ready[1]['id'], matched[0]['id'])
+        self.assertEqual(second_para['id'], matched[1]['id'])
+
+        record = {
+            'type': 'mark', 'quote': 'Ready.',
+            'snapshot': 'Ready. Unique second context.',
+        }
+        attach_mark_layer_node_ids(record, text)
+        self.assertEqual(ready[1]['id'], record['mark_layer_node_id'])
+        self.assertEqual(ready[1]['id'], record['mark_layer_node_ids'][0])
+
+    def test_repeated_sentence_misses_when_snapshot_does_not_narrow(self):
+        # Skip 2026-09-06 nit 1: without a snapshot that uniquely names one
+        # paragraph, do not first-hit attach. A wrong node id is silent and
+        # permanent on the sidecar — prefer no id.
+        text = 'Ready. Unique first context.\n\nReady. Unique second context.'
+        nodes = to_mark_layer_nodes(text)
+        ready_ids = {
+            n['id'] for n in nodes
+            if n['kind'] == 'sentence' and n['fragments'][0]['text'].strip() == 'Ready.'
+        }
+        self.assertEqual(2, len(ready_ids))
+
+        self.assertEqual([], match_mark_layer_nodes(nodes, quote='Ready.'))
+        self.assertEqual(
+            [],
+            match_mark_layer_nodes(nodes, quote='Ready.', snapshot='no such paragraph'),
+        )
+
+        unscoped = {'type': 'mark', 'quote': 'Ready.', 'snapshot': ''}
+        attach_mark_layer_node_ids(unscoped, text)
+        self.assertNotIn('mark_layer_node_id', unscoped)
+        self.assertNotIn('mark_layer_node_ids', unscoped)
+
+        stale = {
+            'type': 'mark', 'quote': 'Ready.',
+            'snapshot': 'no such paragraph',
+        }
+        attach_mark_layer_node_ids(stale, text)
+        self.assertNotIn('mark_layer_node_id', stale)
+        self.assertNotIn('mark_layer_node_ids', stale)
+
+    def test_ambiguous_containment_is_a_miss_not_first_hit(self):
+        # The fall-through `needle in text or text in needle` used to take
+        # the first hit. "is" sits in both sentences; attaching Alpha would
+        # be silent and wrong.
+        text = 'Alpha is first. Beta is second.'
+        nodes = to_mark_layer_nodes(text)
+        self.assertEqual([], match_mark_layer_nodes(nodes, quote='is'))
+
+    def test_unique_containment_still_attaches(self):
+        text = 'Alpha is first. Beta is second.'
+        nodes = to_mark_layer_nodes(text)
+        expected = next(
+            n for n in nodes
+            if n['kind'] == 'sentence'
+            and n['fragments'][0]['text'].strip() == 'Beta is second.'
+        )
+        matched = match_mark_layer_nodes(nodes, quote='Beta is')
+        self.assertTrue(matched)
+        self.assertEqual(expected['id'], matched[0]['id'])
+
 
 if __name__ == '__main__':
     unittest.main()

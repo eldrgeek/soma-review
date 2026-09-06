@@ -1264,6 +1264,14 @@ no-op — the mark still writes as today. Live comment/mark UI does not read the
 twin emitter stays. 6a stays open until the live UI rides nodes and the item-15 view-diff /
 parity gate is green.
 
+**Skip 2026-09-06 nit 1 (load-bearing before any UI rides `mark_layer_node_id`):**
+`match_mark_layer_nodes` now unique-matches only. A repeated sentence plus a snapshot that
+names one paragraph group attaches that occurrence; when the snapshot does not uniquely
+narrow, attach misses (no node id) rather than first-hit containment. Exact-match happy
+path is unchanged. 6a is still open.
+
+**Skip 2026-09-06 nit 2 (named, not fixed):** the occurrence-suffix residual is now persisted on new marks.
+
 ## Authorship
 
 v2 built 2026-07-02 by Dee (Claude Sonnet 5, engineering-lead/COO role) per Mike's spec

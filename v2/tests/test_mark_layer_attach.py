@@ -41,6 +41,14 @@ SENTENCE_PAGE = (
     'Alpha is first. Beta is second. Gamma is third.\n'
 )
 
+# Two paragraphs share the sentence "Ready."; snapshot must pick the
+# occurrence. Skip 2026-09-06 nit 1.
+REPEAT_PAGE = (
+    '# Review title\n\n'
+    'Ready. Unique first context.\n\n'
+    'Ready. Unique second context.\n'
+)
+
 
 class MarkLayerAttachHTTPTests(unittest.TestCase):
     def setUp(self):
@@ -190,6 +198,77 @@ class MarkLayerAttachHTTPTests(unittest.TestCase):
         self.assertEqual(1, len(saved))
         self.assertEqual(row['id'], saved[0]['id'])
         self.assertNotIn('mark_layer_node_id', saved[0])
+
+    def test_repeated_sentence_snapshot_scopes_to_the_correct_occurrence(self):
+        # Skip 2026-09-06 nit 1: snapshot of the second block attaches that
+        # occurrence's node id, not the first "Ready." in document order.
+        self.write_doc(REPEAT_PAGE)
+        server.render_page('docs/page.md')
+        mapping = blockmap.load_map(server.block_map_path('docs/page.md'))
+        targets = [
+            row for row in mapping['blocks']
+            if (row.get('text') or '').startswith('Ready.')
+        ]
+        self.assertEqual(2, len(targets))
+        second = targets[1]
+        with open(self.doc, encoding='utf-8') as handle:
+            src = handle.read()
+        expected = [
+            n for n in to_mark_layer_nodes(src)
+            if n['kind'] == 'sentence'
+            and n['fragments'][0]['text'].strip() == 'Ready.'
+        ]
+        self.assertEqual(2, len(expected))
+
+        status, row = self._post({
+            'page': 'docs/page.md', 'type': 'mark', 'mark_kind': 'ack',
+            'block_id': second['id'], 'from': 0, 'to': 6,
+            'quote': 'Ready.',
+            'snapshot': 'Ready. Unique second context.',
+        })
+        self.assertEqual(201, status)
+        self.assertEqual(expected[1]['id'], row['mark_layer_node_id'])
+        self.assertIn(expected[1]['id'], row['mark_layer_node_ids'])
+        saved = [c for c in server.read_comments('docs/page.md') if c['id'] == row['id']]
+        self.assertEqual(1, len(saved))
+        self.assertEqual(expected[1]['id'], saved[0]['mark_layer_node_id'])
+        # Old path stays default: block_id / quote / snapshot unchanged.
+        self.assertEqual(second['id'], row['block_id'])
+        self.assertEqual('Ready.', row['quote'])
+        self.assertEqual('Ready. Unique second context.', row['snapshot'])
+
+    def test_repeated_sentence_misses_when_snapshot_does_not_narrow(self):
+        # Skip 2026-09-06 nit 1: no unique snapshot → no node id. First-hit
+        # attach would be silent and permanent in the sidecar.
+        self.write_doc(REPEAT_PAGE)
+        server.render_page('docs/page.md')
+        mapping = blockmap.load_map(server.block_map_path('docs/page.md'))
+        first = next(
+            row for row in mapping['blocks']
+            if (row.get('text') or '').startswith('Ready.')
+        )
+        payload = {
+            'page': 'docs/page.md', 'type': 'mark', 'mark_kind': 'ack',
+            'block_id': first['id'], 'from': 0, 'to': 6,
+            'quote': 'Ready.',
+        }
+        status, row = self._post(payload)
+        self.assertEqual(201, status)
+        self.assertEqual('mark', row['type'])
+        self.assertEqual('Ready.', row['quote'])
+        self.assertEqual(first['id'], row['block_id'])
+        self.assertNotIn('mark_layer_node_id', row)
+        self.assertNotIn('mark_layer_node_ids', row)
+        saved = [c for c in server.read_comments('docs/page.md') if c['id'] == row['id']]
+        self.assertEqual(1, len(saved))
+        self.assertNotIn('mark_layer_node_id', saved[0])
+
+        status2, row2 = self._post({
+            **payload, 'snapshot': 'no such paragraph',
+        })
+        self.assertEqual(201, status2)
+        self.assertNotIn('mark_layer_node_id', row2)
+        self.assertNotIn('mark_layer_node_ids', row2)
 
 
 if __name__ == '__main__':

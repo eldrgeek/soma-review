@@ -36,9 +36,12 @@ from blockmap import norm  # noqa: E402
 import tours as tour_engine  # noqa: E402  (Quinn tours of completed jobs — see tours.py)
 import cursor_intake  # noqa: E402  (Grok/Cursor intake — see SOMA/cursor-intake/README.md)
 from mark_layer_adapter import (  # noqa: E402  (SOMA agreed model item 6a)
-    to_mark_layer_nodes, attach_mark_layer_node_ids, MarkLayerDomStamper,
+    attach_mark_layer_node_ids, MarkLayerDomStamper,
     align_mark_layer_nodes, rebind_mark_layer_node_ids, remap_ledger_entries,
     block_for_mark_layer_node, find_mark_layer_node, mark_layer_node_text,
+)
+from mark_layer_engine import (  # noqa: E402
+    emit_live_mark_layer_nodes, last_live_emitter_source, mark_layer_twin_enabled,
 )
 
 PROJECTS_ROOT = os.path.expanduser('~/Projects')
@@ -364,8 +367,10 @@ def block_map_path(route_path, workspace=DEFAULT_WORKSPACE):
 # SOMA_REVIEW_MARK_LAYER_DUAL_WRITE to keep writing block_id/quote/snapshot
 # alongside the id. Set SOMA_REVIEW_MARK_LAYER_BESIDE to keep the old
 # block_id/quote resolve as a live fallthrough when a stored id is present
-# but the stamp misses. Readers use the id when present and fall back to
-# those fields only for legacy rows (no id) or when a flag is on.
+# but the stamp misses. Set SOMA_REVIEW_MARK_LAYER_TWIN to stamp via the
+# historical twin name (debug/bridge only; default off). Readers use the
+# id when present and fall back to those fields only for legacy rows
+# (no id) or when a flag is on.
 _LEGACY_ANCHOR_KEYS = (
     'block_id', 'from', 'to', 'quote', 'origin_quote', 'block_text_sha',
 )
@@ -4273,7 +4278,7 @@ def bind_from_mark_layer_node(route_path, workspace, candidate):
         if report.get('blocked'):
             return None
         src = src_bytes.decode('utf-8')
-        nodes = to_mark_layer_nodes(_mark_layer_source(src))
+        nodes = emit_live_mark_layer_nodes(_mark_layer_source(src))
     except Exception:  # noqa: BLE001 — fall through to legacy binding
         return None
     node = find_mark_layer_node(nodes, node_id)
@@ -4308,7 +4313,7 @@ def load_page_mark_layer_nodes(route_path, workspace=DEFAULT_WORKSPACE):
         fs_path = resolve_page(route_path, workspace)
         with open(fs_path, 'rb') as handle:
             src = handle.read().decode('utf-8')
-        nodes = to_mark_layer_nodes(_mark_layer_source(src))
+        nodes = emit_live_mark_layer_nodes(_mark_layer_source(src))
         _src, blocks, _mapping, _report = current_page_blocks(route_path, workspace)
         return blocks, nodes
     except Exception:  # noqa: BLE001 — readers must fall back to legacy fields
@@ -4571,14 +4576,14 @@ def _rerender_block(route_path, workspace, fs_path, new_src, block_id, old_block
     later_html = []
     next_nodes = []
     try:
-        next_nodes = to_mark_layer_nodes(_mark_layer_source(new_src))
+        next_nodes = emit_live_mark_layer_nodes(_mark_layer_source(new_src))
         stamper = MarkLayerDomStamper(next_nodes)
         for prior in new_blocks:
             if prior is new_block:
                 break
             stamper.skip_block(prior.get('text') or '')
         if prev_src is not None:
-            prev_nodes = to_mark_layer_nodes(_mark_layer_source(prev_src))
+            prev_nodes = emit_live_mark_layer_nodes(_mark_layer_source(prev_src))
             remap = align_mark_layer_nodes(prev_nodes, next_nodes)
             rebound = rebind_page_mark_layer_nodes(
                 route_path, workspace, prev_nodes, next_nodes,
@@ -5020,7 +5025,7 @@ def render_page(route_path, workspace=DEFAULT_WORKSPACE, view='classic'):
     mark_layer_nodes_json = 'null'
     try:
         mark_layer_src = _mark_layer_source(src)
-        mark_layer_nodes = to_mark_layer_nodes(mark_layer_src)
+        mark_layer_nodes = emit_live_mark_layer_nodes(mark_layer_src)
         prev_nodes = load_mark_layer_nodes_cache(route_path, workspace)
         rebound = []
         if prev_nodes:
@@ -5205,6 +5210,7 @@ window.__DISPATCH_BUTTON__ = {json.dumps(dispatch_cfg['button'])};
 window.__MARK_LAYER__ = {json.dumps(mark_layer)}; window.__HAS_DISPATCH__ = {json.dumps(has_dispatch)};
 window.__TERM_DEFS__ = {term_defs_json};
 window.__MARK_LAYER_NODES__ = {mark_layer_nodes_json};
+window.__MARK_LAYER_EMITTER__ = {json.dumps(last_live_emitter_source())};
 window.__V3_VIEW__ = {json.dumps(view == 'v3')}; window.__LEVEL_LABEL__ = {json.dumps(level_label)};</script>
 <script>{PAGE_JS}</script>
 {f'<script>{MARK_LAYER_JS}</script>' if mark_layer else ''}
@@ -5844,19 +5850,15 @@ def render_mark_layer_preview(route_path, workspace=DEFAULT_WORKSPACE):
     20:10:12Z mission-1 run) — that endpoint was proven live via `curl` but
     read by no page or script, the same "staged, unconsumed" state the
     Python/JS adapters themselves were in before the endpoint existed. A
-    debug view rather than a production one: renders `to_mark_layer_nodes`'s
-    flat node list (paragraph, its sentence children as SIBLING nodes, blank
-    separators — see `mark_layer_adapter.to_mark_layer_nodes`'s own
-    docstring) as a plain readable list, so a human can look at a page and
-    confirm the node/fragment shape the shared engine emits actually matches
-    what a mark-bar client would receive, before any client is built. Not
-    wired into the mark bar itself — that is still the next step named by
-    the run that shipped the endpoint."""
+    debug view rather than a production one: renders
+    `emit_live_mark_layer_nodes` / `from_prose_markdown` (Playmaker
+    fromProseMarkdown port) as a plain readable list. The Python twin is
+    not the live default. Not wired into the mark bar itself."""
     ws = get_workspace(workspace)
     fs_path = resolve_page(route_path, workspace)
     with open(fs_path, 'rb') as handle:
         src = handle.read().decode('utf-8')
-    nodes = to_mark_layer_nodes(src)
+    nodes = emit_live_mark_layer_nodes(src)
 
     def node_html(node):
         kind = node['kind']
@@ -6082,7 +6084,7 @@ def compute_ringer_list(route_path, workspace=DEFAULT_WORKSPACE, reader=RINGER_R
     try:
         fs_path = resolve_page(route_path, workspace)
         with open(fs_path, 'rb') as handle:
-            nodes = to_mark_layer_nodes(_mark_layer_source(handle.read().decode('utf-8')))
+            nodes = emit_live_mark_layer_nodes(_mark_layer_source(handle.read().decode('utf-8')))
     except Exception:  # noqa: BLE001 — ringer falls back to legacy block_id
         nodes = []
     node_block_cache = {}
@@ -7410,17 +7412,8 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == '/api/mark-layer':
-            # SOMA agreed model item 6a, first live surface: expose
-            # to_mark_layer_nodes's node/fragment shape for a page's raw
-            # markdown source. Deliberately a NEW endpoint, not a change to
-            # any existing route's response — /page/*, /api/comments etc.
-            # keep their current wire format untouched, so this is safe to
-            # ship without a live-consumer migration. Not yet linked from
-            # any page UI; a script or the eventual mark-bar client reads it
-            # directly. Deliberately absent from TUNNEL_ALLOWED_GET (fail-closed
-            # default, see the block above) — loopback-only for now; add it to
-            # the allowlist when a real tunnel consumer (e.g. Mike's phone)
-            # needs it, per Skip's 2026-09-05 review of this route.
+            # SOMA agreed model item 6a: expose the live fromProseMarkdown
+            # port's node/fragment shape. Twin is debug-only.
             page = qs.get('page', [''])[0]
             if not page:
                 self._send_json({'error': 'page required'}, status=400)
@@ -7432,7 +7425,15 @@ class Handler(BaseHTTPRequestHandler):
                 return
             with open(fs_path, 'rb') as handle:
                 src = handle.read().decode('utf-8')
-            self._send_json({'page': page, 'nodes': to_mark_layer_nodes(src)})
+            payload = {
+                'page': page,
+                'nodes': emit_live_mark_layer_nodes(src),
+                'emitter': last_live_emitter_source(),
+            }
+            if mark_layer_twin_enabled():
+                from mark_layer_adapter import to_mark_layer_nodes  # noqa: PLC0415
+                payload['twin'] = to_mark_layer_nodes(src)
+            self._send_json(payload)
             return
 
         if path == '/healthz':

@@ -1214,10 +1214,10 @@ share one engine, Playmaker's, with soma-review supplying blocks and the mark re
 is the emitter half of that, staged in additive, never-load-bearing steps so nothing existing
 depends on it yet:
 
-1. **`v2/mark_layer_adapter.py`** — `to_mark_layer_nodes(src)` parses markdown into the same
-   flat `MarkLayerNode`/`MarkLayerFragment` shape Playmaker's `fromProseMarkdown`
-   (`playmaker/src/mark-layer-engine/adapters/proseMarkdown.ts`) already emits: paragraphs, their
-   sentences as sibling nodes, blank-line separators. Ids are `{prefix}-{sha1(kind:text)[:10]}`,
+1. **`v2/mark_layer_engine.py`** — `from_prose_markdown(src)` / `emit_live_mark_layer_nodes(src)`
+   is the live shared-model port of Playmaker's `fromProseMarkdown`
+   (`playmaker/src/mark-layer-engine/adapters/proseMarkdown.ts`): paragraphs, their
+   sentences as sibling nodes, blank-line separators. Ids are `{prefix}-{sha1(prefix:text)[:10]}`,
    content-derived so re-parsing unmodified text always yields the same ids (a prerequisite for
    client-side diffing) — verified to mint the literal same ids as the JS adapter on identical
    input (`tests/mark-layer-engine-extraction.test.ts`). Accepted Playmaker twin mint: the
@@ -1257,8 +1257,10 @@ Item-15 view-diff / parity is a named gate (`v2/mark_layer_parity.py`,
 `v2/tests/test_mark_layer_parity.py`): zero unaccounted landing diffs
 on the fixture set, or every diff listed with reason (remap ledger /
 occurrence-suffix-shift / unpaired-miss / heading-no-sentence-node).
-The Python twin emitter is a **bridge during migration only**, then dies — not
-a permanent parallel or debug-only option.
+The Python twin emitter was a **bridge during migration only**. Live stamps
+now come from `from_prose_markdown` (Playmaker `fromProseMarkdown` port in
+`v2/mark_layer_engine.py`). The twin name is debug-only
+(`SOMA_REVIEW_MARK_LAYER_TWIN`, default off) — not the live default.
 
 **6a beside (2026-09-06), first step, not closed:** `POST /api/comments` with `type: mark` now
 resolves the best matching `MarkLayerNode` via `to_mark_layer_nodes` on the page source and
@@ -1355,6 +1357,24 @@ are `unique-match-miss`, not lumped into `unpaired-miss`.
 DOM — not Playmaker's `fromProseMarkdown` as the sole live path.
 Do not claim 6a closed on twin-still-stamps. Out of scope unchanged:
 Playmaker Fountain `[[SCENE:]]` / P1 Doc export; unbounded ledger prune.
+
+**6a residual (2026-09-06), twin demoted — closed for twin-stamps-live-DOM:**
+Skip's close criterion after #11 was "Playmaker `fromProseMarkdown` as the
+sole live path." Live node emission is now `emit_live_mark_layer_nodes` →
+`from_prose_markdown` (`v2/mark_layer_engine.py`), the in-repo faithful
+port of Playmaker's mark-layer-engine adapter. `MarkLayerDomStamper`,
+create/resolve, rebind, ringer, and `/api/mark-layer` consume that path.
+`to_mark_layer_nodes` is a debug alias and is not called on live render
+when `SOMA_REVIEW_MARK_LAYER_TWIN` is off (default). Optional
+`SOMA_REVIEW_MARK_LAYER_ENGINE=js` consumes `v2/mark-layer-engine/fromProseMarkdown.mjs`
+(same mint). Playmaker's TypeScript package is not a runtime dependency
+of this stdlib server (sibling checkout optional for
+`tests/test_engine_parity.py`).
+**6a closed** for the twin-stamp residual. Named remaining residuals
+(accepted, not hidden): occurrence-suffix mint + remap ledger; unpaired
+weak-neighbor miss; heading-no-sentence-node; unique-match-miss;
+Playmaker TS not vendored. Out of scope unchanged: P1 Doc export;
+Fountain `[[SCENE:]]`; unbounded ledger prune.
 
 ## Fold (SOMA agreed model item 10) — wired into the v3 panel (2026-09-06)
 

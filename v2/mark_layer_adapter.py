@@ -1,17 +1,14 @@
-"""Python-side emitter of the shared mark-layer node/fragment model.
+"""Mark-layer attach / align / DOM stamper — not the live node emitter.
 
-SOMA agreed model item 6a: "Playmaker and soma-review are to share one
-engine, Playmaker's, with soma-review supplying blocks and the mark record."
-Playmaker's JS side (`playmaker/src/mark-layer-engine/adapters/proseMarkdown.ts`)
-already defines the target shape (`MarkLayerNode`/`MarkLayerFragment`,
-`playmaker/src/mark-layer-engine/types.ts`) and a `fromProseMarkdown` adapter
-that ported soma-review's OWN `segment_sentences`/`blockmap.norm` into JS.
-This module is the missing other half: soma-review emitting that same
-node/fragment shape natively, in Python, from the sentence-segmentation logic
-it already owns (`mdblocks.segment_sentences`, `blockmap.norm`) — the
-prerequisite named in `playmaker/docs/MARK-LAYER-ENGINE.md` "Next" item 1
-("soma-review consumption") before the live block parser can be rewired to
-produce it.
+SOMA agreed model item 6a: live node emission is Playmaker's
+`fromProseMarkdown` shared model, ported in `mark_layer_engine.py` as
+`from_prose_markdown` / `emit_live_mark_layer_nodes`. This module binds
+those nodes onto sidecar rows and rendered HTML.
+
+`to_mark_layer_nodes` is the historical Python twin name. It is a
+debug/bridge alias of `from_prose_markdown` and is not the live stamp
+path. Live callers use `emit_live_mark_layer_nodes`. Twin stays only
+behind `SOMA_REVIEW_MARK_LAYER_TWIN` (default off).
 
 Write-side (2026-09-06, dual-write retired as default): `POST /api/comments`
 type=mark treats `mark_layer_node_id` as the sole required anchoring
@@ -19,9 +16,9 @@ record for a unique match. `attach_mark_layer_node_ids` prefers a
 client-supplied stamp id that still exists in the current parse and
 agrees with a supplied quote (Skip 2026-09-06 nit 1), then unique
 quote/snapshot match. Default jump/render is that stored id → DOM
-`data-mark-layer-node-id` (`MarkLayerDomStamper` walks these nodes in
-document order). Text-occurrence lookup remains the counted fallback
-when the id or stamp is missing.
+`data-mark-layer-node-id` (`MarkLayerDomStamper` walks live-emitted
+nodes in document order). Text-occurrence lookup remains the counted
+fallback when the id or stamp is missing.
 
 Old `block_id` is not written on unique-match creates or type=edit
 unless `SOMA_REVIEW_MARK_LAYER_DUAL_WRITE` is explicitly on
@@ -36,9 +33,8 @@ gate. Twin `-{n}` mint is the permanent Playmaker mint (unique
 edits is the remap ledger. Weak-neighbor pairing no longer
 position-pairs identical lone paragraphs; unpaired old ids miss.
 Later-block stamps are restamped on the same mid-doc edit that remaps
-sidecar ids (see `_rerender_block`). The twin emitter stamps DOM and
-mints fallback ids; it is not the live create/resolve path when a
-`mark_layer_node_id` is present.
+sidecar ids (see `_rerender_block`). Live stamps come from
+`from_prose_markdown`, not the twin.
 
 Edit-rebind: `align_mark_layer_nodes` maps previous-parse ids onto the
 current parse by unique fingerprint, then neighborhood for duplicates,
@@ -105,12 +101,12 @@ rebind + persisted `remap_ledger`), not a change to `_content_id`
 minting — the suffix still shifts in the twin emitter; the ledger
 accounts that remap so a stored id keeps querySelector-hitting the
 same sentence (or a named unpaired residual). Create/resolve live path is the stored or client-stamped
-`mark_layer_node_id`. Twin quote-matching is fallback minting
-when no id was sent. type=edit no longer dual-writes `block_id`
-as identity. Old block_id/quote resolve is off when an id is
-present (gated by `SOMA_REVIEW_MARK_LAYER_BESIDE`). 6a stays
-open while the twin still stamps live DOM (not Playmaker's
-engine as the sole live path).
+`mark_layer_node_id`. Unique quote/snapshot match is fallback
+minting when no id was sent. type=edit no longer dual-writes
+`block_id` as identity. Old block_id/quote resolve is off when
+an id is present (gated by `SOMA_REVIEW_MARK_LAYER_BESIDE`).
+Live node emission is `from_prose_markdown` (Playmaker
+fromProseMarkdown port). The Python twin is debug-only.
 
 **Known gap, still flagged rather than fixed:**
 
@@ -127,11 +123,13 @@ engine as the sole live path).
 """
 from __future__ import annotations
 
-import hashlib
 import re
 from typing import Any
 
-from mdblocks import norm, segment_sentences
+from mdblocks import norm
+from mark_layer_engine import (  # noqa: E402
+    from_prose_markdown, emit_live_mark_layer_nodes,
+)
 
 _HEADING_RE = re.compile(r'^#{1,6}\s+')
 
@@ -202,62 +200,6 @@ def remap_ledger_entries(applied: list[dict[str, Any]] | None) -> list[dict[str,
     return out
 
 
-def _content_id(seen: dict[str, int], prefix: str, text: str) -> str:
-    """A content-derived id: same `(prefix, text)` always hashes to the same
-    base id, so unchanged content maps to the same id across calls. `seen`
-    (fresh per `to_mark_layer_nodes` call) disambiguates a `(prefix, text)`
-    pair that repeats verbatim within the same call — an empty-line `blank`
-    node or two literally identical sentences are both real cases — by
-    appending `-{occurrence index}` to every repeat after the first, so ids
-    stay unique within a call without giving up cross-call stability for the
-    common (non-duplicated) case."""
-    digest = hashlib.sha1(f'{prefix}:{text}'.encode('utf-8')).hexdigest()[:10]
-    key = f'{prefix}:{digest}'
-    occurrence = seen.get(key, 0)
-    seen[key] = occurrence + 1
-    base = f'{prefix}-{digest}'
-    return base if occurrence == 0 else f'{base}-{occurrence}'
-
-
-def _paragraph_node(seen: dict[str, int], text: str) -> dict[str, Any]:
-    node_id = _content_id(seen, 'pmpara', text)
-    return {
-        'id': node_id,
-        'kind': 'paragraph',
-        'fragments': [{'id': _content_id(seen, f'{node_id}-frag', text), 'text': text}],
-    }
-
-
-def _blank_node(seen: dict[str, int], text: str) -> dict[str, Any]:
-    node_id = _content_id(seen, 'pmln', text)
-    return {
-        'id': node_id,
-        'kind': 'blank',
-        'fragments': [{'id': _content_id(seen, f'{node_id}-frag', text), 'text': text}],
-    }
-
-
-def _sentence_nodes(seen: dict[str, int], paragraph_text: str) -> list[dict[str, Any]]:
-    """One `sentence` node per sentence in `paragraph_text`, offsets in
-    code points into `norm(paragraph_text)` — the same coordinate space
-    `blockmap`/`server.sentence_ranges` already anchor marks to, and the
-    one the JS adapter's `attrs.offset` was fixed to agree with (2026-09-05,
-    `docs/MARK-LAYER-ENGINE.md` "Next" item 1, offset-space closure)."""
-    normalized = norm(paragraph_text)
-    nodes = []
-    offset = 0
-    for _start, _end, text in segment_sentences(normalized):
-        node_id = _content_id(seen, 'pmsent', text)
-        nodes.append({
-            'id': node_id,
-            'kind': 'sentence',
-            'fragments': [{'id': _content_id(seen, f'{node_id}-frag', text), 'text': text}],
-            'attrs': {'offset': offset},
-        })
-        offset += len(text)
-    return nodes
-
-
 def _node_text(node: dict[str, Any]) -> str:
     return ''.join(str(frag.get('text') or '') for frag in (node.get('fragments') or []))
 
@@ -316,7 +258,7 @@ def block_for_mark_layer_node(
 def _paragraph_groups(nodes: list[dict[str, Any]]) -> list[tuple[dict[str, Any] | None, list[dict[str, Any]]]]:
     """Walk the adapter's flat list into (paragraph, following sentences) groups.
 
-    `to_mark_layer_nodes` emits a paragraph, then its sentence siblings, then
+    `from_prose_markdown` emits a paragraph, then its sentence siblings, then
     a blank (or the next paragraph). Grouping lets a mark's `snapshot` (the
     block text) scope which duplicate sentence we attach when the same quote
     appears more than once.
@@ -704,7 +646,7 @@ def attach_mark_layer_node_ids(
         if nodes is None:
             if not isinstance(page_src, str):
                 return record
-            nodes = to_mark_layer_nodes(page_src)
+            nodes = emit_live_mark_layer_nodes(page_src)
         if not nodes:
             return record
         supplied = record.get('mark_layer_node_id')
@@ -738,8 +680,8 @@ class MarkLayerDomStamper:
     """Assign adapter node ids to rendered blocks/sentences in document order.
 
     Live HTML is produced by `parse_markdown` + `sentence_ranges`; adapter
-    nodes come from `to_mark_layer_nodes` (blank-line split +
-    `segment_sentences`). The walker consumes unused groups/sentences
+    nodes come from `emit_live_mark_layer_nodes` / `from_prose_markdown`
+    (Playmaker fromProseMarkdown port). The walker consumes unused groups/sentences
     forward so a later duplicate gets `pmsent-…-1`, not the first hit.
 
     `bind_block` prefers the next unused group when its text matches
@@ -842,27 +784,11 @@ class MarkLayerDomStamper:
 
 
 def to_mark_layer_nodes(md: str) -> list[dict[str, Any]]:
-    """Parse `md` into the shared node/fragment model: one `paragraph` node
-    per blank-line-separated block (headings kept whole, not sentence-split),
-    each non-heading paragraph further split into `sentence` nodes, and blank
-    separators preserved as their own `blank` nodes — mirrors
-    `fromProseMarkdown` in `playmaker/src/mark-layer-engine/adapters/proseMarkdown.ts`
-    node-for-node, so the two engines can agree on the shape of the mark
-    record (SOMA agreed model item 6a). Ids are content-derived (`_content_id`)
-    and therefore stable across repeated calls on the same document — see the
-    module docstring's 2026-09-05 fix note."""
-    nodes: list[dict[str, Any]] = []
-    seen: dict[str, int] = {}
-    blocks = re.split(r'(\n{2,})', md)
-    for block in blocks:
-        if not block:
-            continue
-        if re.fullmatch(r'\n{2,}', block):
-            nodes.append(_blank_node(seen, block))
-            continue
-        if _HEADING_RE.match(block):
-            nodes.append(_paragraph_node(seen, block))
-            continue
-        nodes.append(_paragraph_node(seen, block))
-        nodes.extend(_sentence_nodes(seen, block))
-    return nodes
+    """Debug/bridge alias of `from_prose_markdown`.
+
+    Not the live stamp path. Live callers must use
+    `emit_live_mark_layer_nodes`. Kept so unit tests of the shared
+    model and an explicit `SOMA_REVIEW_MARK_LAYER_TWIN=1` debug
+    bridge still have a name. Does not implement a second algorithm.
+    """
+    return from_prose_markdown(md)

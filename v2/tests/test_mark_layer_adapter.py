@@ -1,7 +1,7 @@
-"""to_mark_layer_nodes — the Python-side emitter of the shared mark-layer
-node/fragment model (SOMA agreed model item 6a; see
-`v2/mark_layer_adapter.py` module docstring and
-`playmaker/docs/MARK-LAYER-ENGINE.md` "Next" item 1).
+"""Shared-model node shape + attach/align (SOMA agreed model item 6a).
+
+Live emission is `from_prose_markdown` in `mark_layer_engine.py`.
+`to_mark_layer_nodes` is the debug alias of that port.
 """
 import os
 import sys

@@ -7,9 +7,10 @@ Fails the run if any landing mismatch is unaccounted. Accounted reasons
 are remap-ledger / occurrence-suffix-shift / unpaired-miss /
 unique-match-miss / heading-no-sentence-node / edit-id-reattach.
 
-Does not claim 6a closed. Dual-write stays off on location create
-and type=edit identity; snapshot/proposed stay as the change record.
-Old beside is off when an id is present. Run:
+6a is closed for the twin-stamp residual: live stamps are
+from_prose_markdown (Playmaker fromProseMarkdown port). Dual-write
+stays off on location create and type=edit identity; snapshot/proposed
+stay as the change record. Old beside is off when an id is present. Run:
 
   python3 -m unittest v2.tests.test_mark_layer_parity
   python3 v2/mark_layer_parity.py
@@ -89,13 +90,19 @@ class MarkLayerParityGateTests(unittest.TestCase):
         ]
         self.assertTrue(headings, self.report['accounted'])
 
-    def test_six_a_stays_open(self):
-        self.assertEqual('open', self.report['six_a_status'])
-        self.assertIn('twin', self.report['six_a_reason'])
-        self.assertIn('stamps live DOM', self.report['six_a_reason'])
+    def test_six_a_closed_twin_not_live(self):
+        self.assertEqual('closed', self.report['six_a_status'])
+        self.assertFalse(self.report['twin_enabled'])
+        self.assertTrue(
+            self.report['live_emitter'].startswith('fromProseMarkdown'),
+            self.report['live_emitter'],
+        )
+        self.assertNotIn('stamps live DOM', self.report['six_a_reason'])
         named = '\n'.join(self.report['residuals_accepted'])
         self.assertIn('dual-write', named)
         self.assertIn('type=edit', named)
+        self.assertIn('fromProseMarkdown port', named)
+        self.assertNotIn('twin emitter still stamps live DOM', named)
         self.assertNotIn('type=edit still writes block_id+snapshot', named)
 
     def test_edit_cutover_reattaches_id_without_block_id(self):

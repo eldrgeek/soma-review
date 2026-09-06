@@ -3991,6 +3991,90 @@ def apply_sentence_revert(route_path, workspace, mark):
     return result
 
 
+_TERMS_HEADING_RE = re.compile(r'^## Terms\s*$', re.MULTILINE)
+_NEXT_H2_RE = re.compile(r'^## ', re.MULTILINE)
+# `term` is embedded verbatim into the trunk file as both a markdown link label
+# and a bold Terms bullet (below) — unlike `sentence_text`, which is hash-guarded
+# against what's really on disk, `term` is caller-supplied free text with no such
+# check. Found by an adversarial pass before this shipped: an unrestricted `term`
+# containing `]`/`(`/`)` can break out of the intended single link into a second,
+# attacker-chosen link, and one containing a newline can forge an extra `- **X**
+# — ...` bullet that reads exactly like a real, agreed term definition. Restrict
+# it to a single line of plain text with no markdown-link-breaking characters.
+_SAFE_TERM_RE = re.compile(r'^[^\n\]\)\(`]{1,80}$')
+
+
+def apply_sentence_fold(route_path, workspace, block_id, sentence_text, term):
+    """Fold (MDP agreed model item 10 — "an agreed extension may be folded
+    out of the sentence into the node it defines, leaving the link. The
+    document gets shorter as agreement grows." — agreed 2026-09-03, flagged
+    unbuilt in mdp-agreed-model.md's `## Open` section until this function).
+
+    Moves one whole sentence (the hash-guarded unit of editing, same as
+    settle/revert — item 6a) out of its block verbatim and into a new
+    bullet in the page's own `## Terms` list, replacing it in place with a
+    `[term](#terms)` link. The existing local-term auto-link machinery
+    (extract_terms / render_inline's local-term match) picks the new
+    bullet up on next render with no further wiring — this function only
+    performs the two writes.
+
+    Refuses (MergeConflict) if `sentence_text` no longer matches the block
+    on disk (same drift guard as settle/revert), if it does not resolve to
+    exactly one full sentence, if `term` isn't a single safe line (see
+    `_SAFE_TERM_RE`), or if the page has no `## Terms` heading — creating
+    one from scratch is out of scope for this first cut."""
+    if not _SAFE_TERM_RE.match(term or ''):
+        raise MergeConflict('term must be 1-80 chars, one line, no ] ( ) `')
+    fs_path, normalized, start, end, block, sentence_index = _locate_change_span(
+        route_path, workspace, block_id, sentence_text
+    )
+    if sentence_index is None:
+        # A whole-block match (_locate_change_span's fast path) proves nothing
+        # about how many actual sentences the block holds — a caller passing a
+        # genuinely multi-sentence block's full text as `sentence_text` matched
+        # here too (found by an adversarial pass: the old guard compared
+        # `normalized[start:end]` against itself and could never fire). Re-derive
+        # the sentence count the same way _locate_change_span would have to
+        # actually enforce "exactly one sentence."
+        if len(segment_sentences(normalized[start:end])) != 1:
+            raise MergeConflict('fold operates on exactly one sentence at a time')
+    # segment_sentences' spans can carry a leading/trailing separator space (e.g.
+    # right after a numbered-list marker like "10. "); replacing verbatim would
+    # collapse "10. An agreed..." into "10.[term](#terms)" with the space eaten.
+    # Preserve whatever whitespace bordered the matched span exactly as found.
+    span = normalized[start:end]
+    lead_ws = span[:len(span) - len(span.lstrip())]
+    trail_ws = span[len(span.rstrip()):] if span.rstrip() else ''
+    link_text = f'[{term}](#terms)'
+    new_src = normalized[:start] + lead_ws + link_text + trail_ws + normalized[end:]
+    m = _TERMS_HEADING_RE.search(new_src)
+    if not m:
+        raise MergeConflict('page has no "## Terms" section to fold into')
+    next_heading = _NEXT_H2_RE.search(new_src[m.end():])
+    insert_at = m.end() + next_heading.start() if next_heading else len(new_src)
+    # If the page already defines this term, fold ONLY the link (found live: folding
+    # "fold" itself into mdp-agreed-model.md, which already hand-defined "fold" in its
+    # own Terms list, produced two conflicting bullets for the same label). The link
+    # already resolves to the existing definition via the same local-term matching
+    # extract_terms()/render_inline() use — no new bullet is needed or wanted.
+    existing_re = re.compile(r'^-\s+\*\*' + re.escape(term) + r'\*\*\s+—', re.MULTILINE | re.IGNORECASE)
+    if not existing_re.search(new_src[m.end():insert_at]):
+        bullet = f'- **{term}** — {sentence_text.strip()}\n'
+        new_src = new_src[:insert_at].rstrip('\n') + '\n\n' + bullet + new_src[insert_at:]
+    with open(fs_path, 'w', encoding='utf-8') as f:
+        f.write(new_src)
+    commit_sha = None
+    commit_err = None
+    repo_root = _git_repo_root(fs_path)
+    if repo_root:
+        message = f"mdp: fold '{term}' on {route_path}"
+        commit_sha, commit_err = _git_commit_file(repo_root, fs_path, message)
+    result = _rerender_block(route_path, workspace, fs_path, new_src, block_id, block)
+    result['commit'] = commit_sha
+    result['commit_error'] = commit_err
+    return result
+
+
 _LEVEL_FRONTMATTER_RE = re.compile(r'^\s*(?:<!--.*?-->\s*)*---\s*\n(.*?)\n---\s*\n', re.S)
 _LEVEL_KEY_RE = re.compile(r'^level:\s*(.+?)\s*$', re.M)
 _VIEW_KEY_RE = re.compile(r'^view:\s*(.+?)\s*$', re.M)
@@ -6892,6 +6976,35 @@ class Handler(BaseHTTPRequestHandler):
             update_comment(page, mark_id, revert_patch, workspace)
             self._send_json({
                 'ok': True, 'reverted': True,
+                'block_id': result['block_id'], 'html': result['html'], 'commit': result['commit'],
+            })
+            return
+
+        if path == '/api/fold':
+            # Fold (MDP agreed model item 10): {page, block_id, sentence, term}.
+            # sentence is the exact text of the sentence to extract (drift-guarded
+            # against the file, same as /api/marks/merge); term is the name it
+            # folds into under the page's own "## Terms" section.
+            data = self._read_json_body()
+            page = data.get('page', '')
+            block_id = data.get('block_id', '')
+            sentence = data.get('sentence', '')
+            term = (data.get('term') or '').strip()
+            if not (page and block_id and sentence and term):
+                self._send_json({'error': 'page, block_id, sentence and term required'}, status=400)
+                return
+            try:
+                resolve_page(page, workspace)
+            except NotFoundError:
+                self._send_json({'error': 'unknown page'}, status=404)
+                return
+            try:
+                result = apply_sentence_fold(page, workspace, block_id, sentence, term)
+            except MergeConflict as exc:
+                self._send_json({'error': str(exc)}, status=409)
+                return
+            self._send_json({
+                'ok': True, 'folded': True, 'term': term,
                 'block_id': result['block_id'], 'html': result['html'], 'commit': result['commit'],
             })
             return

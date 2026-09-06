@@ -267,6 +267,135 @@ class ChangeSettleRevertTests(unittest.TestCase):
             shutil.rmtree(no_git_root, ignore_errors=True)
 
 
+class SentenceFoldTests(ChangeSettleRevertTests):
+    """apply_sentence_fold (MDP agreed model item 10, "an agreed extension may
+    be folded out of the sentence into the node it defines, leaving the
+    link" — agreed 2026-09-03, unbuilt until this pass). Reuses
+    ChangeSettleRevertTests' fixture (temp git repo, workspaces.json) since
+    fold shares its file/commit machinery with settle/revert; these tests
+    don't use make_edit_mark (fold takes the sentence directly, no prior
+    mark required)."""
+
+    def test_fold_moves_sentence_into_terms_and_leaves_a_link(self):
+        self.write_doc(
+            '# Title\n\n'
+            'A bracket is the span between two explicit marks by the same '
+            'reader. Everything inside that span counts as at least acked.\n\n'
+            '## Terms\n\n'
+            '- **mark** — a reader\'s recorded response to one sentence.\n'
+        )
+        self.commit_doc()
+        _src, blocks, _map, _report = server.current_page_blocks('docs/page.md', 'estate')
+        block = next(b for b in blocks if 'bracket is the span' in b['text'])
+        sentence = ('A bracket is the span between two explicit marks by the same '
+                    'reader.')
+
+        result = server.apply_sentence_fold('docs/page.md', 'estate', block['id'], sentence, 'bracket')
+
+        with open(self.doc, encoding='utf-8') as f:
+            content = f.read()
+        self.assertIn('[bracket](#terms) Everything inside', content)
+        self.assertIn('- **bracket** — ' + sentence, content)
+        # The pre-existing hand-written term is untouched (fold only appends).
+        self.assertIn("- **mark** — a reader's recorded response to one sentence.", content)
+        self.assertIsNotNone(result['commit'])
+        log = _git('log', '-1', '--pretty=%B', cwd=self.docs_repo).stdout
+        self.assertIn('fold', log)
+        self.assertIn('bracket', log)
+
+    def test_fold_refuses_without_a_terms_section(self):
+        self.write_doc('# Title\n\nA lone sentence with no Terms section.\n')
+        self.commit_doc()
+        _src, blocks, _map, _report = server.current_page_blocks('docs/page.md', 'estate')
+        block = blocks[0]
+        with self.assertRaises(server.MergeConflict):
+            server.apply_sentence_fold('docs/page.md', 'estate', block['id'],
+                                        'A lone sentence with no Terms section.', 'lone')
+
+    def test_fold_into_an_already_defined_term_does_not_duplicate_the_bullet(self):
+        """Found live (2026-09-06) folding item 10 of the real mdp-agreed-model.md
+        into its own already-hand-defined "fold" term: without this guard, fold
+        appends a second conflicting `- **fold** — ...` bullet under the same
+        label instead of just leaving the link."""
+        self.write_doc(
+            '# Title\n\n'
+            'An agreed extension may be folded out of the sentence. It stays short.\n\n'
+            '## Terms\n\n'
+            '- **fold** — moving an extension out of the sentence into the node it defines.\n'
+        )
+        self.commit_doc()
+        _src, blocks, _map, _report = server.current_page_blocks('docs/page.md', 'estate')
+        block = next(b for b in blocks if 'agreed extension' in b['text'])
+        sentence = 'An agreed extension may be folded out of the sentence.'
+
+        server.apply_sentence_fold('docs/page.md', 'estate', block['id'], sentence, 'fold')
+
+        with open(self.doc, encoding='utf-8') as f:
+            content = f.read()
+        self.assertEqual(1, content.count('**fold**'))
+        self.assertIn('[fold](#terms) It stays short.', content)
+
+    def test_fold_refuses_a_multi_sentence_block_passed_whole(self):
+        """Found by an adversarial pass: _locate_change_span's whole-block match
+        (sentence_index=None) proves nothing about how many real sentences the
+        block holds, so passing a genuinely multi-sentence block's full text used
+        to fold the ENTIRE block into one term/link, silently collapsing content
+        this function's own docstring says it refuses to touch."""
+        self.write_doc(
+            '# Title\n\n'
+            'First sentence here. Second sentence here.\n\n'
+            '## Terms\n\n- **x** — placeholder.\n'
+        )
+        self.commit_doc()
+        _src, blocks, _map, _report = server.current_page_blocks('docs/page.md', 'estate')
+        block = next(b for b in blocks if 'First sentence' in b['text'])
+        with self.assertRaises(server.MergeConflict):
+            server.apply_sentence_fold('docs/page.md', 'estate', block['id'],
+                                        'First sentence here. Second sentence here.', 'whole')
+        with open(self.doc, encoding='utf-8') as f:
+            content = f.read()
+        self.assertIn('First sentence here. Second sentence here.', content)
+
+    def test_fold_refuses_an_unsafe_term(self):
+        """Found by an adversarial pass: `term` is embedded verbatim as both a
+        markdown link label and a bold Terms bullet with no validation, unlike
+        `sentence_text` (hash-guarded against disk). A `]`/`(`/`)` breaks out of
+        the intended single link into a second, caller-chosen link; a newline
+        can forge an extra bullet that reads like a real agreed definition."""
+        self.write_doc('# Title\n\nA plain sentence.\n\n## Terms\n\n- **x** — placeholder.\n')
+        self.commit_doc()
+        _src, blocks, _map, _report = server.current_page_blocks('docs/page.md', 'estate')
+        block = blocks[0]
+        for bad_term in (
+            'x](https://evil.example)[y',
+            'x\n- **forged** — not real',
+            'x`y',
+        ):
+            with self.assertRaises(server.MergeConflict):
+                server.apply_sentence_fold('docs/page.md', 'estate', block['id'],
+                                            'A plain sentence.', bad_term)
+        with open(self.doc, encoding='utf-8') as f:
+            content = f.read()
+        self.assertIn('A plain sentence.', content)
+        self.assertNotIn('evil.example', content)
+        self.assertNotIn('forged', content)
+
+    def test_fold_refuses_on_sentence_drift(self):
+        self.write_doc(
+            '# Title\n\nOriginal sentence here.\n\n## Terms\n\n- **x** — placeholder.\n'
+        )
+        self.commit_doc()
+        _src, blocks, _map, _report = server.current_page_blocks('docs/page.md', 'estate')
+        block = blocks[0]
+        self.write_doc(
+            '# Title\n\nSomeone changed it already.\n\n## Terms\n\n- **x** — placeholder.\n'
+        )
+        self.commit_doc('drift')
+        with self.assertRaises(server.MergeConflict):
+            server.apply_sentence_fold('docs/page.md', 'estate', block['id'],
+                                        'Original sentence here.', 'orig')
+
+
 class SegmentSentencesTests(unittest.TestCase):
     """mdblocks.segment_sentences — item C's "unit of editing is the
     sentence, not the block/paragraph" primitive."""

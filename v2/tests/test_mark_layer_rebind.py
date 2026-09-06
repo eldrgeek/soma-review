@@ -2,8 +2,9 @@
 
 After an earlier-paragraph insert that would shift occurrence suffixes,
 render_page remaps the stored id onto the new parse so jump can still
-querySelector the stamp. Does not claim 6a closed — dual-write and the
-suffix mint remain.
+querySelector the stamp. Does not claim 6a closed — the suffix mint,
+weak-neighbor pairing, and later-block stamps until full-page rebind
+remain.
 """
 import json
 import os

@@ -131,6 +131,19 @@ class RingerListTests(unittest.TestCase):
         ringer = server.compute_ringer_list('docs/page.md')
         self.assertEqual(0, ringer['swallowed'])
 
+    def test_mark_with_only_node_id_still_covers_the_revision(self):
+        """Ringer reads mark_layer_node_id when block_id was not persisted."""
+        self._revision(1, 'Alpha one.', 'Alpha one, revised.')
+        status, row = self._mark(1)
+        self.assertEqual(201, status)
+        self.assertTrue(row.get('mark_layer_node_id'))
+        self.assertIsNone(row.get('block_id'))
+        saved = [c for c in server.read_comments('docs/page.md') if c['id'] == row['id']]
+        self.assertIsNone(saved[0].get('block_id'))
+        self._mark(3)
+        ringer = server.compute_ringer_list('docs/page.md')
+        self.assertEqual(0, ringer['swallowed'])
+
     def test_revision_past_the_last_read_block_is_not_a_ringer(self):
         self._revision(3, 'Charlie three.', 'Charlie three, revised.')
         self._mark(1)

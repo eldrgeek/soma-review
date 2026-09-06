@@ -17,6 +17,7 @@ sys.path.insert(0, V2_DIR)
 import blockmap  # noqa: E402
 import mdblocks  # noqa: E402
 import server  # noqa: E402
+from mark_layer_adapter import to_mark_layer_nodes  # noqa: E402
 
 
 def _git(*args, cwd):
@@ -239,6 +240,37 @@ class ChangeSettleRevertTests(unittest.TestCase):
             server.apply_sentence_revert('docs/page.md', 'estate', mark)
         with open(self.doc, encoding='utf-8') as f:
             self.assertIn('Someone changed it again.', f.read())
+
+    def test_change_via_node_id_without_block_id(self):
+        """apply_sentence_change uses mark_layer_node_id when block_id is gone."""
+        self.write_doc('# Title\n\nOriginal typo sentence here.\n')
+        self.commit_doc()
+        server.render_page('docs/page.md', view='v3')
+        node_id = next(
+            n['id'] for n in to_mark_layer_nodes(open(self.doc, encoding='utf-8').read())
+            if n['kind'] == 'sentence'
+            and n['fragments'][0]['text'].strip() == 'Original typo sentence here.'
+        )
+        row = {
+            'id': 'e-node', 'page': 'docs/page.md', 'type': 'edit',
+            'anchor': None, 'snapshot': 'Original typo sentence here.',
+            'proposed': 'Fixed sentence here.', 'author': 'claude',
+            'text': '(sentence change)', 'timestamp': '2026-09-03T00:00:00Z',
+            'status': 'queued', 'thread_id': 'e-node', 'deleted': False,
+            'block_id': None, 'mark_layer_node_id': node_id,
+            'mark_layer_primary': 'mark_layer_node_id',
+        }
+        change_result = server.apply_sentence_change(
+            'docs/page.md', 'estate', row, author_label='claude',
+        )
+        with open(self.doc, encoding='utf-8') as handle:
+            content = handle.read()
+        self.assertIn('Fixed sentence here.', content)
+        self.assertNotIn('Original typo sentence here.', content)
+        self.assertIsNotNone(change_result.get('html'))
+        self.assertIn('Fixed sentence here.', change_result['html'])
+        # Live id remaps onto the post-write parse so later jump/stale work.
+        self.assertTrue(row.get('mark_layer_node_id'))
 
     def test_change_without_git_repo_still_writes_file(self):
         no_git_root = tempfile.mkdtemp()

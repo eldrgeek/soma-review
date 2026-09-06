@@ -8,7 +8,8 @@ Parity / success gate:
   (e) SOMA_REVIEW_MARK_LAYER_DUAL_WRITE=1 still writes the old fields
   (f) create with only mark_layer_node_id is enough
 
-Does not claim 6a closed — edit-rebind residuals and the item-15 gate remain.
+Does not claim 6a closed — occurrence-suffix mint and the item-15 gate
+remain. block_id identity dual-write is off on location create.
 """
 import json
 import os

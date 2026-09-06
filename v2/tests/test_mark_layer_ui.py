@@ -8,8 +8,10 @@ Parity:
   (e) create with only the node id jumps via id while dual-write is off
   (f) legacy marks without an id still jump via block_id
 
-Does not claim 6a closed — weak-neighbor pairing, later-block stamps,
-and the item-15 gate remain.
+Does not claim 6a closed — occurrence-suffix mint and the item-15
+gate remain. block_id identity dual-write is off on location create;
+edit type still carries block_id+snapshot. Quote/from/to stay as the
+selected span.
 """
 import json
 import os
@@ -53,6 +55,8 @@ class MarkLayerUiSourceTests(unittest.TestCase):
         self.assertIn('function findMarkLayerNodeEl', server.PAGE_JS)
         self.assertIn('function findStampedMarkLayerNodeEl', server.PAGE_JS)
         self.assertIn('function findMarkLayerNodeElByText', server.PAGE_JS)
+        self.assertIn('function applyRerenderedBlocks', server.PAGE_JS)
+        self.assertIn('function applyMergedBlockHtml', server.PAGE_JS)
         self.assertIn("reason: 'missing-id'", server.PAGE_JS)
         self.assertIn("reason: 'not-found'", server.PAGE_JS)
         self.assertIn("via = 'id'", server.PAGE_JS)
@@ -644,6 +648,55 @@ class MarkLayerUiBrowserTests(unittest.TestCase):
         )
         # jumpToBlock may flash the wrap; at least the dialog path must not crash.
         self.assertGreaterEqual(flashed, 0)
+        self.assertEqual([], self.errors)
+
+    def test_edit_early_block_later_duplicate_jump_stays_via_id(self):
+        """Edit the first Ready. block; later duplicate jump stays via:id."""
+        with open(self.doc, 'w', encoding='utf-8') as handle:
+            handle.write(REPEAT_PAGE)
+        snapshot = 'Ready. Unique second context.'
+        status, row = self._post_sentence_mark('Ready.', snapshot)
+        self.assertEqual(201, status)
+        original_id = row['mark_layer_node_id']
+        self._goto_v3()
+        mapping = blockmap.load_map(server.block_map_path('docs/page.md'))
+        first = [b for b in mapping['blocks']
+                 if (b.get('text') or '').startswith('Ready.')][0]
+        status, edit = self._post({
+            'page': 'docs/page.md', 'type': 'edit',
+            'block_id': first['id'],
+            'snapshot': 'Ready. Unique first context.',
+            'proposed': 'Ready. Ready. Unique first context.',
+        })
+        self.assertEqual(201, status)
+        self.assertTrue(edit.get('later_html'))
+        saved = [c for c in server.read_comments('docs/page.md') if c['id'] == row['id']]
+        self.assertEqual(1, len(saved))
+        rebound_id = saved[0]['mark_layer_node_id']
+        self.assertNotEqual(original_id, rebound_id)
+        result = self.page.evaluate(
+            """({data, id}) => {
+                window.applyRerenderedBlocks(data);
+                window.__MARK_LAYER_NODES__ = [];
+                window.__MARK_LAYER_JUMP_STATS__ = {id: 0, fallback: 0};
+                const r = window.jumpToMarkLayerNode(id, {behavior: 'auto', flashMs: 0});
+                return {
+                    ok: r.ok, via: r.via,
+                    text: r.el ? r.el.textContent.trim() : '',
+                    block: r.el && r.el.closest('.block-wrap')
+                        ? atob(r.el.closest('.block-wrap').dataset.normText) : '',
+                    stamped: !!(r.el && r.el.getAttribute('data-mark-layer-node-id') === id),
+                    stats: window.__MARK_LAYER_JUMP_STATS__,
+                };
+            }""",
+            {'data': edit, 'id': rebound_id},
+        )
+        self.assertTrue(result['ok'])
+        self.assertEqual('id', result['via'])
+        self.assertEqual('Ready.', result['text'])
+        self.assertEqual(snapshot, result['block'])
+        self.assertTrue(result['stamped'])
+        self.assertEqual({'id': 1, 'fallback': 0}, result['stats'])
         self.assertEqual([], self.errors)
 
 

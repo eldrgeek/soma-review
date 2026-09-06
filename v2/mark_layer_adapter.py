@@ -28,8 +28,10 @@ creates unless `SOMA_REVIEW_MARK_LAYER_DUAL_WRITE` is explicitly on
 (compat bridge, default off). Readers use the stored id when present
 and fall back to those fields only for legacy rows. 6a stays open
 until edit-rebind is proven against the item-15 view-diff / parity
-gate; named residuals remain (weak-neighbor pairing, later-block
-stamps until full-page rebind, occurrence-suffix mint).
+gate; named residuals remain (occurrence-suffix mint). Weak-neighbor
+pairing no longer position-pairs identical lone paragraphs; unpaired
+old ids miss. Later-block stamps are restamped on the same mid-doc
+edit that remaps sidecar ids (see `_rerender_block`).
 
 Edit-rebind: `align_mark_layer_nodes` maps previous-parse ids onto the
 current parse by unique fingerprint, then neighborhood for duplicates,
@@ -405,17 +407,35 @@ def _alignment_neighbors(
     return neighbors
 
 
-def _neighbor_score(
+def _unique_fingerprints(nodes: list[dict[str, Any]]) -> set[tuple[str, str]]:
+    """Fingerprints that appear on exactly one node — a distinguishing sibling."""
+    counts: dict[tuple[str, str], int] = {}
+    for node in nodes:
+        fp = _node_fingerprint(node)
+        if fp is None:
+            continue
+        counts[fp] = counts.get(fp, 0) + 1
+    return {fp for fp, count in counts.items() if count == 1}
+
+
+def _strong_neighbor_score(
     prev_nb: tuple, next_nb: tuple,
+    unique_prev: set[tuple[str, str]],
+    unique_next: set[tuple[str, str]],
 ) -> int:
-    """Concrete neighbors score higher than shared start/end-of-doc Nones."""
+    """Score only concrete neighbors that are unique on both sides.
+
+    Shared start/end-of-doc Nones and another copy of the same text
+    (Ready. next to Ready.) do not count — those are weak and used to
+    let position-only pairing win when uniqueness failed.
+    """
     score = 0
     for i in range(4):
         a, b = prev_nb[i], next_nb[i]
-        if a is not None and a == b:
+        if a is None or b is None or a != b:
+            continue
+        if a in unique_prev and b in unique_next:
             score += 2
-        elif a is None and b is None:
-            score += 1
     return score
 
 
@@ -442,14 +462,15 @@ def align_mark_layer_nodes(
 
     Pass 1: a (kind, stripped text) fingerprint that is unique on both
     sides pairs (usually the same content-hash id).
-    Pass 2: remaining duplicates pair by neighbor fingerprints so an
-    earlier inserted twin remaps the untouched later occurrence instead
-    of shifting it by occurrence-suffix alone. Position is a weak
-    tie-break when neighbors do not decide.
+    Pass 2: remaining duplicates pair only when a concrete neighbor
+    fingerprint is unique on both sides and the pair is each other's
+    unique best. That remaps an earlier-inserted twin that still sits
+    next to a unique sibling. Identical one-sentence paragraphs with
+    only other copies of themselves as neighbors do not pair — position
+    is not a tie-break. Unpaired old ids are omitted (miss).
 
-    Every pairing is returned, including identity. Unpaired old ids are
-    omitted — that is a named residual (mark may miss after reload).
-    Does not change `_content_id` minting.
+    Every pairing is returned, including identity. Does not change
+    `_content_id` minting.
     """
     prev = [node for node in (prev_nodes or []) if node.get('id')]
     nxt = [node for node in (next_nodes or []) if node.get('id')]
@@ -468,6 +489,8 @@ def align_mark_layer_nodes(
     prev_nb = _alignment_neighbors(prev)
     next_nb = _alignment_neighbors(nxt)
     empty_nb = (None, None, None, None)
+    unique_prev_fps = _unique_fingerprints(prev)
+    unique_next_fps = _unique_fingerprints(nxt)
 
     for fp, prev_idxs in prev_by_fp.items():
         next_idxs = next_by_fp.get(fp) or []
@@ -480,25 +503,51 @@ def align_mark_layer_nodes(
         remaining_next = [i for i in (next_by_fp.get(fp) or []) if i not in used_next]
         if not remaining_prev or not remaining_next:
             continue
-        scored: list[tuple[int, float, int, int]] = []
+
+        def strong_score(pi: int, ni: int) -> int:
+            return _strong_neighbor_score(
+                prev_nb.get(prev[pi]['id'], empty_nb),
+                next_nb.get(nxt[ni]['id'], empty_nb),
+                unique_prev_fps,
+                unique_next_fps,
+            )
+
+        # Mutual unique-best: pair only when one next is this prev's unique
+        # best and this prev is that next's unique best. Ties and score-0
+        # (weak / position-only) stay unpaired — mark may miss.
+        prev_best: dict[int, tuple[int, list[int]]] = {}
         for pi in remaining_prev:
-            p_nb = prev_nb.get(prev[pi]['id'], empty_nb)
+            by_score: dict[int, list[int]] = {}
             for ni in remaining_next:
-                n_nb = next_nb.get(nxt[ni]['id'], empty_nb)
-                pos_penalty = abs(
-                    (pi / max(len(prev), 1)) - (ni / max(len(nxt), 1))
-                )
-                scored.append((_neighbor_score(p_nb, n_nb), -pos_penalty, pi, ni))
-        scored.sort(reverse=True)
-        taken_prev: set[int] = set()
-        taken_next: set[int] = set()
-        for _score, _pen, pi, ni in scored:
-            if pi in taken_prev or ni in taken_next:
+                score = strong_score(pi, ni)
+                if score <= 0:
+                    continue
+                by_score.setdefault(score, []).append(ni)
+            if by_score:
+                best = max(by_score)
+                prev_best[pi] = (best, by_score[best])
+
+        next_best: dict[int, tuple[int, list[int]]] = {}
+        for ni in remaining_next:
+            by_score: dict[int, list[int]] = {}
+            for pi in remaining_prev:
+                score = strong_score(pi, ni)
+                if score <= 0:
+                    continue
+                by_score.setdefault(score, []).append(pi)
+            if by_score:
+                best = max(by_score)
+                next_best[ni] = (best, by_score[best])
+
+        for pi, (p_score, p_nis) in prev_best.items():
+            if len(p_nis) != 1:
+                continue
+            ni = p_nis[0]
+            n_info = next_best.get(ni)
+            if not n_info or n_info[0] != p_score or n_info[1] != [pi]:
                 continue
             remap[prev[pi]['id']] = nxt[ni]['id']
             used_next.add(ni)
-            taken_prev.add(pi)
-            taken_next.add(ni)
     return remap
 
 
@@ -607,7 +656,8 @@ class MarkLayerDomStamper:
     rest of the document. A miss returns None (no stamp) rather than
     lining up a later twin by text; that was the mid-doc-edit drift.
     Remaining residual: occurrence-suffix ids still come from `_content_id`;
-    edit-rebind remaps stored ids onto this parse.
+    edit-rebind remaps stored ids onto this parse. Later blocks after a
+    mid-doc edit are restamped by `_rerender_block`, not left stale.
     """
 
     def __init__(self, nodes: list[dict[str, Any]] | None = None):

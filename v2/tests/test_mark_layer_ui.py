@@ -1,12 +1,12 @@
-"""6a beside: default jump is id→DOM; text-occurrence is fallback only.
+"""6a: create rides mark_layer_node_id; jump is id→DOM; edit-rebind keeps stamps.
 
-Parity for the id→DOM cutover step:
-  (a) rendered sentences/blocks carry data-mark-layer-node-id
-  (b) jumpToMarkLayerNode querySelectors that stamp (not find-by-text)
-  (c) two identical sentences jump to the stamped occurrence, not the first
-  (d) missing id or missing stamp falls back to the old text path and counts it
+Parity:
+  (a) create produces mark_layer_node_id used for jump without text fallback
+  (b) edit that used to break the stamp still jumps via id (or documented remap)
+  (c) two identical sentences stay unique
+  (d) missing stamp still falls back to text and counts it
 
-Does not retire dual-write / old block-parser create path. Does not claim 6a closed.
+Does not retire dual-write. Does not claim 6a closed.
 """
 import json
 import os
@@ -81,12 +81,15 @@ class MarkLayerUiSourceTests(unittest.TestCase):
         self.assertIn('markLayerNodeIdButton(m.markLayerNodeId)', server.MARK_LAYER_JS)
 
     def test_old_path_tokens_still_default(self):
-        # Create/render still rides block_id / .mark-sentence / v3 panel.
+        # Dual-write residual: block_id / .mark-sentence / v3 panel stay live.
         self.assertIn('block_id', server.PAGE_JS)
         self.assertIn('.mark-sentence', server.PAGE_JS)
         self.assertIn('function renderPanel', server.V3_JS)
         self.assertNotIn('/api/mark-layer', server.TUNNEL_ALLOWED_GET)
         self.assertNotIn('/api/mark-layer', server.TUNNEL_ALLOWED_GET_PREFIXES)
+        self.assertTrue(server.MARK_LAYER_DUAL_WRITE)
+        self.assertIn('mark_layer_node_id: span', server.PAGE_JS)
+        self.assertIn('mark_layer_node_id', server.PAGE_JS)
 
     def test_classic_render_does_not_ship_v3_panel(self):
         tmp = tempfile.TemporaryDirectory()
@@ -447,6 +450,109 @@ class MarkLayerUiBrowserTests(unittest.TestCase):
         self.assertEqual({'id': 0, 'fallback': 1}, result['stats'])
         self.assertEqual([], self.errors)
 
+    def test_create_from_dom_stamp_jumps_via_id_without_text_fallback(self):
+        """(a) create writes the stamped id; jump uses it, not quote-text."""
+        self._goto_v3()
+        stamped = self.page.evaluate("""() => {
+            const el = Array.from(document.querySelectorAll('.mark-sentence'))
+                .find(e => e.textContent.trim() === 'Beta is second.');
+            return {
+                id: el && el.getAttribute('data-mark-layer-node-id'),
+                wrapId: el && el.closest('.block-wrap').dataset.blockId,
+            };
+        }""")
+        self.assertTrue(stamped['id'])
+        status, row = self._post({
+            'page': 'docs/page.md', 'type': 'mark', 'mark_kind': 'ack',
+            'block_id': stamped['wrapId'], 'from': 16, 'to': 31,
+            'quote': 'Beta is second.',
+            'snapshot': 'Alpha is first. Beta is second. Gamma is third.',
+            'mark_layer_node_id': stamped['id'],
+        })
+        self.assertEqual(201, status)
+        self.assertEqual(stamped['id'], row['mark_layer_node_id'])
+        self.assertEqual('mark_layer_node_id', row.get('mark_layer_primary'))
+        self.page.reload()
+        self.page.wait_for_selector('.mark-sentence')
+        result = self.page.evaluate(
+            """(id) => {
+                window.__MARK_LAYER_NODES__ = [];
+                window.__MARK_LAYER_JUMP_STATS__ = {id: 0, fallback: 0};
+                const r = window.jumpToMarkLayerNode(id, {behavior: 'auto', flashMs: 0});
+                return {
+                    ok: r.ok, via: r.via,
+                    text: r.el ? r.el.textContent.trim() : '',
+                    stamped: !!(r.el && r.el.getAttribute('data-mark-layer-node-id') === id),
+                    stats: window.__MARK_LAYER_JUMP_STATS__,
+                };
+            }""",
+            row['mark_layer_node_id'],
+        )
+        self.assertTrue(result['ok'])
+        self.assertEqual('id', result['via'])
+        self.assertEqual('Beta is second.', result['text'])
+        self.assertTrue(result['stamped'])
+        self.assertEqual({'id': 1, 'fallback': 0}, result['stats'])
+        self.assertEqual([], self.errors)
+
+    def test_edit_rebind_after_earlier_duplicate_still_jumps_via_id(self):
+        """(b) insert an earlier Ready. — stored id remaps; jump stays via id."""
+        with open(self.doc, 'w', encoding='utf-8') as handle:
+            handle.write(REPEAT_PAGE)
+        snapshot = 'Ready. Unique second context.'
+        status, row = self._post_sentence_mark('Ready.', snapshot)
+        self.assertEqual(201, status)
+        original_id = row['mark_layer_node_id']
+        ready_before = [
+            n['id'] for n in to_mark_layer_nodes(REPEAT_PAGE)
+            if n['kind'] == 'sentence' and n['fragments'][0]['text'].strip() == 'Ready.'
+        ]
+        self.assertEqual(ready_before[1], original_id)
+
+        after = (
+            '# Review title\n\n'
+            'Ready. Brand new context.\n\n'
+            'Ready. Unique first context.\n\n'
+            'Ready. Unique second context.\n'
+        )
+        with open(self.doc, 'w', encoding='utf-8') as handle:
+            handle.write(after)
+        self._goto_v3()
+        saved = [c for c in server.read_comments('docs/page.md') if c['id'] == row['id']]
+        self.assertEqual(1, len(saved))
+        rebound_id = saved[0]['mark_layer_node_id']
+        ready_after = [
+            n['id'] for n in to_mark_layer_nodes(after)
+            if n['kind'] == 'sentence' and n['fragments'][0]['text'].strip() == 'Ready.'
+        ]
+        self.assertEqual(ready_after[2], rebound_id)
+        self.assertNotEqual(original_id, rebound_id)
+
+        result = self.page.evaluate(
+            """(id) => {
+                window.__MARK_LAYER_NODES__ = [];
+                window.__MARK_LAYER_JUMP_STATS__ = {id: 0, fallback: 0};
+                const r = window.jumpToMarkLayerNode(id, {behavior: 'auto', flashMs: 0});
+                return {
+                    ok: r.ok, via: r.via,
+                    text: r.el ? r.el.textContent.trim() : '',
+                    block: r.el && r.el.closest('.block-wrap')
+                        ? atob(r.el.closest('.block-wrap').dataset.normText) : '',
+                    stamped: !!(r.el && r.el.getAttribute('data-mark-layer-node-id') === id),
+                    stats: window.__MARK_LAYER_JUMP_STATS__,
+                };
+            }""",
+            rebound_id,
+        )
+        self.assertTrue(result['ok'])
+        self.assertEqual('id', result['via'])
+        self.assertEqual('Ready.', result['text'])
+        self.assertEqual(snapshot, result['block'])
+        self.assertTrue(result['stamped'])
+        self.assertEqual({'id': 1, 'fallback': 0}, result['stats'])
+        self.assertEqual([], self.errors)
+
 
 if __name__ == '__main__':
     unittest.main()
+

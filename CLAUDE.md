@@ -1286,6 +1286,27 @@ increments `window.__MARK_LAYER_JUMP_STATS__.fallback`. Old `block_id` / quote
 create path and dual-write stay until a parity gate retires them. Twin emitter
 stays. 6a stays open.
 
+**6a beside (2026-09-06), create rides node id + edit-rebind, not closed:**
+`POST /api/comments` type=mark now treats `mark_layer_node_id` as the primary
+create record (`mark_layer_primary: mark_layer_node_id`). The client sends the
+DOM stamp from `blockPayload`; the server prefers that id when it still exists
+in the current parse, else unique quote/snapshot match. After a content edit,
+`align_mark_layer_nodes` maps the previous parse onto the new one (unique
+fingerprint, then paragraph-group neighbors for duplicates) and
+`rebind_mark_layer_node_ids` rewrites sidecar ids so a later `querySelector`
+still hits the same sentence. Stamper `next_sentence` no longer searches the
+whole document for a text twin (that was the mid-doc-edit miss → silent
+text-fallback). Residuals, named not hidden: (1) old `block_id` / quote /
+snapshot stay dual-written — `apply_sentence_change`, ringer, and v3 stale
+still consume them; `SOMA_REVIEW_MARK_LAYER_DUAL_WRITE` documents the flag,
+stripping is not implemented; (2) `_content_id` occurrence-suffix minting is
+unchanged (Playmaker twin); rebind accounts the remap when neighbors decide,
+but identical one-sentence paragraphs with no distinguishing sibling can still
+pair by position; (3) item-15 view-diff / parity gate is not run here. Twin
+emitter stays. Out of scope: Playmaker Fountain `[[SCENE:]]` / P1 Doc export;
+P2 rrweb harness. **6a stays open** until dual-write is fully retired AND
+edit-rebind is proven against that gate. Do not claim 6a closed.
+
 ## Authorship
 
 v2 built 2026-07-02 by Dee (Claude Sonnet 5, engineering-lead/COO role) per Mike's spec

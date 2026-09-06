@@ -13,17 +13,28 @@ prerequisite named in `playmaker/docs/MARK-LAYER-ENGINE.md` "Next" item 1
 ("soma-review consumption") before the live block parser can be rewired to
 produce it.
 
-Write-side beside-step (2026-09-06): `POST /api/comments` type=mark now
-calls `attach_mark_layer_node_ids` so a new mark can carry the matching
-node id. Default jump/render prefers that stored id when the live DOM
-carries a matching `data-mark-layer-node-id` stamp (`MarkLayerDomStamper`
-walks these nodes in document order while `mark_layer_inner` renders).
-Text-occurrence lookup remains the fallback, not the default, when the
-id or stamp is missing. The live comment/mark *create* path is still the
-old block-parser / `block_id` / quote fields — this module is not the
-default writer. Wiring the live block-parse response itself to *emit*
-this shape (and retiring dual-write) is the remaining cutover
-(agreed-model 6a + item 15), still open.
+Write-side (2026-09-06, create rides the node): `POST /api/comments`
+type=mark treats `mark_layer_node_id` as the primary anchoring record.
+`attach_mark_layer_node_ids` prefers a client-supplied stamp id that
+still exists in the current parse, then unique quote/snapshot match.
+Default jump/render is that stored id → DOM `data-mark-layer-node-id`
+(`MarkLayerDomStamper` walks these nodes in document order).
+Text-occurrence lookup remains the counted fallback when the id or
+stamp is missing.
+
+Old `block_id` / quote / snapshot stay dual-written because
+`apply_sentence_change`, the ringer list, and v3 stale detection still
+consume them. That dual-write is a named residual (item-15 view-diff /
+parity gate), not the default create identity. 6a stays open until
+dual-write is retired AND edit-rebind is proven.
+
+Edit-rebind: `align_mark_layer_nodes` maps previous-parse ids onto the
+current parse by unique fingerprint, then neighborhood for duplicates,
+so an earlier inserted twin remaps the stored id instead of silently
+falling back to text. `rebind_mark_layer_node_ids` applies that map to
+sidecar rows. Occurrence-suffix minting in `_content_id` is unchanged
+(Playmaker twin); rebind accounts the remap rather than claiming the
+suffix is stable.
 
 **Fixed 2026-09-05 (mission-1, same day as the module's first slice): node
 ids are now content-derived, not a call-scoped counter.** `_next_id` used to
@@ -71,14 +82,13 @@ would read two untouched nodes as deleted-and-recreated, purely because an
 unrelated sibling with the same text was inserted earlier in the doc. This
 is the same failure SHAPE Anchoring v2 exists to prevent (`blockmap.py`),
 one layer down: content-hash ids are stable, but the occurrence COUNTER
-layered on top to break ties is itself position-derived. **UI can display/jump via a stored id** (additive chip +
-`jumpToMarkLayerNode`); the default create path is still the old
-block-parser fields — but whoever wires the real cross-edit
-diffing use case (as opposed to idempotent re-parse of one static document,
-e.g. on server restart) MUST solve real disambiguation first, or two runs
-of identical content anywhere in the same document will falsely appear to
-move/change across every edit that happens to touch an EARLIER occurrence
-of that text.
+layered on top to break ties is itself position-derived. Create now writes `mark_layer_node_id` as the primary record (client
+stamp id, else unique match). Cross-edit identity is `align_mark_layer_nodes`
++ sidecar rebind, not a change to `_content_id` minting — the suffix
+still shifts in the twin emitter; rebind accounts that remap so a stored
+id keeps querySelector-hitting the same sentence (or a named unpaired
+residual). Do not claim 6a closed while dual-write and the suffix mint
+remain load-bearing.
 
 **Known gap, still flagged rather than fixed:**
 
@@ -297,27 +307,231 @@ def match_mark_layer_nodes(
     return []
 
 
-def attach_mark_layer_node_ids(record: dict[str, Any], page_src: str) -> dict[str, Any]:
-    """Additively stamp `mark_layer_node_id` / `mark_layer_node_ids` on a mark.
+def _node_fingerprint(node: dict[str, Any] | None) -> tuple[str, str] | None:
+    if not node:
+        return None
+    return (str(node.get('kind') or ''), _node_text(node).strip())
 
-    Best-effort and never load-bearing: any adapter failure, empty node list,
-    or unmatched quote leaves `record` unchanged (no new keys). Does not
-    raise. Existing anchor/quote/snapshot/block_id fields are not touched.
+
+def _group_fingerprint(
+    group: tuple[dict[str, Any] | None, list[dict[str, Any]]],
+) -> tuple[str, str] | None:
+    para, sents = group
+    if para is not None:
+        return _node_fingerprint(para)
+    if sents:
+        return _node_fingerprint(sents[0])
+    return None
+
+
+def _alignment_neighbors(
+    nodes: list[dict[str, Any]],
+) -> dict[str, tuple[tuple[str, str] | None, tuple[str, str] | None,
+                     tuple[str, str] | None, tuple[str, str] | None]]:
+    """Per-id context: (prev group, next group, intra-left, intra-right).
+
+    Group neighbors survive inserting an earlier duplicate of the same
+    sentence: the untouched occurrence still sits next to the same
+    sibling paragraph. Intra-group neighbors distinguish two Ready.
+    sentences that live in different unique paragraphs.
+    """
+    groups = _paragraph_groups(nodes)
+    neighbors: dict[str, tuple] = {}
+    for gi, (para, sents) in enumerate(groups):
+        prev_g = _group_fingerprint(groups[gi - 1]) if gi > 0 else None
+        next_g = _group_fingerprint(groups[gi + 1]) if gi + 1 < len(groups) else None
+        seq = ([para] if para is not None else []) + list(sents)
+        for i, node in enumerate(seq):
+            nid = node.get('id')
+            if not nid:
+                continue
+            left = _node_fingerprint(seq[i - 1]) if i > 0 else None
+            right = _node_fingerprint(seq[i + 1]) if i + 1 < len(seq) else None
+            neighbors[nid] = (prev_g, next_g, left, right)
+    return neighbors
+
+
+def _neighbor_score(
+    prev_nb: tuple, next_nb: tuple,
+) -> int:
+    """Concrete neighbors score higher than shared start/end-of-doc Nones."""
+    score = 0
+    for i in range(4):
+        a, b = prev_nb[i], next_nb[i]
+        if a is not None and a == b:
+            score += 2
+        elif a is None and b is None:
+            score += 1
+    return score
+
+
+def _ids_for_matched_node(
+    nodes: list[dict[str, Any]], hit: dict[str, Any],
+) -> list[str]:
+    """Sentence id first, then its paragraph parent — same shape as match()."""
+    ids = [hit['id']] if hit.get('id') else []
+    if hit.get('kind') != 'sentence':
+        return ids
+    for para, sents in _paragraph_groups(nodes):
+        if any(sent.get('id') == hit.get('id') for sent in sents):
+            if para is not None and para.get('id') and para.get('id') not in ids:
+                ids.append(para['id'])
+            break
+    return ids
+
+
+def align_mark_layer_nodes(
+    prev_nodes: list[dict[str, Any]] | None,
+    next_nodes: list[dict[str, Any]] | None,
+) -> dict[str, str]:
+    """Map previous-parse node ids onto the current parse.
+
+    Pass 1: a (kind, stripped text) fingerprint that is unique on both
+    sides pairs (usually the same content-hash id).
+    Pass 2: remaining duplicates pair by neighbor fingerprints so an
+    earlier inserted twin remaps the untouched later occurrence instead
+    of shifting it by occurrence-suffix alone. Position is a weak
+    tie-break when neighbors do not decide.
+
+    Every pairing is returned, including identity. Unpaired old ids are
+    omitted — that is a named residual (mark may miss after reload).
+    Does not change `_content_id` minting.
+    """
+    prev = [node for node in (prev_nodes or []) if node.get('id')]
+    nxt = [node for node in (next_nodes or []) if node.get('id')]
+    if not prev or not nxt:
+        return {}
+
+    prev_by_fp: dict[tuple[str, str], list[int]] = {}
+    next_by_fp: dict[tuple[str, str], list[int]] = {}
+    for index, node in enumerate(prev):
+        prev_by_fp.setdefault(_node_fingerprint(node), []).append(index)
+    for index, node in enumerate(nxt):
+        next_by_fp.setdefault(_node_fingerprint(node), []).append(index)
+
+    remap: dict[str, str] = {}
+    used_next: set[int] = set()
+    prev_nb = _alignment_neighbors(prev)
+    next_nb = _alignment_neighbors(nxt)
+    empty_nb = (None, None, None, None)
+
+    for fp, prev_idxs in prev_by_fp.items():
+        next_idxs = next_by_fp.get(fp) or []
+        if len(prev_idxs) == 1 and len(next_idxs) == 1:
+            remap[prev[prev_idxs[0]]['id']] = nxt[next_idxs[0]]['id']
+            used_next.add(next_idxs[0])
+
+    for fp, prev_idxs in prev_by_fp.items():
+        remaining_prev = [i for i in prev_idxs if prev[i]['id'] not in remap]
+        remaining_next = [i for i in (next_by_fp.get(fp) or []) if i not in used_next]
+        if not remaining_prev or not remaining_next:
+            continue
+        scored: list[tuple[int, float, int, int]] = []
+        for pi in remaining_prev:
+            p_nb = prev_nb.get(prev[pi]['id'], empty_nb)
+            for ni in remaining_next:
+                n_nb = next_nb.get(nxt[ni]['id'], empty_nb)
+                pos_penalty = abs(
+                    (pi / max(len(prev), 1)) - (ni / max(len(nxt), 1))
+                )
+                scored.append((_neighbor_score(p_nb, n_nb), -pos_penalty, pi, ni))
+        scored.sort(reverse=True)
+        taken_prev: set[int] = set()
+        taken_next: set[int] = set()
+        for _score, _pen, pi, ni in scored:
+            if pi in taken_prev or ni in taken_next:
+                continue
+            remap[prev[pi]['id']] = nxt[ni]['id']
+            used_next.add(ni)
+            taken_prev.add(pi)
+            taken_next.add(ni)
+    return remap
+
+
+def rebind_mark_layer_node_ids(
+    records: list[dict[str, Any]],
+    remap: dict[str, str],
+    only_ids: set[str] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+    """Apply an align() remap to stored mark_layer_node_id fields.
+
+    Identity remaps are left untouched (no sidecar write). `only_ids`
+    restricts to records whose current node id is in that set — used
+    when only one block was restamped. Returns (records, applied) where
+    applied lists {record_id, from, to} for every real change.
+    """
+    applied: list[dict[str, str]] = []
+    if not remap:
+        return records, applied
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        old = record.get('mark_layer_node_id')
+        if not old or old not in remap:
+            continue
+        if only_ids is not None and old not in only_ids:
+            continue
+        new = remap[old]
+        if not new or new == old:
+            continue
+        record['mark_layer_node_id'] = new
+        ids = [str(item) for item in (record.get('mark_layer_node_ids') or []) if item]
+        record['mark_layer_node_ids'] = [remap.get(item, item) for item in ids] or [new]
+        record['mark_layer_node_rebound'] = {'from': old, 'to': new}
+        applied.append({
+            'record_id': str(record.get('id') or ''),
+            'from': old,
+            'to': new,
+        })
+    return records, applied
+
+
+def attach_mark_layer_node_ids(
+    record: dict[str, Any],
+    page_src: str | None,
+    nodes: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Write `mark_layer_node_id` / `mark_layer_node_ids` as the create record.
+
+    Prefers a client-supplied id that still exists in the current parse
+    (the DOM stamp at mark time). Otherwise unique quote/snapshot match.
+    Adapter failure, empty nodes, or unmatched quote leave the record
+    without a node id — page-level / ambiguous marks still persist.
+    Does not raise. Existing block_id/quote/snapshot are not stripped
+    (dual-write residual).
     """
     try:
-        if not isinstance(record, dict) or not isinstance(page_src, str):
+        if not isinstance(record, dict):
             return record
+        if nodes is None:
+            if not isinstance(page_src, str):
+                return record
+            nodes = to_mark_layer_nodes(page_src)
+        if not nodes:
+            return record
+        supplied = record.get('mark_layer_node_id')
+        if supplied:
+            hit = next((node for node in nodes if node.get('id') == supplied), None)
+            if hit is not None:
+                ids = _ids_for_matched_node(nodes, hit)
+                if ids:
+                    record['mark_layer_node_id'] = ids[0]
+                    record['mark_layer_node_ids'] = ids
+                    return record
         matched = match_mark_layer_nodes(
-            to_mark_layer_nodes(page_src),
+            nodes,
             quote=record.get('quote'),
             snapshot=record.get('snapshot'),
         )
         ids = [node['id'] for node in matched if node.get('id')]
         if not ids:
+            if supplied:
+                record.pop('mark_layer_node_id', None)
+                record.pop('mark_layer_node_ids', None)
             return record
         record['mark_layer_node_id'] = ids[0]
         record['mark_layer_node_ids'] = ids
-    except Exception:  # noqa: BLE001 — attach is beside-only; never fail a write
+    except Exception:  # noqa: BLE001 — attach must never fail a mark write
         return record
     return record
 
@@ -327,14 +541,17 @@ class MarkLayerDomStamper:
 
     Live HTML is produced by `parse_markdown` + `sentence_ranges`; adapter
     nodes come from `to_mark_layer_nodes` (blank-line split +
-    `segment_sentences`). This walker lines the two up by stripped / normed
-    text and consumes matches so a repeated sentence in a later block gets
-    that occurrence's id (`pmsent-…-1`), not the first hit.
+    `segment_sentences`). The walker consumes unused groups/sentences
+    forward so a later duplicate gets `pmsent-…-1`, not the first hit.
 
-    `bind_block` stamps the paragraph node on `.block-wrap`.
-    `next_sentence` stamps the sentence node on `.mark-sentence`.
-    A miss returns None — the renderer omits the attribute and jump falls
-    back to the old text-occurrence path.
+    `bind_block` prefers the next unused group when its text matches
+    (positional), then scans forward for a text match so a list/table
+    sitting between prose groups is skipped rather than stealing a stamp.
+    `next_sentence` stays inside the bound group — it does not search the
+    rest of the document. A miss returns None (no stamp) rather than
+    lining up a later twin by text; that was the mid-doc-edit drift.
+    Remaining residual: occurrence-suffix ids still come from `_content_id`;
+    edit-rebind remaps stored ids onto this parse.
     """
 
     def __init__(self, nodes: list[dict[str, Any]] | None = None):
@@ -344,6 +561,18 @@ class MarkLayerDomStamper:
         self._next_sentence = 0
         self._used_sentence_ids: set[str] = set()
 
+    def _group_matches(self, para: dict[str, Any] | None, needle: str, needle_norm: str) -> bool:
+        if para is None:
+            return False
+        text = _node_text(para).strip()
+        heading_stripped = _HEADING_RE.sub('', text).strip()
+        return bool(
+            text == needle
+            or heading_stripped == needle
+            or norm(text) == needle_norm
+            or (heading_stripped and norm(heading_stripped) == needle_norm)
+        )
+
     def bind_block(self, block_text: str) -> str | None:
         """Consume the next unused paragraph group matching `block_text`."""
         needle = (block_text or '').strip()
@@ -352,23 +581,23 @@ class MarkLayerDomStamper:
             self._next_sentence = 0
             return None
         needle_norm = norm(needle)
+        # Prefer the next unused group when it already matches — do not
+        # skip ahead to a later twin just because a search would find it.
+        if self._next_group < len(self._groups):
+            para, sents = self._groups[self._next_group]
+            if self._group_matches(para, needle, needle_norm):
+                self._next_group += 1
+                self._current_sentences = sents
+                self._next_sentence = 0
+                return para.get('id') if para is not None else None
         for i in range(self._next_group, len(self._groups)):
             para, sents = self._groups[i]
-            if para is None:
-                continue
-            text = _node_text(para).strip()
-            heading_stripped = _HEADING_RE.sub('', text).strip()
-            if not (
-                text == needle
-                or heading_stripped == needle
-                or norm(text) == needle_norm
-                or (heading_stripped and norm(heading_stripped) == needle_norm)
-            ):
+            if not self._group_matches(para, needle, needle_norm):
                 continue
             self._next_group = i + 1
             self._current_sentences = sents
             self._next_sentence = 0
-            return para.get('id')
+            return para.get('id') if para is not None else None
         self._current_sentences = []
         self._next_sentence = 0
         return None
@@ -382,8 +611,21 @@ class MarkLayerDomStamper:
                 if sid:
                     self._used_sentence_ids.add(sid)
 
+    def bound_node_ids(self) -> set[str]:
+        """Paragraph + sentence ids of the group `bind_block` just opened."""
+        ids: set[str] = set()
+        for sent in self._current_sentences:
+            sid = sent.get('id')
+            if sid:
+                ids.add(sid)
+        return ids
+
     def next_sentence(self, quote: str) -> str | None:
-        """Consume the next unused sentence whose stripped text equals `quote`."""
+        """Consume the next unused sentence in the bound group matching `quote`.
+
+        No document-wide text search: a miss is unstamped. Jump may fall
+        back to text-occurrence; that path is counted, not the default.
+        """
         needle = (quote or '').strip()
         if not needle:
             return None
@@ -397,14 +639,6 @@ class MarkLayerDomStamper:
                 if sid:
                     self._used_sentence_ids.add(sid)
                 return sid
-        for _para, sents in self._groups:
-            for sent in sents:
-                sid = sent.get('id')
-                if not sid or sid in self._used_sentence_ids:
-                    continue
-                if _node_text(sent).strip() == needle:
-                    self._used_sentence_ids.add(sid)
-                    return sid
         return None
 
 

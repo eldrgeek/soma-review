@@ -1,12 +1,12 @@
-"""6a beside: new marks store MarkLayerNode ids; old wire path stays default.
+"""6a create rides MarkLayerNode id; old wire fields stay dual-written.
 
-Parity / success gate for the first write-side slice:
+Parity / success gate:
   (a) a mark on a known sentence gets a stable node id matching the adapter
-  (b) old wire fields are still present and unchanged in shape
+  (b) old wire fields are still present (dual-write residual)
   (c) pages without nodes still create marks (graceful no-op on attach)
+  (d) a client-supplied stamp id is the primary record, even for repeats
 
-Does not rewire the live comment/mark client. Does not delete the twin
-emitter. 6a stays open until live UI rides nodes.
+Does not retire dual-write. Does not claim 6a closed.
 """
 import json
 import os
@@ -170,9 +170,9 @@ class MarkLayerAttachHTTPTests(unittest.TestCase):
         self.assertEqual('Beta is precise.', row['proposed'])
         self.assertEqual('Less vague', row['reason'])
         self.assertEqual(2.0, row['strength'])
-        # Additive only — node ids sit beside the old fields, they do not
-        # replace them.
+        # Node id is the primary create record; old fields stay dual-written.
         self.assertIn('mark_layer_node_id', row)
+        self.assertEqual('mark_layer_node_id', row.get('mark_layer_primary'))
         self.assertNotEqual(row['mark_layer_node_id'], row['block_id'])
 
     def test_page_without_nodes_still_creates_mark(self):
@@ -269,6 +269,32 @@ class MarkLayerAttachHTTPTests(unittest.TestCase):
         self.assertEqual(201, status2)
         self.assertNotIn('mark_layer_node_id', row2)
         self.assertNotIn('mark_layer_node_ids', row2)
+
+    def test_supplied_stamp_id_is_the_primary_create_record(self):
+        # Unscoped repeated quote used to miss attach; the client stamp wins.
+        self.write_doc(REPEAT_PAGE)
+        server.render_page('docs/page.md')
+        mapping = blockmap.load_map(server.block_map_path('docs/page.md'))
+        second = [row for row in mapping['blocks']
+                  if (row.get('text') or '').startswith('Ready.')][1]
+        with open(self.doc, encoding='utf-8') as handle:
+            src = handle.read()
+        expected = [
+            n for n in to_mark_layer_nodes(src)
+            if n['kind'] == 'sentence'
+            and n['fragments'][0]['text'].strip() == 'Ready.'
+        ]
+        status, row = self._post({
+            'page': 'docs/page.md', 'type': 'mark', 'mark_kind': 'ack',
+            'block_id': second['id'], 'from': 0, 'to': 6,
+            'quote': 'Ready.',
+            'mark_layer_node_id': expected[1]['id'],
+        })
+        self.assertEqual(201, status)
+        self.assertEqual(expected[1]['id'], row['mark_layer_node_id'])
+        self.assertEqual('mark_layer_node_id', row.get('mark_layer_primary'))
+        saved = [c for c in server.read_comments('docs/page.md') if c['id'] == row['id']]
+        self.assertEqual(expected[1]['id'], saved[0]['mark_layer_node_id'])
 
 
 if __name__ == '__main__':

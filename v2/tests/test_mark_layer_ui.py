@@ -8,11 +8,10 @@ Parity:
   (e) create with only the node id jumps via id while dual-write is off
   (f) legacy marks without an id still jump via block_id
 
-Does not claim 6a closed — twin `-{n}` mint and the item-15
-gate remain. Remap ledger is the identity model for suffix drift.
-block_id identity dual-write is off on location create;
-edit type still carries block_id+snapshot. Quote/from/to stay as the
-selected span.
+Does not claim 6a closed — twin still stamps live DOM. Remap ledger
+is the identity model for suffix drift. block_id identity dual-write
+is off on location create and type=edit. Quote/from/to stay as the
+selected span. Old beside is off when an id is present.
 """
 import json
 import os
@@ -111,20 +110,24 @@ class MarkLayerUiSourceTests(unittest.TestCase):
         self.assertIn('markLayerNodeId:c.mark_layer_node_id || null', server.MARK_LAYER_JS)
         self.assertIn('markLayerNodeIdButton(m.markLayerNodeId)', server.MARK_LAYER_JS)
 
-    def test_old_path_tokens_still_default(self):
+    def test_old_path_tokens_remain_for_legacy_only(self):
         # Legacy tokens stay in the client for fallback / hydrated GET.
-        # Dual-write of those fields is off unless the env flag is on.
+        # Dual-write and beside are off unless their env flags are on.
         self.assertIn('block_id', server.PAGE_JS)
         self.assertIn('.mark-sentence', server.PAGE_JS)
         self.assertIn('function renderPanel', server.V3_JS)
+        self.assertIn('function jumpToMark', server.V3_JS)
         self.assertNotIn('/api/mark-layer', server.TUNNEL_ALLOWED_GET)
         self.assertNotIn('/api/mark-layer', server.TUNNEL_ALLOWED_GET_PREFIXES)
         self.assertFalse(server.mark_layer_dual_write_enabled())
+        self.assertFalse(server.mark_layer_beside_enabled())
         self.assertFalse(server.MARK_LAYER_DUAL_WRITE)
         self.assertIn('function commentBlockId', server.PAGE_JS)
         self.assertIn('function markIsStale', server.PAGE_JS)
         self.assertIn('mark_layer_node_id: span', server.PAGE_JS)
         self.assertIn('mark_layer_node_id', server.PAGE_JS)
+        self.assertIn('jumpToMark(m)', server.V3_JS)
+        self.assertIn('jumpToMark(next)', server.V3_JS)
 
     def test_classic_render_does_not_ship_v3_panel(self):
         tmp = tempfile.TemporaryDirectory()

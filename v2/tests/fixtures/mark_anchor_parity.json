@@ -55,5 +55,15 @@
       "mark_occurrence": 1,
       "expect_accounted": ["unpaired-miss"]
     }
+  ],
+  "edit_applies": [
+    {
+      "id": "edit-unique-reattach",
+      "before": "# Review title\n\nAlpha is first. Beta is second. Gamma is third.\n",
+      "mark_quote": "Beta is second.",
+      "mark_snapshot": "Beta is second.",
+      "proposed": "Beta is precise.",
+      "expect_accounted": ["edit-id-reattach"]
+    }
   ]
 }

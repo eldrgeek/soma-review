@@ -359,24 +359,39 @@ def block_map_path(route_path, workspace=DEFAULT_WORKSPACE):
     return os.path.join(ws['feedback_dir'], page_slug(route_path) + '.blocks.json')
 
 
-# Compat bridge only (default off). Unique-match location marks persist
-# mark_layer_node_id as the sole anchoring write. Set this to 1/true/yes
-# to keep writing block_id/quote/snapshot alongside the id. Readers use
-# the id when present and fall back to those fields for legacy rows.
+# Compat bridges only (default off). Unique-match marks persist
+# mark_layer_node_id as the sole anchoring write. Set
+# SOMA_REVIEW_MARK_LAYER_DUAL_WRITE to keep writing block_id/quote/snapshot
+# alongside the id. Set SOMA_REVIEW_MARK_LAYER_BESIDE to keep the old
+# block_id/quote resolve as a live fallthrough when a stored id is present
+# but the stamp misses. Readers use the id when present and fall back to
+# those fields only for legacy rows (no id) or when a flag is on.
 _LEGACY_ANCHOR_KEYS = (
     'block_id', 'from', 'to', 'quote', 'origin_quote', 'block_text_sha',
 )
 
 
+def _env_flag_on(name, default='0'):
+    return os.environ.get(name, default).strip().lower() in ('1', 'true', 'yes')
+
+
 def mark_layer_dual_write_enabled():
-    return os.environ.get('SOMA_REVIEW_MARK_LAYER_DUAL_WRITE', '0').strip().lower() in (
-        '1', 'true', 'yes',
-    )
+    return _env_flag_on('SOMA_REVIEW_MARK_LAYER_DUAL_WRITE')
+
+
+def mark_layer_beside_enabled():
+    """Old block_id/quote resolve beside a present mark_layer_node_id.
+
+    Default off: an id-bearing row does not fall through to the old
+    path. Legacy rows with no id still use block_id/quote.
+    """
+    return _env_flag_on('SOMA_REVIEW_MARK_LAYER_BESIDE')
 
 
 # Default-off snapshot of the flag at import time. Live checks use
 # mark_layer_dual_write_enabled() so tests can toggle the env var.
 MARK_LAYER_DUAL_WRITE = mark_layer_dual_write_enabled()
+MARK_LAYER_BESIDE = mark_layer_beside_enabled()
 
 
 def mark_layer_nodes_cache_path(route_path, workspace=DEFAULT_WORKSPACE):
@@ -966,8 +981,10 @@ function escapeHtml(s) {
 // on the rendered sentence/block). Text-occurrence lookup is fallback only
 // when the id or stamp is missing — counted on __MARK_LAYER_JUMP_STATS__.
 // Create rides the same id: blockPayload/postComment send the stamp.
-// Dual-write of block_id/quote is off by default; readers use the id
-// when present. A missing id is a no-op (no chip, no throw).
+// Dual-write of block_id is off by default; readers use the id
+// when present. Old block_id/quote jump is not the live path when
+// an id is present (stop beside). A missing id is a no-op (no chip,
+// no throw).
 function markLayerNodeText(node) {
   if (!node || !Array.isArray(node.fragments)) return '';
   return node.fragments.map(f => (f && f.text) || '').join('').trim();
@@ -3066,6 +3083,19 @@ V3_JS = r"""
     showBackChip();
     el.scrollIntoView({block:'center', behavior:'smooth'});
   }
+  function jumpToMark(m, opts){
+    // Live jump: stored mark_layer_node_id → DOM stamp. Old block_id
+    // path is only for legacy rows with no id (stop beside).
+    if (m && m.mark_layer_node_id && typeof jumpToMarkLayerNode === 'function') {
+      backStack.push(window.scrollY);
+      const r = jumpToMarkLayerNode(m.mark_layer_node_id, opts || {behavior:'smooth'});
+      if (r && r.ok) showBackChip();
+      else backStack.pop();
+      return r || {ok: false, reason: 'not-found', via: null};
+    }
+    jumpToBlock(commentBlockId(m));
+    return {ok: !!commentBlockId(m), via: 'block'};
+  }
   function jumpToAnchor(id){
     const target = document.getElementById(id) || document.querySelector(`.block-wrap[data-block-id="${CSS.escape(id)}"]`);
     if (!target) return false;
@@ -3297,7 +3327,7 @@ V3_JS = r"""
   function advanceAfterResolve(m){
     const next = nextOpenMark(m.id);
     if (next) {
-      jumpToBlock(commentBlockId(next));
+      jumpToMark(next);
       openDialog(allRows.find(r => r.id === next.id) || next);
     } else {
       document.getElementById('v3-done-btn')?.focus();
@@ -3457,7 +3487,7 @@ V3_JS = r"""
     backdrop.querySelector('[data-v3-close]').addEventListener('click', () => backdrop.remove());
     if (typeof wireMarkLayerNodeIdButtons === 'function') wireMarkLayerNodeIdButtons(backdrop);
     backdrop.querySelector('[data-v3-scroll]')?.addEventListener('click', () => {
-      jumpToBlock(commentBlockId(m));
+      jumpToMark(m);
     });
     backdrop.querySelector('[data-v3-resolve]')?.addEventListener('click', async () => {
       await setStatus(m, 'done');
@@ -3519,8 +3549,14 @@ V3_JS = r"""
     });
     backdrop.querySelector('[data-v3-edit-more]')?.addEventListener('click', () => {
       backdrop.remove();
-      jumpToBlock(commentBlockId(m));
-      const wrap = document.querySelector(`.block-wrap[data-block-id="${CSS.escape(commentBlockId(m))}"]`);
+      jumpToMark(m);
+      let wrap = null;
+      if (m.mark_layer_node_id && typeof findStampedMarkLayerNodeEl === 'function') {
+        const el = findStampedMarkLayerNodeEl(m.mark_layer_node_id);
+        wrap = el && el.closest && el.closest('.block-wrap');
+      } else if (commentBlockId(m)) {
+        wrap = document.querySelector(`.block-wrap[data-block-id="${CSS.escape(commentBlockId(m))}"]`);
+      }
       const body = wrap && wrap.querySelector('.block-body');
       if (wrap && body && typeof enterEditMode === 'function') enterEditMode(wrap, body);
     });
@@ -4175,12 +4211,13 @@ class BindingConflict(Exception):
 def maybe_attach_mark_layer_nodes(comment, page, workspace):
     """Write mark_layer_node_id as the sole required create record. Never raises.
 
-    Prefers a client-supplied stamp id already on `comment` that agrees
-    with a supplied quote, then unique quote/snapshot match against the
-    same source `GET /api/mark-layer` feeds `to_mark_layer_nodes`. A miss,
-    empty node list, or adapter error is a no-op — page-level / ambiguous
-    marks still persist. Legacy block_id/quote are stripped after a unique
-    attach unless SOMA_REVIEW_MARK_LAYER_DUAL_WRITE is on.
+    Live create prefers a client-supplied stamp id already on `comment`
+    that still exists and agrees with a supplied quote. Unique
+    quote/snapshot match is fallback minting when no id was sent — not
+    a parallel live path beside block_id. A miss, empty node list, or
+    adapter error is a no-op — page-level / ambiguous marks still
+    persist. Legacy block_id is stripped after a unique attach unless
+    SOMA_REVIEW_MARK_LAYER_DUAL_WRITE is on.
     """
     try:
         fs_path = resolve_page(page, workspace)
@@ -4194,13 +4231,14 @@ def maybe_attach_mark_layer_nodes(comment, page, workspace):
 
 
 def maybe_strip_legacy_anchor_fields(comment):
-    """Drop block_id/quote/snapshot as the live identity after a unique attach.
+    """Drop block_id as live identity after a unique attach / edit re-attach.
 
     Dual-write stays only behind SOMA_REVIEW_MARK_LAYER_DUAL_WRITE (default
-    off). Snapshot/proposed and block_id stay on type=edit — they are the
-    MDP change record (content-hash ids do not survive the trunk write).
-    Location marks keep quote/from/to as the selected span and drop
-    block_id. A miss (no node id) keeps the legacy fields so unmatched /
+    off). type=edit keeps snapshot/proposed as the MDP change record
+    (before/after) and quote/from/to as the selected span; block_id is
+    not persisted when mark_layer_node_id can carry the row (re-attached
+    after apply). Location marks keep quote/from/to and drop snapshot.
+    A miss (no node id) keeps the legacy fields so unmatched /
     page-level / legacy-shaped writes still persist.
     """
     if not isinstance(comment, dict):
@@ -4209,19 +4247,59 @@ def maybe_strip_legacy_anchor_fields(comment):
         return
     if not comment.get('mark_layer_node_id'):
         return
-    if comment.get('type') == 'edit':
-        # Change record: content-hash ids do not survive the trunk write
-        # (fingerprint is the new sentence). Keep block_id + snapshot so
-        # revert/ringer can fall back. Quote/from/to stay as the span.
-        comment['block_text_sha'] = None
-        comment['origin_quote'] = None
-        return
-    # Location mark: node id is the identity. Keep quote/from/to as the
-    # selected span (ringer coverage). Drop the old block identity.
+    # Id-only identity. Quote/from/to stay as the selected span.
     comment['block_id'] = None
     comment['block_text_sha'] = None
     comment['origin_quote'] = None
+    if comment.get('type') == 'edit':
+        # snapshot/proposed are the change record, not identity.
+        return
     comment['snapshot'] = ''
+
+
+def bind_from_mark_layer_node(route_path, workspace, candidate):
+    """Id-first create binding. None when the stamp is missing or disagrees.
+
+    This is the live create path when the client sends a DOM stamp that
+    still exists. Does not run blockmap.resolve (the old beside path).
+    Quote/from/to are kept as the selected span when the client sent
+    them; otherwise quote is the node's text.
+    """
+    node_id = str(candidate.get('mark_layer_node_id') or '').strip()
+    if not node_id or not isinstance(candidate, dict):
+        return None
+    try:
+        src_bytes, blocks, _mapping, report = current_page_blocks(route_path, workspace)
+        if report.get('blocked'):
+            return None
+        src = src_bytes.decode('utf-8')
+        nodes = to_mark_layer_nodes(_mark_layer_source(src))
+    except Exception:  # noqa: BLE001 — fall through to legacy binding
+        return None
+    node = find_mark_layer_node(nodes, node_id)
+    if node is None:
+        return None
+    supplied_quote = candidate.get('quote')
+    needle = (supplied_quote or '').strip()
+    node_text = mark_layer_node_text(node).strip()
+    if needle and needle != node_text:
+        return None
+    block = block_for_mark_layer_node(blocks, nodes, node_id)
+    quote = needle or node_text or None
+    return {
+        'schema': 2,
+        'block_id': block['id'] if (mark_layer_dual_write_enabled() and block) else None,
+        'from': candidate.get('from'),
+        'to': candidate.get('to'),
+        'quote': quote,
+        'origin_quote': None,
+        'block_text_sha': None,
+        'heading_path': list(block.get('heading_path') or []) if block else None,
+        'source_sha': blockmap.source_sha256(src_bytes),
+        'unresolved': False,
+        'mark_layer_node_id': node_id,
+        'mark_layer_primary': 'mark_layer_node_id',
+    }
 
 
 def load_page_mark_layer_nodes(route_path, workspace=DEFAULT_WORKSPACE):
@@ -4238,7 +4316,12 @@ def load_page_mark_layer_nodes(route_path, workspace=DEFAULT_WORKSPACE):
 
 
 def resolve_mark_block(route_path, workspace, mark, blocks=None, nodes=None):
-    """Block for a mark: mark_layer_node_id when present, else block_id."""
+    """Block for a mark: mark_layer_node_id when present, else block_id.
+
+    When an id is present, the old block_id path is not consulted unless
+    SOMA_REVIEW_MARK_LAYER_BESIDE is on. A stale id therefore misses
+    rather than silently landing on a leftover block_id.
+    """
     if blocks is None or nodes is None:
         blocks, nodes = load_page_mark_layer_nodes(route_path, workspace)
     node_id = mark.get('mark_layer_node_id') if isinstance(mark, dict) else None
@@ -4246,6 +4329,8 @@ def resolve_mark_block(route_path, workspace, mark, blocks=None, nodes=None):
         block = block_for_mark_layer_node(blocks, nodes, node_id)
         if block is not None:
             return block
+        if not mark_layer_beside_enabled():
+            return None
     block_id = mark.get('block_id') if isinstance(mark, dict) else None
     if block_id:
         return next((block for block in blocks if block.get('id') == block_id), None)
@@ -5872,6 +5957,8 @@ def _ringer_row_block_id(row, blocks, nodes, cache):
             cache[node_id] = block['id'] if block else None
         if cache[node_id]:
             return cache[node_id]
+        if not mark_layer_beside_enabled():
+            return None
     return row.get('block_id')
 
 
@@ -7435,7 +7522,15 @@ class Handler(BaseHTTPRequestHandler):
                     self._send_json({'error': 'page and text required'}, status=400)
                     return
             try:
-                binding = validated_binding(page, workspace, data)
+                # Live create: a valid client stamp is identity. Old
+                # blockmap.resolve is not consulted when the id exists
+                # (stop beside). Fallback is unique-match attach, then
+                # legacy block_id/quote for rows with no id.
+                binding = None
+                if ctype in ('mark', 'edit') and data.get('mark_layer_node_id'):
+                    binding = bind_from_mark_layer_node(page, workspace, data)
+                if binding is None:
+                    binding = validated_binding(page, workspace, data)
             except NotFoundError:
                 self._send_json({'error': 'unknown page'}, status=404)
                 return
@@ -7458,11 +7553,11 @@ class Handler(BaseHTTPRequestHandler):
                 'deleted': False,
                 **binding,
             }
-            # Sole create record for location marks/edits: persist the DOM
-            # stamp (quote↔id checked in attach) or unique quote/snapshot
-            # match. Dual-write of block_id/quote is off unless the flag
-            # is on. Must run before apply_sentence_change so the write
-            # path can resolve the block from the node id.
+            # Sole create record: persist the DOM stamp, else unique
+            # quote/snapshot match (fallback mint). Dual-write of
+            # block_id is off unless the flag is on. Must run before
+            # apply_sentence_change so the write path can resolve the
+            # block from the node id.
             if data.get('mark_layer_node_id'):
                 comment['mark_layer_node_id'] = str(data.get('mark_layer_node_id'))
             if ctype in ('mark', 'edit'):
@@ -7515,6 +7610,7 @@ class Handler(BaseHTTPRequestHandler):
                         comment['mark_layer_node_id'] = probe['mark_layer_node_id']
                         comment['mark_layer_node_ids'] = probe.get('mark_layer_node_ids')
                         comment['mark_layer_primary'] = 'mark_layer_node_id'
+                    maybe_strip_legacy_anchor_fields(comment)
                 # Not persisted to the sidecar (would bloat every row with a
                 # full block-html blob) — only returned in THIS response so
                 # postComment()'s caller can redraw reactively. later_html

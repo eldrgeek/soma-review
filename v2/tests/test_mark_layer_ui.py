@@ -1,14 +1,16 @@
-"""6a beside: UI can display/jump via mark_layer_node_id; old path stays default.
+"""6a beside: default jump is id→DOM; text-occurrence is fallback only.
 
-Parity for the first visible UI slice:
-  (a) jumpToMarkLayerNode no-ops on a missing/unknown id (no throw)
-  (b) a stored id finds the matching sentence and flashes it
-  (c) v3 marks panel shows a clickable chip only when the id is present
+Parity for the id→DOM cutover step:
+  (a) rendered sentences/blocks carry data-mark-layer-node-id
+  (b) jumpToMarkLayerNode querySelectors that stamp (not find-by-text)
+  (c) two identical sentences jump to the stamped occurrence, not the first
+  (d) missing id or missing stamp falls back to the old text path and counts it
 
-Does not cut over create/render to nodes. Does not claim 6a closed.
+Does not retire dual-write / old block-parser create path. Does not claim 6a closed.
 """
 import json
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -46,11 +48,25 @@ class MarkLayerUiSourceTests(unittest.TestCase):
     def test_shared_helper_lives_in_page_js_not_v3_only(self):
         self.assertIn('function jumpToMarkLayerNode', server.PAGE_JS)
         self.assertIn('function findMarkLayerNodeEl', server.PAGE_JS)
+        self.assertIn('function findStampedMarkLayerNodeEl', server.PAGE_JS)
+        self.assertIn('function findMarkLayerNodeElByText', server.PAGE_JS)
         self.assertIn("reason: 'missing-id'", server.PAGE_JS)
         self.assertIn("reason: 'not-found'", server.PAGE_JS)
+        self.assertIn("via = 'id'", server.PAGE_JS)
+        self.assertIn('jump fallback to text-occurrence', server.PAGE_JS)
         self.assertIn('window.jumpToMarkLayerNode = jumpToMarkLayerNode', server.PAGE_JS)
         # Not a v3-prefixed leak into the shared bundle.
         self.assertNotIn('function v3JumpToMarkLayerNode', server.PAGE_JS)
+
+    def test_classic_chip_click_does_not_match_stamped_sentences(self):
+        # Stamped .mark-sentence also carries data-mark-layer-node-id.
+        # The dwell click handler must target the chip button only, or a
+        # sentence click would jump instead of starting a mark.
+        self.assertIn("e.target.closest('button.mark-layer-node-id')", server.MARK_LAYER_JS)
+        self.assertNotIn(
+            "e.target.closest('[data-mark-layer-node-id]')",
+            server.MARK_LAYER_JS,
+        )
 
     def test_missing_id_chip_is_empty_string(self):
         self.assertIn('function markLayerNodeIdButton(nodeId)', server.PAGE_JS)
@@ -101,6 +117,51 @@ class MarkLayerUiSourceTests(unittest.TestCase):
         self.assertIn('function jumpToMarkLayerNode', html)
         self.assertNotIn('v3-panel', html)
         self.assertIn('class="mark-layer"', html)
+        self.assertIn('data-mark-layer-node-id="', html)
+        self.assertIn('class="mark-sentence"', html)
+
+    def test_render_stamps_distinct_ids_on_repeated_sentences(self):
+        tmp = tempfile.TemporaryDirectory()
+        try:
+            root = tmp.name
+            os.makedirs(os.path.join(root, 'docs'))
+            with open(os.path.join(root, 'docs', 'page.md'), 'w', encoding='utf-8') as handle:
+                handle.write(REPEAT_PAGE)
+            config = os.path.join(root, 'workspaces.json')
+            with open(config, 'w', encoding='utf-8') as handle:
+                json.dump({
+                    'estate': {
+                        'label': 'Test', 'roots': [['docs', 'docs']],
+                        'nav': [], 'home': 'docs/page.md', 'feedback_dir': 'feedback',
+                        'nightly': False, 'tours': False,
+                    }
+                }, handle)
+            old_root, old_config = server.PROJECTS_ROOT, server.WORKSPACES_CONFIG
+            server.PROJECTS_ROOT = root
+            server.WORKSPACES_CONFIG = config
+            try:
+                classic = server.render_page('docs/page.md')
+                v3 = server.render_page('docs/page.md', view='v3')
+            finally:
+                server.PROJECTS_ROOT = old_root
+                server.WORKSPACES_CONFIG = old_config
+        finally:
+            tmp.cleanup()
+        nodes = to_mark_layer_nodes(REPEAT_PAGE)
+        ready = [n for n in nodes if n['kind'] == 'sentence'
+                 and n['fragments'][0]['text'].strip() == 'Ready.']
+        self.assertEqual(2, len(ready))
+        self.assertNotEqual(ready[0]['id'], ready[1]['id'])
+        for html in (classic, v3):
+            stamped = re.findall(
+                r'<span class="mark-sentence"[^>]*data-mark-layer-node-id="([^"]+)"[^>]*>Ready\.</span>',
+                html,
+            )
+            self.assertEqual([ready[0]['id'], ready[1]['id']], stamped)
+            self.assertIn(f'id="{ready[0]["id"]}"', html)
+            self.assertIn(f'id="{ready[1]["id"]}"', html)
+            self.assertIn(f'data-mark-layer-node-id="{ready[0]["id"]}"', html)
+            self.assertIn(f'data-mark-layer-node-id="{ready[1]["id"]}"', html)
 
 
 @unittest.skipIf(sync_playwright is None, 'playwright not installed')
@@ -219,18 +280,25 @@ class MarkLayerUiBrowserTests(unittest.TestCase):
         self.assertTrue(node_id)
         result = self.page.evaluate(
             """(id) => {
+                window.__MARK_LAYER_JUMP_STATS__ = {id: 0, fallback: 0};
                 const r = window.jumpToMarkLayerNode(id, {behavior: 'auto', flashMs: 0});
                 return {
                     ok: r.ok,
+                    via: r.via,
                     text: r.el ? r.el.textContent.trim() : '',
                     flashed: !!(r.el && r.el.classList.contains('mark-layer-node-flash')),
+                    stamped: !!(r.el && r.el.getAttribute('data-mark-layer-node-id') === id),
+                    stats: window.__MARK_LAYER_JUMP_STATS__,
                 };
             }""",
             node_id,
         )
         self.assertTrue(result['ok'])
+        self.assertEqual('id', result['via'])
         self.assertEqual('Beta is second.', result['text'])
         self.assertTrue(result['flashed'])
+        self.assertTrue(result['stamped'])
+        self.assertEqual({'id': 1, 'fallback': 0}, result['stats'])
         self.assertEqual([], self.errors)
 
     def test_v3_panel_shows_chip_and_click_flashes_sentence(self):
@@ -295,6 +363,88 @@ class MarkLayerUiBrowserTests(unittest.TestCase):
         )
         self.assertEqual('Ready.', result['text'])
         self.assertEqual(snapshot, result['block'])
+        self.assertEqual([], self.errors)
+
+    def test_repeated_sentence_jump_uses_stamped_id_not_text_occurrence(self):
+        """Two identical quotes: default jump is querySelector(stamp), not first-hit text."""
+        with open(self.doc, 'w', encoding='utf-8') as handle:
+            handle.write(REPEAT_PAGE)
+        snapshot = 'Ready. Unique second context.'
+        status, row = self._post_sentence_mark('Ready.', snapshot)
+        self.assertEqual(201, status)
+        nodes = to_mark_layer_nodes(REPEAT_PAGE)
+        ready = [n for n in nodes if n['kind'] == 'sentence'
+                 and n['fragments'][0]['text'].strip() == 'Ready.']
+        self.assertEqual(ready[1]['id'], row['mark_layer_node_id'])
+        self._goto_v3()
+        # Wipe the node list so the old text-occurrence path cannot succeed.
+        result = self.page.evaluate(
+            """(id) => {
+                const first = document.querySelector('.mark-sentence');
+                const stamped = window.findStampedMarkLayerNodeEl(id);
+                window.__MARK_LAYER_NODES__ = [];
+                window.__MARK_LAYER_JUMP_STATS__ = {id: 0, fallback: 0};
+                const r = window.jumpToMarkLayerNode(id, {behavior: 'auto', flashMs: 0});
+                return {
+                    ok: r.ok,
+                    via: r.via,
+                    text: r.el ? r.el.textContent.trim() : '',
+                    block: r.el && r.el.closest('.block-wrap')
+                        ? atob(r.el.closest('.block-wrap').dataset.normText) : '',
+                    stampedId: stamped && stamped.getAttribute('data-mark-layer-node-id'),
+                    firstId: first && first.getAttribute('data-mark-layer-node-id'),
+                    sameAsFirst: !!(r.el && first && r.el === first),
+                    usedTextLookup: typeof window.findMarkLayerNodeElByText === 'function'
+                        && !!window.findMarkLayerNodeElByText(id),
+                    stats: window.__MARK_LAYER_JUMP_STATS__,
+                };
+            }""",
+            row['mark_layer_node_id'],
+        )
+        self.assertTrue(result['ok'])
+        self.assertEqual('id', result['via'])
+        self.assertEqual('Ready.', result['text'])
+        self.assertEqual(snapshot, result['block'])
+        self.assertEqual(row['mark_layer_node_id'], result['stampedId'])
+        self.assertNotEqual(result['stampedId'], result['firstId'])
+        self.assertFalse(result['sameAsFirst'])
+        self.assertFalse(result['usedTextLookup'])
+        self.assertEqual({'id': 1, 'fallback': 0}, result['stats'])
+        self.assertEqual([], self.errors)
+
+    def test_missing_stamp_falls_back_to_text_occurrence_and_counts_it(self):
+        with open(self.doc, 'w', encoding='utf-8') as handle:
+            handle.write(REPEAT_PAGE)
+        snapshot = 'Ready. Unique second context.'
+        status, row = self._post_sentence_mark('Ready.', snapshot)
+        self.assertEqual(201, status)
+        self._goto_v3()
+        result = self.page.evaluate(
+            """(id) => {
+                document.querySelectorAll('[data-mark-layer-node-id]').forEach(el => {
+                    if (!el.classList.contains('mark-layer-node-id')) {
+                        el.removeAttribute('data-mark-layer-node-id');
+                        el.removeAttribute('id');
+                    }
+                });
+                window.__MARK_LAYER_JUMP_STATS__ = {id: 0, fallback: 0};
+                const r = window.jumpToMarkLayerNode(id, {behavior: 'auto', flashMs: 0});
+                return {
+                    ok: r.ok,
+                    via: r.via,
+                    text: r.el ? r.el.textContent.trim() : '',
+                    block: r.el && r.el.closest('.block-wrap')
+                        ? atob(r.el.closest('.block-wrap').dataset.normText) : '',
+                    stats: window.__MARK_LAYER_JUMP_STATS__,
+                };
+            }""",
+            row['mark_layer_node_id'],
+        )
+        self.assertTrue(result['ok'])
+        self.assertEqual('text', result['via'])
+        self.assertEqual('Ready.', result['text'])
+        self.assertEqual(snapshot, result['block'])
+        self.assertEqual({'id': 0, 'fallback': 1}, result['stats'])
         self.assertEqual([], self.errors)
 
 

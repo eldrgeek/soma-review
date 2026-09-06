@@ -193,6 +193,15 @@ def _paragraph_groups(nodes: list[dict[str, Any]]) -> list[tuple[dict[str, Any] 
     return groups
 
 
+def _unique_node_id(nodes: list[dict[str, Any]]) -> str | None:
+    """Single node id if every node shares one; else None (ambiguous or empty)."""
+    ids = [node.get('id') for node in nodes if node.get('id')]
+    if not ids:
+        return None
+    first = ids[0]
+    return first if all(nid == first for nid in ids) else None
+
+
 def match_mark_layer_nodes(
     nodes: list[dict[str, Any]],
     *,
@@ -206,7 +215,13 @@ def match_mark_layer_nodes(
     while live mark quotes come from `sentence_ranges` which strips), then an
     exact paragraph match, then containment. When `snapshot` uniquely names a
     paragraph group, matching is scoped to that group so a repeated sentence
-    attaches the occurrence in that block. Returns [] when nothing matches.
+    attaches the occurrence in that block.
+
+    A tier that still has more than one distinct node id is a miss, not a
+    first-hit attach. Containment (`needle in text or text in needle`) is
+    the last tier and is also unique-only: a wrong node id is silent and
+    permanent on the sidecar (Skip 2026-09-06 nit 1). Returns [] when
+    nothing uniquely matches.
     """
     needle = (quote or '').strip() or (snapshot or '').strip()
     if not needle or not nodes:
@@ -222,6 +237,8 @@ def match_mark_layer_nodes(
         ]
         if narrowed:
             scoped = narrowed
+        # else: snapshot did not narrow; keep all groups and require a
+        # unique match below so we never first-hit attach.
 
     exact_sentences: list[tuple[dict[str, Any], dict[str, Any] | None]] = []
     exact_paragraphs: list[dict[str, Any]] = []
@@ -253,13 +270,25 @@ def match_mark_layer_nodes(
         return out
 
     if exact_sentences:
-        return with_parent(*exact_sentences[0])
+        sent, para = exact_sentences[0]
+        if _unique_node_id([s for s, _p in exact_sentences]) == sent.get('id'):
+            return with_parent(sent, para)
+        return []
     if exact_paragraphs:
-        return [exact_paragraphs[0]]
+        para = exact_paragraphs[0]
+        if _unique_node_id(exact_paragraphs) == para.get('id'):
+            return [para]
+        return []
     if contain_sentences:
-        return with_parent(*contain_sentences[0])
+        sent, para = contain_sentences[0]
+        if _unique_node_id([s for s, _p in contain_sentences]) == sent.get('id'):
+            return with_parent(sent, para)
+        return []
     if contain_paragraphs:
-        return [contain_paragraphs[0]]
+        para = contain_paragraphs[0]
+        if _unique_node_id(contain_paragraphs) == para.get('id'):
+            return [para]
+        return []
     return []
 
 

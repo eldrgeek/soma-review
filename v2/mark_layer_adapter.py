@@ -15,8 +15,9 @@ produce it.
 
 Write-side beside-step (2026-09-06): `POST /api/comments` type=mark now
 calls `attach_mark_layer_node_ids` so a new mark can carry the matching
-node id. The live comment/mark *read* path still uses the old block-parser
-/ `mark_layer_inner` / v3 path — this module is not the default renderer.
+node id. UI may display/jump via that id; the live comment/mark *read*
+path still uses the old block-parser / `mark_layer_inner` / v3 path — this
+module is not the default renderer.
 Wiring `server.py`'s actual block-parse response to emit this shape is the
 cutover (agreed-model 6a + item 15), still open.
 
@@ -66,9 +67,9 @@ would read two untouched nodes as deleted-and-recreated, purely because an
 unrelated sibling with the same text was inserted earlier in the doc. This
 is the same failure SHAPE Anchoring v2 exists to prevent (`blockmap.py`),
 one layer down: content-hash ids are stable, but the occurrence COUNTER
-layered on top to break ties is itself position-derived. **Not a live
-read-path consumer yet** (new marks store the id beside the old anchor
-fields; UI still ignores it) — but whoever wires the real cross-edit
+layered on top to break ties is itself position-derived. **UI can display/jump via a stored id** (additive chip +
+`jumpToMarkLayerNode`); the default create/render path is still the old
+block-parser fields — but whoever wires the real cross-edit
 diffing use case (as opposed to idempotent re-parse of one static document,
 e.g. on server restart) MUST solve real disambiguation first, or two runs
 of identical content anywhere in the same document will falsely appear to

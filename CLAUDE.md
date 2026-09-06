@@ -1260,9 +1260,8 @@ resolves the best matching `MarkLayerNode` via `to_mark_layer_nodes` on the page
 additively stores `mark_layer_node_id` / `mark_layer_node_ids` on the new sidecar row
 (`v2/mark_layer_adapter.attach_mark_layer_node_ids`). Existing anchor/quote/snapshot/`block_id`
 fields are unchanged and remain the default read/render path. No match or adapter failure is a
-no-op — the mark still writes as today. Live comment/mark UI does not read these ids yet; the
-twin emitter stays. 6a stays open until the live UI rides nodes and the item-15 view-diff /
-parity gate is green.
+no-op — the mark still writes as today. Twin emitter stays. 6a stays open until the live UI
+rides nodes as the default path and the item-15 view-diff / parity gate is green.
 
 **Skip 2026-09-06 nit 1 (load-bearing before any UI rides `mark_layer_node_id`):**
 `match_mark_layer_nodes` now unique-matches only. A repeated sentence plus a snapshot that
@@ -1271,6 +1270,12 @@ narrow, attach misses (no node id) rather than first-hit containment. Exact-matc
 path is unchanged. 6a is still open.
 
 **Skip 2026-09-06 nit 2 (named, not fixed):** the occurrence-suffix residual is now persisted on new marks.
+
+**6a beside (2026-09-06), UI-on-node-id, not closed:** v3 marks panel/dialog and classic
+comment/dwell cards can display `mark_layer_node_id` and jump to the matching sentence via
+`jumpToMarkLayerNode` + `window.__MARK_LAYER_NODES__`. Missing ids stay a no-op (no chip,
+no crash). Old block-parser / v3 / classic mark path remains the default create/render
+path. Twin emitter stays. 6a stays open.
 
 ## Authorship
 

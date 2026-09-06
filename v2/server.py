@@ -3221,6 +3221,39 @@ V3_JS = r"""
     return true;
   }
 
+  // Fold (MDP agreed model item 10, wired to the panel here): only offered on
+  // an ALREADY-RESOLVED edit/replace mark (the trunk currently holds
+  // m.proposed — same assumption Settle relies on). Prompts for the term
+  // name client-side; the server (`apply_sentence_fold`) is what actually
+  // enforces the sentence-drift guard, the one-sentence-only rule, the safe
+  // term pattern, and the page-has-Terms-section requirement — this is only
+  // ever a thin POST + repaint, same shape as settleOrRevertMark.
+  //
+  // The dialog template gates the button on `!m.reverted` in addition to
+  // `m.resolved`/`m.kind` (Skip, adversarial pass, 2026-09-06): a mark
+  // resolved via Revert also has resolved=true and kind='edit'/'replace',
+  // but the trunk holds `m.snapshot`, not `m.proposed` — sending the stale
+  // `m.proposed` would usually just 409 (drift guard), but if `m.proposed`
+  // happened to equal another whole sentence elsewhere in the same block,
+  // it would silently fold the WRONG sentence with no error. Revert sets
+  // `reverted: true` on the mark (see the `/api/marks/merge` revert branch);
+  // that's the exact signal to gate on, not kind/resolved alone.
+  async function foldMark(m, term){
+    const res = await fetch(`${API_BASE}/api/fold`, {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({page: ROUTE, block_id: m.block_id, sentence: m.proposed || m.snapshot || '', term})});
+    let data = {};
+    try { data = await res.json(); } catch(_) {}
+    if (!res.ok) { alert(data.error || 'fold failed'); return false; }
+    if (data.html) {
+      const wrap = document.querySelector(`.block-wrap[data-block-id="${CSS.escape(m.block_id)}"]`);
+      v3ApplyMergedBlockHtml(wrap, data.html);
+    }
+    await fetchMarks();
+    paintBlockIndicators(); v3PaintInlineDiffs(); v3WireInlineDiffClicks(); updateCountBadge();
+    if (panelOpen) renderPanel();
+    return true;
+  }
+
   async function setStatus(m, status){
     await fetch(`${API_BASE}/api/comments/status`, {method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({page: ROUTE, id: m.id, status})});
@@ -3294,7 +3327,7 @@ V3_JS = r"""
       ${typeof markLayerNodeIdButton === 'function' ? markLayerNodeIdButton(m.mark_layer_node_id) : ''}
       <div class="v3-dialog-actions">
         ${extraActions}
-        ${!extraActions ? (m.resolved ? '<button data-v3-reopen>Reopen</button>' : '<button class="primary" data-v3-resolve>Resolve</button>') : ''}
+        ${!extraActions ? (m.resolved ? `<button data-v3-reopen>Reopen</button>${((m.kind === 'edit' || m.kind === 'replace') && !m.reverted) ? '<button data-v3-fold>Fold</button>' : ''}` : '<button class="primary" data-v3-resolve>Resolve</button>') : ''}
         <button data-v3-scroll>Go to block</button>
       </div>
     </div>`;
@@ -3313,6 +3346,12 @@ V3_JS = r"""
     backdrop.querySelector('[data-v3-reopen]')?.addEventListener('click', async () => {
       await setStatus(m, 'queued');
       backdrop.remove();
+    });
+    backdrop.querySelector('[data-v3-fold]')?.addEventListener('click', async () => {
+      const term = (prompt('Fold this sentence into a Terms entry named:', '') || '').trim();
+      if (!term) return;
+      const ok = await foldMark(m, term);
+      if (ok) backdrop.remove();
     });
     backdrop.querySelectorAll('[data-v3-ratify]').forEach(btn => {
       btn.addEventListener('click', async () => {

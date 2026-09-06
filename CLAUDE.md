@@ -1307,6 +1307,37 @@ emitter stays. Out of scope: Playmaker Fountain `[[SCENE:]]` / P1 Doc export;
 P2 rrweb harness. **6a stays open** until dual-write is fully retired AND
 edit-rebind is proven against that gate. Do not claim 6a closed.
 
+## Fold (SOMA agreed model item 10) — wired into the v3 panel (2026-09-06)
+
+Item 10: "an agreed extension may be folded out of the sentence into the node it
+defines, leaving the link. The document gets shorter as agreement grows." Built
+server-side first (`apply_sentence_fold`, `v2/server.py`) with no client caller —
+moves one whole sentence (same hash-guarded unit as settle/revert) out of its
+block and into a `- **term** — <sentence>` bullet under the page's own
+`## Terms` heading, replacing it in place with a `[term](#terms)` link.
+`POST /api/fold` takes `{page, block_id, sentence, term}`; refuses (409) on
+sentence drift, a non-single-sentence span, an unsafe term (`_SAFE_TERM_RE`),
+or a page with no `## Terms` section.
+
+The v3 mark dialog (`V3_JS`, `foldMark` + the `data-v3-fold` button) is now the
+first UI caller: a **Fold** button appears next to **Reopen** on a resolved
+edit/replace mark, sends `m.proposed` as the sentence to fold, prompts for the
+term name, and repaints the block from the response the same way Settle/Revert
+do. Gated on `!m.reverted` in addition to kind/resolved — a mark resolved via
+Revert also has `resolved: true` and `kind: 'edit'`/`'replace'`, but the trunk
+then holds `m.snapshot`, not `m.proposed`; sending the stale `m.proposed`
+would usually just 409 via the drift guard, but could silently fold the wrong
+sentence if it happened to match another whole sentence in the same block
+(found by Skip's adversarial pass before this shipped).
+
+Not yet done: no regression test covers the dialog's button-gating logic
+itself (the v3 panel HTML is a client-side template string with no JS test
+harness in this repo — only the server endpoint has unit tests). Verified
+instead by live demonstration against a scratch page
+(`_estate/fold-ui-demo.md`): create a resolved edit mark, POST the exact body
+`foldMark()` sends, confirm the sentence lands in `## Terms` with a working
+hover-linked reference.
+
 ## Authorship
 
 v2 built 2026-07-02 by Dee (Claude Sonnet 5, engineering-lead/COO role) per Mike's spec

@@ -12,7 +12,7 @@ sys.path.insert(0, V2_DIR)
 
 from mark_layer_adapter import (  # noqa: E402
     to_mark_layer_nodes, match_mark_layer_nodes, attach_mark_layer_node_ids,
-    MarkLayerDomStamper,
+    MarkLayerDomStamper, align_mark_layer_nodes, rebind_mark_layer_node_ids,
 )
 from mdblocks import norm  # noqa: E402
 
@@ -166,6 +166,91 @@ class MarkLayerAdapterTests(unittest.TestCase):
         self.assertNotEqual(before_ids[2], after_ids[3])
 
 
+class AlignMarkLayerNodesTests(unittest.TestCase):
+    """Edit-rebind: neighborhood align accounts occurrence-suffix remaps."""
+
+    def test_unique_sentences_identity_map(self):
+        text = 'Alpha is first. Beta is second.'
+        nodes = to_mark_layer_nodes(text)
+        remap = align_mark_layer_nodes(nodes, to_mark_layer_nodes(text))
+        for node in nodes:
+            self.assertEqual(node['id'], remap.get(node['id']), node['id'])
+
+    def test_inserting_earlier_duplicate_remaps_later_occurrence(self):
+        # Named minting gap (test_named_gap_...): suffixes shift. Align must
+        # still pair each Ready. with the paragraph that still has its
+        # unique sibling — not the newly inserted first occurrence.
+        before = 'Ready. Unique first context.\n\nReady. Unique second context.'
+        after = (
+            'Ready. Brand new context.\n\n'
+            'Ready. Unique first context.\n\n'
+            'Ready. Unique second context.'
+        )
+        prev = to_mark_layer_nodes(before)
+        nxt = to_mark_layer_nodes(after)
+        prev_ready = [n['id'] for n in prev if n['kind'] == 'sentence'
+                      and n['fragments'][0]['text'].strip() == 'Ready.']
+        next_ready = [n['id'] for n in nxt if n['kind'] == 'sentence'
+                      and n['fragments'][0]['text'].strip() == 'Ready.']
+        self.assertEqual(2, len(prev_ready))
+        self.assertEqual(3, len(next_ready))
+        self.assertNotEqual(prev_ready[1], next_ready[2])
+
+        remap = align_mark_layer_nodes(prev, nxt)
+        self.assertEqual(next_ready[1], remap[prev_ready[0]])
+        self.assertEqual(next_ready[2], remap[prev_ready[1]])
+        first_ctx = next(
+            n['id'] for n in prev if n['kind'] == 'sentence'
+            and n['fragments'][0]['text'].strip() == 'Unique first context.'
+        )
+        first_ctx_after = next(
+            n['id'] for n in nxt if n['kind'] == 'sentence'
+            and n['fragments'][0]['text'].strip() == 'Unique first context.'
+        )
+        self.assertEqual(first_ctx_after, remap[first_ctx])
+
+    def test_inserting_earlier_bare_duplicate_uses_group_neighbors(self):
+        before = 'Ready.\n\nOther.\n\nReady.'
+        after = 'Ready.\n\nReady.\n\nOther.\n\nReady.'
+        prev = to_mark_layer_nodes(before)
+        nxt = to_mark_layer_nodes(after)
+        prev_ready = [n['id'] for n in prev if n['kind'] == 'paragraph'
+                      and n['fragments'][0]['text'].strip() == 'Ready.']
+        next_ready = [n['id'] for n in nxt if n['kind'] == 'paragraph'
+                      and n['fragments'][0]['text'].strip() == 'Ready.']
+        remap = align_mark_layer_nodes(prev, nxt)
+        self.assertEqual(next_ready[1], remap[prev_ready[0]])
+        self.assertEqual(next_ready[2], remap[prev_ready[1]])
+
+    def test_rebind_updates_stored_ids_and_skips_identity(self):
+        records = [
+            {'id': 'm1', 'mark_layer_node_id': 'old-a',
+             'mark_layer_node_ids': ['old-a', 'old-p']},
+            {'id': 'm2', 'mark_layer_node_id': 'same'},
+        ]
+        updated, applied = rebind_mark_layer_node_ids(
+            records, {'old-a': 'new-a', 'old-p': 'new-p', 'same': 'same'},
+        )
+        self.assertEqual('new-a', updated[0]['mark_layer_node_id'])
+        self.assertEqual(['new-a', 'new-p'], updated[0]['mark_layer_node_ids'])
+        self.assertEqual({'from': 'old-a', 'to': 'new-a'},
+                         updated[0]['mark_layer_node_rebound'])
+        self.assertEqual([{'record_id': 'm1', 'from': 'old-a', 'to': 'new-a'}], applied)
+        self.assertEqual('same', updated[1]['mark_layer_node_id'])
+        self.assertNotIn('mark_layer_node_rebound', updated[1])
+
+    def test_rebind_only_ids_leaves_other_marks(self):
+        records = [
+            {'id': 'm1', 'mark_layer_node_id': 'old-a'},
+            {'id': 'm2', 'mark_layer_node_id': 'old-b'},
+        ]
+        _updated, applied = rebind_mark_layer_node_ids(
+            records, {'old-a': 'new-a', 'old-b': 'new-b'}, only_ids={'old-a'},
+        )
+        self.assertEqual([{'record_id': 'm1', 'from': 'old-a', 'to': 'new-a'}], applied)
+        self.assertEqual('old-b', records[1]['mark_layer_node_id'])
+
+
 class MatchMarkLayerNodesTests(unittest.TestCase):
     """6a beside: resolve a mark quote to the adapter's node id(s)."""
 
@@ -235,6 +320,32 @@ class MatchMarkLayerNodesTests(unittest.TestCase):
         attach_mark_layer_node_ids(record, text)
         self.assertEqual(ready[1]['id'], record['mark_layer_node_id'])
         self.assertEqual(ready[1]['id'], record['mark_layer_node_ids'][0])
+
+    def test_attach_prefers_supplied_stamp_id_for_repeated_sentence(self):
+        # Create rides the DOM stamp: an unscoped "Ready." would miss, but
+        # the client-supplied occurrence id is the primary record.
+        text = 'Ready. Unique first context.\n\nReady. Unique second context.'
+        nodes = to_mark_layer_nodes(text)
+        ready = [
+            n for n in nodes
+            if n['kind'] == 'sentence' and n['fragments'][0]['text'].strip() == 'Ready.'
+        ]
+        record = {
+            'type': 'mark', 'quote': 'Ready.',
+            'mark_layer_node_id': ready[1]['id'],
+        }
+        attach_mark_layer_node_ids(record, text)
+        self.assertEqual(ready[1]['id'], record['mark_layer_node_id'])
+        self.assertEqual(ready[1]['id'], record['mark_layer_node_ids'][0])
+
+    def test_attach_drops_stale_supplied_id_when_quote_does_not_unique_match(self):
+        text = 'Ready. Unique first context.\n\nReady. Unique second context.'
+        record = {
+            'type': 'mark', 'quote': 'Ready.',
+            'mark_layer_node_id': 'pmsent-no-such',
+        }
+        attach_mark_layer_node_ids(record, text)
+        self.assertNotIn('mark_layer_node_id', record)
 
     def test_repeated_sentence_misses_when_snapshot_does_not_narrow(self):
         # Skip 2026-09-06 nit 1: without a snapshot that uniquely names one
@@ -351,6 +462,23 @@ class MarkLayerDomStamperTests(unittest.TestCase):
         stamper = MarkLayerDomStamper([])
         self.assertIsNone(stamper.bind_block('Ready.'))
         self.assertIsNone(stamper.next_sentence('Ready.'))
+
+    def test_next_sentence_does_not_steal_from_another_group(self):
+        # Mid-doc-edit drift: a document-wide text search used to stamp a
+        # later twin's id onto this block. A miss in the bound group is
+        # unstamped — jump may fall back to text, counted, not default.
+        text = 'Ready. Unique first context.\n\nReady. Unique second context.'
+        nodes = to_mark_layer_nodes(text)
+        ready = [
+            n for n in nodes
+            if n['kind'] == 'sentence' and n['fragments'][0]['text'].strip() == 'Ready.'
+        ]
+        stamper = MarkLayerDomStamper(nodes)
+        stamper.bind_block('Ready. Unique first context.')
+        stamper.next_sentence('Ready.')
+        self.assertIsNone(stamper.next_sentence('Ready.'))
+        stamper.bind_block('Ready. Unique second context.')
+        self.assertEqual(ready[1]['id'], stamper.next_sentence('Ready.'))
 
 
 if __name__ == '__main__':

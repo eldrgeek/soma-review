@@ -37,6 +37,7 @@ import tours as tour_engine  # noqa: E402  (Quinn tours of completed jobs — se
 import cursor_intake  # noqa: E402  (Grok/Cursor intake — see SOMA/cursor-intake/README.md)
 from mark_layer_adapter import (  # noqa: E402  (SOMA agreed model item 6a)
     to_mark_layer_nodes, attach_mark_layer_node_ids, MarkLayerDomStamper,
+    align_mark_layer_nodes, rebind_mark_layer_node_ids,
 )
 
 PROJECTS_ROOT = os.path.expanduser('~/Projects')
@@ -355,6 +356,72 @@ def sidecar_path(route_path, workspace=DEFAULT_WORKSPACE):
 def block_map_path(route_path, workspace=DEFAULT_WORKSPACE):
     ws = get_workspace(workspace)
     return os.path.join(ws['feedback_dir'], page_slug(route_path) + '.blocks.json')
+
+
+# Dual-write residual (6a still open): old block_id/quote/snapshot stay on
+# every location-bearing mark because apply_sentence_change, the ringer
+# list, and v3 stale detection still read them. Item-15 view-diff/parity
+# gate retires this. The env flag documents intent; stripping those
+# fields is not implemented (a zero would still write them).
+MARK_LAYER_DUAL_WRITE = os.environ.get(
+    'SOMA_REVIEW_MARK_LAYER_DUAL_WRITE', '1'
+).strip().lower() not in ('0', 'false', 'no')
+
+
+def mark_layer_nodes_cache_path(route_path, workspace=DEFAULT_WORKSPACE):
+    """Previous-parse node list used to rebind stored mark_layer_node_ids."""
+    ws = get_workspace(workspace)
+    return os.path.join(ws['feedback_dir'], page_slug(route_path) + '.mark-layer-nodes.json')
+
+
+def _mark_layer_source(src):
+    _, mark_layer_src = strip_auto_lexicon_marker(src or '')
+    return strip_front_matter(mark_layer_src)
+
+
+def load_mark_layer_nodes_cache(route_path, workspace=DEFAULT_WORKSPACE):
+    path = mark_layer_nodes_cache_path(route_path, workspace)
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, encoding='utf-8') as handle:
+            payload = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+    nodes = payload.get('nodes') if isinstance(payload, dict) else None
+    return nodes if isinstance(nodes, list) else None
+
+
+def save_mark_layer_nodes_cache(route_path, nodes, workspace=DEFAULT_WORKSPACE):
+    path = mark_layer_nodes_cache_path(route_path, workspace)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    payload = json.dumps(
+        {'version': 1, 'nodes': list(nodes or [])},
+        ensure_ascii=False, separators=(',', ':'),
+    ).encode('utf-8')
+    blockmap.atomic_write(path, payload)
+
+
+def rebind_page_mark_layer_nodes(
+    route_path, workspace, prev_nodes, next_nodes, only_ids=None,
+):
+    """Remap stored mark_layer_node_id values after a content edit.
+
+    Returns the list of applied remaps (empty when nothing changed).
+    """
+    try:
+        remap = align_mark_layer_nodes(prev_nodes, next_nodes)
+    except Exception:  # noqa: BLE001 — rebind is additive; never fail a render
+        return []
+    if not remap:
+        return []
+    path = sidecar_path(route_path, workspace)
+    with blockmap.file_lock(path):
+        comments = _read_comments_unlocked(path)
+        updated, applied = rebind_mark_layer_node_ids(comments, remap, only_ids)
+        if applied:
+            _write_all_comments_unlocked(path, updated)
+    return applied
 
 
 def _read_comments_unlocked(path):
@@ -849,8 +916,9 @@ function escapeHtml(s) {
 // Default jump is id→DOM (querySelector the stamped data-mark-layer-node-id
 // on the rendered sentence/block). Text-occurrence lookup is fallback only
 // when the id or stamp is missing — counted on __MARK_LAYER_JUMP_STATS__.
-// Old block_id + quote remain the default create path. A missing id is a
-// no-op (no chip, no throw).
+// Create rides the same id: blockPayload/postComment send the stamp.
+// Old block_id + quote stay dual-written (edit/ringer/stale). A missing
+// id is a no-op (no chip, no throw).
 function markLayerNodeText(node) {
   if (!node || !Array.isArray(node.fragments)) return '';
   return node.fragments.map(f => (f && f.text) || '').join('').trim();
@@ -1315,11 +1383,17 @@ function sentenceSpanInBlock(el) {
   // units, so one astral character (emoji; 434 of them across 215 estate docs)
   // earlier in the block shifts the slice and the server refuses the mark 409.
   const quote = hit.map(u => b64ToUtf8(u.dataset.quote)).join(' ');
-  return {from, to, quote};
+  // One selected sentence: the stamped MarkLayerNode id is the create record.
+  // A multi-sentence selection is ambiguous — omit and let the server match.
+  const markLayerNodeId = hit.length === 1
+    ? (hit[0].getAttribute('data-mark-layer-node-id') || null)
+    : null;
+  return {from, to, quote, mark_layer_node_id: markLayerNodeId};
 }
 
 function blockPayload(el) {
-  if (!el) return {block_id: null, from: null, to: null, quote: null, block_text_sha: null};
+  if (!el) return {block_id: null, from: null, to: null, quote: null, block_text_sha: null,
+                   mark_layer_node_id: null};
   const norm = b64ToUtf8(el.dataset.normText);
   const span = sentenceSpanInBlock(el);
   return {
@@ -1328,19 +1402,22 @@ function blockPayload(el) {
     to: span ? span.to : null,
     quote: span ? span.quote : norm,
     block_text_sha: el.dataset.blockSha,
+    mark_layer_node_id: span
+      ? (span.mark_layer_node_id || null)
+      : (el.dataset.markLayerNodeId || null),
   };
 }
 
 async function postComment({anchor, snapshot, text, threadId, type, proposed, row_id, verdict,
                             block_id, from, to, quote, block_text_sha, mark_kind, strength,
-                            scope, reason, sent_because}) {
+                            scope, reason, sent_because, mark_layer_node_id}) {
   const res = await fetch(`${API_BASE}/api/comments`, {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({ page: ROUTE, anchor, snapshot, text, thread_id: threadId || null,
                             type: type || 'comment', proposed, row_id, verdict,
                             block_id, from, to, quote, block_text_sha, mark_kind, strength,
-                            scope, reason, sent_because })
+                            scope, reason, sent_because, mark_layer_node_id })
   });
   if (!res.ok) throw new Error('post failed: ' + res.status);
   const created = await res.json();
@@ -1879,6 +1956,7 @@ window.initMarkLayer = function initMarkLayer() {
     const to = hasRange ? Number(el.dataset.to) : null;
     const quote = hasRange ? decode(el.dataset.quote) : decode(wrap.dataset.normText);
     return { el, wrap, blockId:wrap.dataset.blockId, from, to, quote,
+      markLayerNodeId: el.dataset.markLayerNodeId || wrap.dataset.markLayerNodeId || null,
       key:`${wrap.dataset.blockId}:${from}:${to == null ? '' : to}` };
   }
   function metas() { return units().map(unitMeta); }
@@ -2093,6 +2171,7 @@ window.initMarkLayer = function initMarkLayer() {
     }
     pending.push(Object.assign({id:uid(),blockId:meta?meta.blockId:null,from:meta?meta.from:null,to:meta?meta.to:null,
       quote:meta?meta.quote:null,author:'Mike',strength:1,scope:null,body:'',before:'',after:'',reason:'',sent:false,
+      markLayerNodeId: extra.markLayerNodeId || (meta && meta.markLayerNodeId) || null,
       ts:new Date().toISOString()},extra));
     touch(); render();
   }
@@ -2125,7 +2204,8 @@ window.initMarkLayer = function initMarkLayer() {
           text:mark.body||`${(K[mark.kind]||K.note).label}${mark.reason?`: ${mark.reason}`:''}`,
           type:'mark',proposed:mark.after||undefined,block_id:mark.blockId,from:mark.from,to:mark.to,
           quote:mark.quote,block_text_sha:wrap?wrap.dataset.blockSha:null,mark_kind:mark.kind,
-          strength:mark.strength||1,scope:mark.scope,reason:mark.reason||undefined,sent_because:why});
+          strength:mark.strength||1,scope:mark.scope,reason:mark.reason||undefined,sent_because:why,
+          mark_layer_node_id:mark.markLayerNodeId||undefined});
         pending=pending.filter(m=>m.id!==mark.id);sent++;save();
       }catch(err){toast(`Could not send; ${pending.length} mark${pending.length===1?' is':'s are'} safe in this browser.`);break;}
     }
@@ -3932,20 +4012,22 @@ class BindingConflict(Exception):
 
 
 def maybe_attach_mark_layer_nodes(comment, page, workspace):
-    """6a beside: stamp MarkLayerNode ids onto a new mark. Never raises.
+    """Write mark_layer_node_id as the primary create record. Never raises.
 
-    Uses the same page-source bytes `GET /api/mark-layer` feeds
-    `to_mark_layer_nodes`. A miss, empty node list, or adapter error is a
-    no-op — the old mark path still writes. Live jump prefers this id
-    when the rendered DOM carries a matching stamp; old block-parser
-    fields remain the default create path and the jump fallback.
+    Prefers a client-supplied stamp id already on `comment`, then unique
+    quote/snapshot match against the same source `GET /api/mark-layer`
+    feeds `to_mark_layer_nodes`. A miss, empty node list, or adapter
+    error is a no-op — page-level / ambiguous marks still persist. Old
+    block_id/quote stay dual-written (MARK_LAYER_DUAL_WRITE residual).
     """
     try:
         fs_path = resolve_page(page, workspace)
         with open(fs_path, 'rb') as handle:
             src = handle.read().decode('utf-8')
-        attach_mark_layer_node_ids(comment, src)
-    except Exception:  # noqa: BLE001 — beside-only; never fail a mark write
+        attach_mark_layer_node_ids(comment, _mark_layer_source(src))
+        if comment.get('mark_layer_node_id'):
+            comment['mark_layer_primary'] = 'mark_layer_node_id'
+    except Exception:  # noqa: BLE001 — attach must never fail a mark write
         return
 
 
@@ -4103,11 +4185,18 @@ def _locate_change_span(route_path, workspace, block_id, expected_text):
     )
 
 
-def _rerender_block(route_path, workspace, fs_path, new_src, block_id, old_block):
+def _rerender_block(route_path, workspace, fs_path, new_src, block_id, old_block,
+                    prev_src=None):
     """Re-render one block fresh from `new_src` (the file content just
     written). Reconciliation (inside current_page_blocks) carries the
     block's id forward across the text change when possible; falls back to
-    matching on the same line_start if the id genuinely changed."""
+    matching on the same line_start if the id genuinely changed.
+
+    When `prev_src` is the pre-write page text, stored mark_layer_node_id
+    values that belong to this restamped block are rebound onto the new
+    parse (neighborhood align). Later blocks keep their live stamps, so
+    their sidecar ids are left alone until the next full-page render.
+    """
     _src2, new_blocks, _map2, _report2 = current_page_blocks(route_path, workspace)
     new_block = next((b for b in new_blocks if b['id'] == block_id), None)
     if new_block is None:
@@ -4122,15 +4211,34 @@ def _rerender_block(route_path, workspace, fs_path, new_src, block_id, old_block
     parse_markdown(new_src, link_resolver=resolver, terms_out=terms_out, lexicon=lexicon)
     badges_on = route_path in (ws.get('status_badges') or [])
     stamper = None
+    rebound = []
     try:
-        _, ml_src = strip_auto_lexicon_marker(new_src)
-        ml_src = strip_front_matter(ml_src)
-        stamper = MarkLayerDomStamper(to_mark_layer_nodes(ml_src))
+        next_nodes = to_mark_layer_nodes(_mark_layer_source(new_src))
+        stamper = MarkLayerDomStamper(next_nodes)
         for prior in new_blocks:
             if prior is new_block:
                 break
             stamper.skip_block(prior.get('text') or '')
-    except Exception:  # noqa: BLE001 — stamp is additive; never fail a rerender
+        if prev_src is not None:
+            prev_nodes = to_mark_layer_nodes(_mark_layer_source(prev_src))
+            probe = MarkLayerDomStamper(next_nodes)
+            for prior in new_blocks:
+                if prior is new_block:
+                    break
+                probe.skip_block(prior.get('text') or '')
+            para_id = probe.bind_block(new_block.get('text') or '')
+            only_ids = set(probe.bound_node_ids())
+            if para_id:
+                only_ids.add(para_id)
+            remap = align_mark_layer_nodes(prev_nodes, next_nodes)
+            only_old = {
+                old for old, new in remap.items()
+                if old in only_ids or new in only_ids
+            }
+            rebound = rebind_page_mark_layer_nodes(
+                route_path, workspace, prev_nodes, next_nodes, only_old or None,
+            ) if only_old else []
+    except Exception:  # noqa: BLE001 — stamp/rebind is additive; never fail a rerender
         stamper = None
     html = render_block_html(
         new_block, route_path,
@@ -4140,7 +4248,7 @@ def _rerender_block(route_path, workspace, fs_path, new_src, block_id, old_block
         auto_local_terms=_auto_local_for(new_block, terms_out),
         stamper=stamper,
     )
-    return {'block_id': new_block['id'], 'html': html}
+    return {'block_id': new_block['id'], 'html': html, 'mark_layer_rebound': rebound}
 
 
 def apply_sentence_change(route_path, workspace, mark, author_label='claude'):
@@ -4169,7 +4277,9 @@ def apply_sentence_change(route_path, workspace, mark, author_label='claude'):
     if repo_root:
         message = f"mdp: change {mark.get('id')} on {route_path} ({author_label})"
         commit_sha, commit_err = _git_commit_file(repo_root, fs_path, message)
-    result = _rerender_block(route_path, workspace, fs_path, new_src, block_id, block)
+    result = _rerender_block(
+        route_path, workspace, fs_path, new_src, block_id, block, prev_src=normalized,
+    )
     result['commit'] = commit_sha
     result['commit_error'] = commit_err
     result['sentence_index'] = sentence_index
@@ -4218,7 +4328,9 @@ def apply_sentence_revert(route_path, workspace, mark):
     if repo_root:
         message = f"mdp: revert {mark.get('id')} on {route_path} (Mike)"
         commit_sha, commit_err = _git_commit_file(repo_root, fs_path, message)
-    result = _rerender_block(route_path, workspace, fs_path, new_src, block_id, block)
+    result = _rerender_block(
+        route_path, workspace, fs_path, new_src, block_id, block, prev_src=normalized,
+    )
     result['commit'] = commit_sha
     result['commit_error'] = commit_err
     result['sentence_index'] = sentence_index
@@ -4303,7 +4415,9 @@ def apply_sentence_fold(route_path, workspace, block_id, sentence_text, term):
     if repo_root:
         message = f"mdp: fold '{term}' on {route_path}"
         commit_sha, commit_err = _git_commit_file(repo_root, fs_path, message)
-    result = _rerender_block(route_path, workspace, fs_path, new_src, block_id, block)
+    result = _rerender_block(
+        route_path, workspace, fs_path, new_src, block_id, block, prev_src=normalized,
+    )
     result['commit'] = commit_sha
     result['commit_error'] = commit_err
     return result
@@ -4524,14 +4638,19 @@ def render_page(route_path, workspace=DEFAULT_WORKSPACE, view='classic'):
 
     badges_on = route_path in (ws.get('status_badges') or [])
     # Build adapter nodes before HTML so each sentence/block can carry its
-    # MarkLayerNode id. Same strip as the embed below; a stamp miss is
-    # silent (old text-occurrence jump remains).
+    # MarkLayerNode id. Rebind stored ids from the previous parse so a
+    # mid-doc edit that shifts occurrence suffixes still querySelector-hits.
     mark_layer_stamper = None
     mark_layer_nodes_json = 'null'
     try:
-        _, mark_layer_src = strip_auto_lexicon_marker(src)
-        mark_layer_src = strip_front_matter(mark_layer_src)
+        mark_layer_src = _mark_layer_source(src)
         mark_layer_nodes = to_mark_layer_nodes(mark_layer_src)
+        prev_nodes = load_mark_layer_nodes_cache(route_path, workspace)
+        if prev_nodes:
+            rebind_page_mark_layer_nodes(
+                route_path, workspace, prev_nodes, mark_layer_nodes,
+            )
+        save_mark_layer_nodes_cache(route_path, mark_layer_nodes, workspace)
         mark_layer_nodes_json = json.dumps(mark_layer_nodes)
         mark_layer_stamper = MarkLayerDomStamper(mark_layer_nodes)
     except Exception as e:  # noqa: BLE001 — additive value, must never 500 a page
@@ -7087,9 +7206,11 @@ class Handler(BaseHTTPRequestHandler):
                         comment['read_states'] = {
                             str(k): str(v) for k, v in read_states.items()
                         }
-                # 6a beside (first step, not cutover): additively store the
-                # matching MarkLayerNode id(s). Old anchor/quote/snapshot
-                # fields stay the default read/render path.
+                # 6a create rides MarkLayerNode: persist the DOM stamp id
+                # when the client sent one, else unique quote/snapshot
+                # match. Old block_id/quote stay dual-written (residual).
+                if data.get('mark_layer_node_id'):
+                    comment['mark_layer_node_id'] = str(data.get('mark_layer_node_id'))
                 maybe_attach_mark_layer_nodes(comment, page, workspace)
             if ctype == 'verdict':
                 comment['verdict'] = data.get('verdict')

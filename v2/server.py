@@ -473,6 +473,14 @@ a.external-link::after { content: " \2197"; font-size: 11px; opacity: .6; }
                           border: 1px solid #262b33; vertical-align: middle; cursor: default; }
 .mark-layer-node-badge:not([hidden]) { display: inline-block; }
 .mark-layer-node-badge-changed { background: #3a2d12; color: #e0b04b; border-color: #6b4f14; }
+/* Additive 6a UI: show a stored mark_layer_node_id and flash its sentence.
+   Missing ids render nothing. Does not replace block_id / quote render. */
+button.mark-layer-node-id { display: inline-block; margin-top: 6px; max-width: 100%;
+  padding: 1px 7px; border-radius: 4px; border: 1px solid #2f4a6e; background: #1c2434;
+  color: #8ab4f8; font-family: ui-monospace, Menlo, monospace; font-size: 10px;
+  line-height: 1.5; cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+button.mark-layer-node-id:hover { border-color: #2f6feb; color: #c5dcff; }
+.mark-layer-node-flash { outline: 2px solid #2f6feb; background: #2f6feb33; border-radius: 3px; }
 .sidebar a { display: block; padding: 6px 8px; border-radius: 6px; text-decoration: none; font-size: 14px; color: #cbd3e0; }
 .sidebar a:hover { background: #1e2430; }
 .sidebar a.active { background: #22344a; color: #9cc7ff; }
@@ -837,6 +845,113 @@ function escapeHtml(s) {
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
+// Additive 6a UI helper: display / jump via a stored mark_layer_node_id.
+// Old block_id + quote remain the default create/render path. A missing
+// id is a no-op (no chip, no throw). Looks up window.__MARK_LAYER_NODES__
+// and scrolls/highlights the matching .mark-sentence or .block-wrap.
+function markLayerNodeText(node) {
+  if (!node || !Array.isArray(node.fragments)) return '';
+  return node.fragments.map(f => (f && f.text) || '').join('').trim();
+}
+
+function findMarkLayerNode(nodes, nodeId) {
+  if (!nodeId || !Array.isArray(nodes)) return null;
+  return nodes.find(n => n && n.id === nodeId) || null;
+}
+
+function markLayerUnitQuote(el) {
+  if (!el) return '';
+  if (el.dataset && el.dataset.quote) {
+    try { return b64ToUtf8(el.dataset.quote).trim(); } catch (_) {}
+  }
+  return ((el.textContent || '')).trim();
+}
+
+function markLayerBlockText(el) {
+  if (!el) return '';
+  if (el.dataset && el.dataset.normText) {
+    try { return b64ToUtf8(el.dataset.normText).trim(); } catch (_) {}
+  }
+  return ((el.textContent || '')).trim();
+}
+
+function findMarkLayerNodeEl(nodeId, opts) {
+  const options = opts || {};
+  const nodes = options.nodes || window.__MARK_LAYER_NODES__;
+  const root = options.root || document;
+  const node = findMarkLayerNode(nodes, nodeId);
+  if (!node) return null;
+  const text = markLayerNodeText(node);
+  if (!text) return null;
+  const kind = node.kind || '';
+  const same = (Array.isArray(nodes) ? nodes : []).filter(
+    n => n && n.kind === kind && markLayerNodeText(n) === text);
+  const occurrence = same.findIndex(n => n.id === nodeId);
+  if (occurrence < 0) return null;
+  let candidates;
+  if (kind === 'sentence') {
+    candidates = Array.from(root.querySelectorAll('.mark-sentence'))
+      .filter(el => markLayerUnitQuote(el) === text);
+  } else {
+    const stripped = text.replace(/^#{1,6}\s+/, '');
+    candidates = Array.from(root.querySelectorAll('.block-wrap')).filter(el => {
+      const blockText = markLayerBlockText(el);
+      return blockText === text || blockText === stripped;
+    });
+  }
+  return candidates[occurrence] || null;
+}
+
+function jumpToMarkLayerNode(nodeId, opts) {
+  if (!nodeId) return {ok: false, reason: 'missing-id'};
+  let el = null;
+  try {
+    el = findMarkLayerNodeEl(nodeId, opts);
+  } catch (_) {
+    return {ok: false, reason: 'error'};
+  }
+  if (!el) return {ok: false, reason: 'not-found'};
+  const options = opts || {};
+  document.querySelectorAll('.mark-layer-node-flash').forEach(n => {
+    n.classList.remove('mark-layer-node-flash');
+  });
+  if (typeof el.scrollIntoView === 'function') {
+    el.scrollIntoView({block: 'center', behavior: options.behavior || 'smooth'});
+  }
+  el.classList.add('mark-layer-node-flash');
+  if (jumpToMarkLayerNode._timer) clearTimeout(jumpToMarkLayerNode._timer);
+  const flashMs = options.flashMs == null ? 1600 : options.flashMs;
+  if (flashMs > 0) {
+    jumpToMarkLayerNode._timer = setTimeout(() => {
+      el.classList.remove('mark-layer-node-flash');
+    }, flashMs);
+  }
+  return {ok: true, el};
+}
+
+function markLayerNodeIdButton(nodeId) {
+  if (!nodeId) return '';
+  const id = String(nodeId);
+  return `<button type="button" class="mark-layer-node-id" data-mark-layer-node-id="${escapeHtml(id)}" title="Jump to this sentence">${escapeHtml(id)}</button>`;
+}
+
+function wireMarkLayerNodeIdButtons(root) {
+  if (!root || typeof root.querySelectorAll !== 'function') return;
+  root.querySelectorAll('.mark-layer-node-id').forEach(btn => {
+    if (btn.dataset.wired === '1') return;
+    btn.dataset.wired = '1';
+    btn.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      jumpToMarkLayerNode(btn.dataset.markLayerNodeId);
+    });
+  });
+}
+
+window.jumpToMarkLayerNode = jumpToMarkLayerNode;
+window.findMarkLayerNodeEl = findMarkLayerNodeEl;
+window.markLayerNodeIdButton = markLayerNodeIdButton;
+
 // Minimal word-level diff (LCS-based) for rendering suggested-edit comments inline.
 // Good enough for short-to-medium block text; not meant to compete with a real diff lib.
 function wordDiff(before, after) {
@@ -896,13 +1011,15 @@ function renderCommentItem(c) {
   const actions = canEditDelete
     ? `<span class="comment-actions"><button class="edit-comment-btn" title="Edit">&#9998;</button><button class="delete-comment-btn" title="Delete">&#128465;</button></span>`
     : '';
+  const nodeChip = markLayerNodeIdButton(c.mark_layer_node_id);
   div.innerHTML = `<div class="meta">${actions}${c.author} · ${new Date(c.timestamp).toLocaleString()} · ${badge}${editedNote}${deletedNote}</div>
-    ${bodyHtml}`;
+    ${bodyHtml}${nodeChip}`;
 
   if (canEditDelete) {
     div.querySelector('.edit-comment-btn').addEventListener('click', () => startInlineEdit(div, c));
     div.querySelector('.delete-comment-btn').addEventListener('click', () => deleteComment(div, c));
   }
+  wireMarkLayerNodeIdButtons(div);
   return div;
 }
 
@@ -1727,7 +1844,7 @@ window.initMarkLayer = function initMarkLayer() {
       body:c.text || '', before:c.before || c.snapshot || '', after:c.proposed || '',
       reason:c.reason || '', strength:c.strength || 1, scope:c.scope || null,
       sent:true, status:c.status || 'queued', deleted:!!c.deleted, unresolved:!!c.unresolved,
-      threadId:c.thread_id
+      threadId:c.thread_id, markLayerNodeId:c.mark_layer_node_id || null
     };
   }
   function markAt(meta) {
@@ -1826,7 +1943,8 @@ window.initMarkLayer = function initMarkLayer() {
       if (m.kind === 'strike') body = m.reason ? `struck\nR: ${m.reason}` : 'struck';
       const quote = (m.to != null && m.quote && ['clarify','rewrite','strike','note'].includes(m.kind))
         ? `<div class="ml-quote">on “${escapeHtml(m.quote)}”</div>` : '';
-      return `<div class="ml-mark ml-${m.kind}">${quote}<div class="ml-who">${escapeHtml(m.author || 'Mike')} · ${def.label}`+
+      const node = (typeof markLayerNodeIdButton === 'function') ? markLayerNodeIdButton(m.markLayerNodeId) : '';
+      return `<div class="ml-mark ml-${m.kind}">${quote}${node}<div class="ml-who">${escapeHtml(m.author || 'Mike')} · ${def.label}`+
         `${m.strength>1?` ×${m.strength}`:''}<span class="ml-meta">${m.sent?(m.status||'sent'):'queued'}</span>`+
         `<button class="ml-drop" data-ml-drop="${m.id}" data-pending="${m.sent?'0':'1'}" title="Remove">×</button></div>`+
         `${body?`<div class="ml-body">${escapeHtml(body)}</div>`:''}</div>`;
@@ -1986,6 +2104,8 @@ window.initMarkLayer = function initMarkLayer() {
   function jump(){render();const meta=currentMeta();if(meta)meta.el.scrollIntoView({block:'center',behavior:'smooth'});}
 
   document.addEventListener('click',async e=>{
+    const nodeBtn=e.target.closest('[data-mark-layer-node-id]');
+    if(nodeBtn){jumpToMarkLayerNode(nodeBtn.dataset.markLayerNodeId);return;}
     const drop=e.target.closest('[data-ml-drop]');
     if(drop){
       if(drop.dataset.pending==='1'){pending=pending.filter(m=>m.id!==drop.dataset.mlDrop);save();render();}
@@ -2133,6 +2253,7 @@ body.v3-view .sidebar.v3-sidebar-closed + .v3-sidebar-toggle-open{display:block;
 .v3-mr-status.resolved{background:#1c3a24;color:#63e089;}
 .v3-mr-status.stale{background:#3a1c1c;color:#e06363;}
 .v3-mr-quote{font-size:12px;color:#c8ccd2;margin-top:4px;font-style:italic;overflow:hidden;text-overflow:ellipsis;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;}
+.v3-mark-row .mark-layer-node-id,.v3-dialog .mark-layer-node-id{margin-top:6px;}
 .v3-panel-empty{padding:20px 16px;color:#8a8f98;font-size:13px;}
 .v3-dialog-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:60;display:flex;align-items:center;justify-content:center;}
 .v3-dialog{width:460px;max-width:92vw;max-height:80vh;overflow-y:auto;background:#181b21;border:1px solid #2a2d34;border-radius:10px;padding:18px;}
@@ -2816,10 +2937,12 @@ V3_JS = r"""
       const folded = m.folded && !expandedFold.has(m.id);
       const chevron = m.folded ? `<button class="v3-fold-toggle" data-fold-id="${m.id}">${folded ? '▸' : '▾'}</button>` : '';
       const quoteHtml = folded ? '' : `<div class="v3-mr-quote">${mdLinkify(escapeHtml(quote))}</div>`;
+      const nodeHtml = folded ? '' : (typeof markLayerNodeIdButton === 'function' ? markLayerNodeIdButton(m.mark_layer_node_id) : '');
       return `<div class="v3-mark-row${folded ? ' v3-folded' : ''}" data-mark-id="${m.id}">
         <div class="v3-mr-top">${chevron}<span class="v3-mr-kind">${meta.glyph} ${meta.label}</span>
           <span class="v3-mr-status ${status}">${status}</span></div>
         ${quoteHtml}
+        ${nodeHtml}
       </div>`;
     }).join('');
     let termsHtml = '';
@@ -2834,10 +2957,12 @@ V3_JS = r"""
     list.querySelectorAll('.v3-mark-row').forEach(row => {
       row.addEventListener('click', (e) => {
         if (e.target.closest('.v3-fold-toggle')) return;
+        if (e.target.closest('.mark-layer-node-id')) return;
         const m = allRows.find(r => r.id === row.dataset.markId);
         if (m) openDialog(m);
       });
     });
+    if (typeof wireMarkLayerNodeIdButtons === 'function') wireMarkLayerNodeIdButtons(list);
     list.querySelectorAll('.v3-fold-toggle').forEach(btn => {
       btn.addEventListener('click', (e) => {
         e.stopPropagation();
@@ -3033,6 +3158,7 @@ V3_JS = r"""
       ${m.text && m.type !== 'edit' && m.kind !== 'decision' ? `<div>${mdLinkify(escapeHtml(m.text))}</div>` : ''}
       ${historyHtml}
       <div style="color:#8a8f98;font-size:11px;margin-top:6px;">${escapeHtml(m.author||'mike')} &middot; block ${escapeHtml(m.block_id||'(page-level)')}${m.stale?' &middot; source text has changed since this mark was made':''}</div>
+      ${typeof markLayerNodeIdButton === 'function' ? markLayerNodeIdButton(m.mark_layer_node_id) : ''}
       <div class="v3-dialog-actions">
         ${extraActions}
         ${!extraActions ? (m.resolved ? '<button data-v3-reopen>Reopen</button>' : '<button class="primary" data-v3-resolve>Resolve</button>') : ''}
@@ -3042,6 +3168,7 @@ V3_JS = r"""
     document.body.appendChild(backdrop);
     backdrop.addEventListener('click', (e) => { if (e.target === backdrop) backdrop.remove(); });
     backdrop.querySelector('[data-v3-close]').addEventListener('click', () => backdrop.remove());
+    if (typeof wireMarkLayerNodeIdButtons === 'function') wireMarkLayerNodeIdButtons(backdrop);
     backdrop.querySelector('[data-v3-scroll]')?.addEventListener('click', () => {
       jumpToBlock(m.block_id);
     });
@@ -3734,8 +3861,8 @@ def maybe_attach_mark_layer_nodes(comment, page, workspace):
 
     Uses the same page-source bytes `GET /api/mark-layer` feeds
     `to_mark_layer_nodes`. A miss, empty node list, or adapter error is a
-    no-op — the old mark path still writes. Live UI does not read these
-    fields yet.
+    no-op — the old mark path still writes. Live UI may display/jump via
+    the id; old block-parser fields remain the default read/render path.
     """
     try:
         fs_path = resolve_page(page, workspace)

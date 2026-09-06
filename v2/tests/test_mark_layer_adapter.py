@@ -13,6 +13,7 @@ sys.path.insert(0, V2_DIR)
 from mark_layer_adapter import (  # noqa: E402
     to_mark_layer_nodes, match_mark_layer_nodes, attach_mark_layer_node_ids,
     MarkLayerDomStamper, align_mark_layer_nodes, rebind_mark_layer_node_ids,
+    block_for_mark_layer_node, find_mark_layer_node,
 )
 from mdblocks import norm  # noqa: E402
 
@@ -338,6 +339,25 @@ class MatchMarkLayerNodesTests(unittest.TestCase):
         self.assertEqual(ready[1]['id'], record['mark_layer_node_id'])
         self.assertEqual(ready[1]['id'], record['mark_layer_node_ids'][0])
 
+    def test_attach_rejects_supplied_stamp_when_quote_disagrees(self):
+        text = 'Alpha is first. Beta is second. Gamma is third.'
+        nodes = to_mark_layer_nodes(text)
+        alpha = next(
+            n for n in nodes
+            if n['kind'] == 'sentence' and n['fragments'][0]['text'].strip() == 'Alpha is first.'
+        )
+        beta = next(
+            n for n in nodes
+            if n['kind'] == 'sentence' and n['fragments'][0]['text'].strip() == 'Beta is second.'
+        )
+        record = {
+            'type': 'mark', 'quote': 'Beta is second.',
+            'mark_layer_node_id': alpha['id'],
+        }
+        attach_mark_layer_node_ids(record, text)
+        self.assertEqual(beta['id'], record['mark_layer_node_id'])
+        self.assertNotEqual(alpha['id'], record['mark_layer_node_id'])
+
     def test_attach_drops_stale_supplied_id_when_quote_does_not_unique_match(self):
         text = 'Ready. Unique first context.\n\nReady. Unique second context.'
         record = {
@@ -479,6 +499,28 @@ class MarkLayerDomStamperTests(unittest.TestCase):
         self.assertIsNone(stamper.next_sentence('Ready.'))
         stamper.bind_block('Ready. Unique second context.')
         self.assertEqual(ready[1]['id'], stamper.next_sentence('Ready.'))
+
+    def test_block_for_mark_layer_node_resolves_repeated_sentence(self):
+        text = 'Ready. Unique first context.\n\nReady. Unique second context.'
+        nodes = to_mark_layer_nodes(text)
+        ready = [
+            n for n in nodes
+            if n['kind'] == 'sentence' and n['fragments'][0]['text'].strip() == 'Ready.'
+        ]
+        blocks = [
+            {'id': 'blk_first', 'text': 'Ready. Unique first context.'},
+            {'id': 'blk_second', 'text': 'Ready. Unique second context.'},
+        ]
+        self.assertEqual(
+            'blk_second',
+            block_for_mark_layer_node(blocks, nodes, ready[1]['id'])['id'],
+        )
+        self.assertEqual(
+            'blk_first',
+            block_for_mark_layer_node(blocks, nodes, ready[0]['id'])['id'],
+        )
+        self.assertIsNone(block_for_mark_layer_node(blocks, nodes, 'pmsent-no-such'))
+        self.assertEqual(ready[1]['id'], find_mark_layer_node(nodes, ready[1]['id'])['id'])
 
 
 if __name__ == '__main__':

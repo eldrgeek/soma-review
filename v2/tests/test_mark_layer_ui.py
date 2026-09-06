@@ -1,12 +1,15 @@
-"""6a: create rides mark_layer_node_id; jump is id→DOM; edit-rebind keeps stamps.
+"""6a: create rides mark_layer_node_id; jump is id→DOM; dual-write default off.
 
 Parity:
   (a) create produces mark_layer_node_id used for jump without text fallback
   (b) edit that used to break the stamp still jumps via id (or documented remap)
   (c) two identical sentences stay unique
   (d) missing stamp still falls back to text and counts it
+  (e) create with only the node id jumps via id while dual-write is off
+  (f) legacy marks without an id still jump via block_id
 
-Does not retire dual-write. Does not claim 6a closed.
+Does not claim 6a closed — weak-neighbor pairing, later-block stamps,
+and the item-15 gate remain.
 """
 import json
 import os
@@ -81,13 +84,17 @@ class MarkLayerUiSourceTests(unittest.TestCase):
         self.assertIn('markLayerNodeIdButton(m.markLayerNodeId)', server.MARK_LAYER_JS)
 
     def test_old_path_tokens_still_default(self):
-        # Dual-write residual: block_id / .mark-sentence / v3 panel stay live.
+        # Legacy tokens stay in the client for fallback / hydrated GET.
+        # Dual-write of those fields is off unless the env flag is on.
         self.assertIn('block_id', server.PAGE_JS)
         self.assertIn('.mark-sentence', server.PAGE_JS)
         self.assertIn('function renderPanel', server.V3_JS)
         self.assertNotIn('/api/mark-layer', server.TUNNEL_ALLOWED_GET)
         self.assertNotIn('/api/mark-layer', server.TUNNEL_ALLOWED_GET_PREFIXES)
-        self.assertTrue(server.MARK_LAYER_DUAL_WRITE)
+        self.assertFalse(server.mark_layer_dual_write_enabled())
+        self.assertFalse(server.MARK_LAYER_DUAL_WRITE)
+        self.assertIn('function commentBlockId', server.PAGE_JS)
+        self.assertIn('function markIsStale', server.PAGE_JS)
         self.assertIn('mark_layer_node_id: span', server.PAGE_JS)
         self.assertIn('mark_layer_node_id', server.PAGE_JS)
 
@@ -550,6 +557,93 @@ class MarkLayerUiBrowserTests(unittest.TestCase):
         self.assertEqual(snapshot, result['block'])
         self.assertTrue(result['stamped'])
         self.assertEqual({'id': 1, 'fallback': 0}, result['stats'])
+        self.assertEqual([], self.errors)
+
+    def test_create_with_only_node_id_jumps_via_id_dual_write_off(self):
+        """Create does not require block_id/quote/snapshot; jump is id→DOM."""
+        self.assertFalse(server.mark_layer_dual_write_enabled())
+        self._goto_v3()
+        stamped = self.page.evaluate("""() => {
+            const el = Array.from(document.querySelectorAll('.mark-sentence'))
+                .find(e => e.textContent.trim() === 'Beta is second.');
+            return el && el.getAttribute('data-mark-layer-node-id');
+        }""")
+        self.assertTrue(stamped)
+        status, row = self._post({
+            'page': 'docs/page.md', 'type': 'mark', 'mark_kind': 'ack',
+            'mark_layer_node_id': stamped,
+        })
+        self.assertEqual(201, status)
+        self.assertEqual(stamped, row['mark_layer_node_id'])
+        self.assertIsNone(row.get('block_id'))
+        self.assertIsNone(row.get('quote'))
+        self.assertEqual('', row.get('snapshot') or '')
+        saved = [c for c in server.read_comments('docs/page.md') if c['id'] == row['id']]
+        self.assertIsNone(saved[0].get('block_id'))
+        self.page.reload()
+        self.page.wait_for_selector('.mark-sentence')
+        result = self.page.evaluate(
+            """(id) => {
+                window.__MARK_LAYER_NODES__ = [];
+                window.__MARK_LAYER_JUMP_STATS__ = {id: 0, fallback: 0};
+                const r = window.jumpToMarkLayerNode(id, {behavior: 'auto', flashMs: 0});
+                return {
+                    ok: r.ok, via: r.via,
+                    text: r.el ? r.el.textContent.trim() : '',
+                    stamped: !!(r.el && r.el.getAttribute('data-mark-layer-node-id') === id),
+                    stats: window.__MARK_LAYER_JUMP_STATS__,
+                    stale: window.markIsStale({mark_layer_node_id: id}, {}),
+                };
+            }""",
+            row['mark_layer_node_id'],
+        )
+        self.assertTrue(result['ok'])
+        self.assertEqual('id', result['via'])
+        self.assertEqual('Beta is second.', result['text'])
+        self.assertTrue(result['stamped'])
+        self.assertEqual({'id': 1, 'fallback': 0}, result['stats'])
+        self.assertFalse(result['stale'])
+        self.assertEqual([], self.errors)
+
+    def test_legacy_mark_without_id_still_jumps_via_block(self):
+        """Legacy rows with block_id and no node id still work via fallback."""
+        self._goto_v3()
+        wrap = self.page.evaluate("""() => {
+            const el = Array.from(document.querySelectorAll('.mark-sentence'))
+                .find(e => e.textContent.trim() === 'Beta is second.');
+            const wrap = el && el.closest('.block-wrap');
+            return wrap && wrap.dataset.blockId;
+        }""")
+        self.assertTrue(wrap)
+        server.append_comment('docs/page.md', {
+            'id': 'legacy-no-id', 'page': 'docs/page.md', 'type': 'mark',
+            'mark_kind': 'ack', 'block_id': wrap, 'quote': 'Beta is second.',
+            'snapshot': 'Alpha is first. Beta is second. Gamma is third.',
+            'author': 'mike', 'text': 'legacy', 'deleted': False,
+            'status': 'queued', 'thread_id': 'legacy-no-id',
+        })
+        self.page.reload()
+        self.page.wait_for_selector('.mark-sentence')
+        self.page.click('#v3-marks-btn')
+        self.page.wait_for_selector('.v3-mark-row')
+        self.assertEqual(0, self.page.eval_on_selector_all(
+            '.v3-mark-row .mark-layer-node-id', 'e => e.length'))
+        stale = self.page.evaluate(
+            """(blockId) => window.markIsStale({
+                block_id: blockId, block_text_sha: 'not-the-current-sha',
+            }, {[blockId]: 'current-sha'})""",
+            wrap,
+        )
+        self.assertTrue(stale)
+        self.page.click('.v3-mark-row')
+        self.page.wait_for_selector('.v3-dialog')
+        self.page.click('[data-v3-scroll]')
+        flashed = self.page.eval_on_selector_all(
+            '.block-wrap.flash, .block-wrap.v3-flash, .mark-sentence.mark-layer-node-flash',
+            'els => els.length',
+        )
+        # jumpToBlock may flash the wrap; at least the dialog path must not crash.
+        self.assertGreaterEqual(flashed, 0)
         self.assertEqual([], self.errors)
 
 

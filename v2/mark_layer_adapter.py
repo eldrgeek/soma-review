@@ -13,20 +13,23 @@ prerequisite named in `playmaker/docs/MARK-LAYER-ENGINE.md` "Next" item 1
 ("soma-review consumption") before the live block parser can be rewired to
 produce it.
 
-Write-side (2026-09-06, create rides the node): `POST /api/comments`
-type=mark treats `mark_layer_node_id` as the primary anchoring record.
-`attach_mark_layer_node_ids` prefers a client-supplied stamp id that
-still exists in the current parse, then unique quote/snapshot match.
-Default jump/render is that stored id → DOM `data-mark-layer-node-id`
-(`MarkLayerDomStamper` walks these nodes in document order).
-Text-occurrence lookup remains the counted fallback when the id or
-stamp is missing.
+Write-side (2026-09-06, dual-write retired as default): `POST /api/comments`
+type=mark treats `mark_layer_node_id` as the sole required anchoring
+record for a unique match. `attach_mark_layer_node_ids` prefers a
+client-supplied stamp id that still exists in the current parse and
+agrees with a supplied quote (Skip 2026-09-06 nit 1), then unique
+quote/snapshot match. Default jump/render is that stored id → DOM
+`data-mark-layer-node-id` (`MarkLayerDomStamper` walks these nodes in
+document order). Text-occurrence lookup remains the counted fallback
+when the id or stamp is missing.
 
-Old `block_id` / quote / snapshot stay dual-written because
-`apply_sentence_change`, the ringer list, and v3 stale detection still
-consume them. That dual-write is a named residual (item-15 view-diff /
-parity gate), not the default create identity. 6a stays open until
-dual-write is retired AND edit-rebind is proven.
+Old `block_id` / quote / snapshot are not written on unique-match
+creates unless `SOMA_REVIEW_MARK_LAYER_DUAL_WRITE` is explicitly on
+(compat bridge, default off). Readers use the stored id when present
+and fall back to those fields only for legacy rows. 6a stays open
+until edit-rebind is proven against the item-15 view-diff / parity
+gate; named residuals remain (weak-neighbor pairing, later-block
+stamps until full-page rebind, occurrence-suffix mint).
 
 Edit-rebind: `align_mark_layer_nodes` maps previous-parse ids onto the
 current parse by unique fingerprint, then neighborhood for duplicates,
@@ -82,13 +85,13 @@ would read two untouched nodes as deleted-and-recreated, purely because an
 unrelated sibling with the same text was inserted earlier in the doc. This
 is the same failure SHAPE Anchoring v2 exists to prevent (`blockmap.py`),
 one layer down: content-hash ids are stable, but the occurrence COUNTER
-layered on top to break ties is itself position-derived. Create now writes `mark_layer_node_id` as the primary record (client
-stamp id, else unique match). Cross-edit identity is `align_mark_layer_nodes`
-+ sidecar rebind, not a change to `_content_id` minting — the suffix
-still shifts in the twin emitter; rebind accounts that remap so a stored
-id keeps querySelector-hitting the same sentence (or a named unpaired
-residual). Do not claim 6a closed while dual-write and the suffix mint
-remain load-bearing.
+layered on top to break ties is itself position-derived. Create now writes `mark_layer_node_id` as the sole required record
+(client stamp id that agrees with quote, else unique match). Cross-edit
+identity is `align_mark_layer_nodes` + sidecar rebind, not a change to
+`_content_id` minting — the suffix still shifts in the twin emitter;
+rebind accounts that remap so a stored id keeps querySelector-hitting
+the same sentence (or a named unpaired residual). Do not claim 6a
+closed while the suffix mint and item-15 gate remain.
 
 **Known gap, still flagged rather than fixed:**
 
@@ -172,6 +175,57 @@ def _sentence_nodes(seen: dict[str, int], paragraph_text: str) -> list[dict[str,
 
 def _node_text(node: dict[str, Any]) -> str:
     return ''.join(str(frag.get('text') or '') for frag in (node.get('fragments') or []))
+
+
+def mark_layer_node_text(node: dict[str, Any] | None) -> str:
+    """Public wrapper for a node's joined fragment text."""
+    if not node:
+        return ''
+    return _node_text(node)
+
+
+def _quote_agrees_with_node(node: dict[str, Any], quote: str | None) -> bool:
+    """True when there is no quote to check, or it equals the node's text.
+
+    Skip 2026-09-06 nit 1: a client stamp for sentence A plus a quote for
+    sentence B must not silently persist A's id.
+    """
+    needle = (quote or '').strip()
+    if not needle:
+        return True
+    return _node_text(node).strip() == needle
+
+
+def find_mark_layer_node(
+    nodes: list[dict[str, Any]] | None, node_id: str | None,
+) -> dict[str, Any] | None:
+    if not node_id or not nodes:
+        return None
+    return next((node for node in nodes if node.get('id') == node_id), None)
+
+
+def block_for_mark_layer_node(
+    blocks: list[dict[str, Any]] | None,
+    nodes: list[dict[str, Any]] | None,
+    node_id: str | None,
+) -> dict[str, Any] | None:
+    """The current parse block that carries `node_id`, via stamper order.
+
+    Walks blocks the same way render stamps them, so a repeated sentence
+    resolves to its occurrence, not the first text hit. None when the id
+    is missing or no block consumed it.
+    """
+    if not node_id or not blocks:
+        return None
+    stamper = MarkLayerDomStamper(nodes)
+    for block in blocks:
+        para_id = stamper.bind_block(block.get('text') or '')
+        ids = set(stamper.bound_node_ids())
+        if para_id:
+            ids.add(para_id)
+        if node_id in ids:
+            return block
+    return None
 
 
 def _paragraph_groups(nodes: list[dict[str, Any]]) -> list[tuple[dict[str, Any] | None, list[dict[str, Any]]]]:
@@ -494,11 +548,13 @@ def attach_mark_layer_node_ids(
     """Write `mark_layer_node_id` / `mark_layer_node_ids` as the create record.
 
     Prefers a client-supplied id that still exists in the current parse
-    (the DOM stamp at mark time). Otherwise unique quote/snapshot match.
-    Adapter failure, empty nodes, or unmatched quote leave the record
-    without a node id — page-level / ambiguous marks still persist.
-    Does not raise. Existing block_id/quote/snapshot are not stripped
-    (dual-write residual).
+    (the DOM stamp at mark time) and whose text agrees with a supplied
+    quote. A quote↔id mismatch falls through to unique quote/snapshot
+    match instead of trusting the stamp. Adapter failure, empty nodes,
+    or unmatched quote leave the record without a node id — page-level
+    / ambiguous marks still persist. Does not raise. Does not write
+    block_id/quote/snapshot; the server strips those on unique-match
+    creates unless SOMA_REVIEW_MARK_LAYER_DUAL_WRITE is on.
     """
     try:
         if not isinstance(record, dict):
@@ -511,8 +567,8 @@ def attach_mark_layer_node_ids(
             return record
         supplied = record.get('mark_layer_node_id')
         if supplied:
-            hit = next((node for node in nodes if node.get('id') == supplied), None)
-            if hit is not None:
+            hit = find_mark_layer_node(nodes, supplied)
+            if hit is not None and _quote_agrees_with_node(hit, record.get('quote')):
                 ids = _ids_for_matched_node(nodes, hit)
                 if ids:
                     record['mark_layer_node_id'] = ids[0]

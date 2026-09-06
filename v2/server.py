@@ -37,7 +37,7 @@ import tours as tour_engine  # noqa: E402  (Quinn tours of completed jobs — se
 import cursor_intake  # noqa: E402  (Grok/Cursor intake — see SOMA/cursor-intake/README.md)
 from mark_layer_adapter import (  # noqa: E402  (SOMA agreed model item 6a)
     to_mark_layer_nodes, attach_mark_layer_node_ids, MarkLayerDomStamper,
-    align_mark_layer_nodes, rebind_mark_layer_node_ids,
+    align_mark_layer_nodes, rebind_mark_layer_node_ids, remap_ledger_entries,
     block_for_mark_layer_node, find_mark_layer_node, mark_layer_node_text,
 )
 
@@ -390,7 +390,8 @@ def _mark_layer_source(src):
     return strip_front_matter(mark_layer_src)
 
 
-def load_mark_layer_nodes_cache(route_path, workspace=DEFAULT_WORKSPACE):
+def load_mark_layer_nodes_payload(route_path, workspace=DEFAULT_WORKSPACE):
+    """Full `.mark-layer-nodes.json` payload (nodes + remap ledger)."""
     path = mark_layer_nodes_cache_path(route_path, workspace)
     if not os.path.isfile(path):
         return None
@@ -399,15 +400,52 @@ def load_mark_layer_nodes_cache(route_path, workspace=DEFAULT_WORKSPACE):
             payload = json.load(handle)
     except (OSError, json.JSONDecodeError):
         return None
-    nodes = payload.get('nodes') if isinstance(payload, dict) else None
+    return payload if isinstance(payload, dict) else None
+
+
+def load_mark_layer_nodes_cache(route_path, workspace=DEFAULT_WORKSPACE):
+    payload = load_mark_layer_nodes_payload(route_path, workspace)
+    if not payload:
+        return None
+    nodes = payload.get('nodes')
     return nodes if isinstance(nodes, list) else None
 
 
-def save_mark_layer_nodes_cache(route_path, nodes, workspace=DEFAULT_WORKSPACE):
+def load_mark_layer_remap_ledger(route_path, workspace=DEFAULT_WORKSPACE):
+    """Accounted remaps for occurrence-suffix (and other align) shifts.
+
+    Permanent identity model while `_content_id` keeps the Playmaker twin
+    `-{n}` mint. Empty list when the cache is missing or has no ledger.
+    """
+    payload = load_mark_layer_nodes_payload(route_path, workspace)
+    if not payload:
+        return []
+    ledger = payload.get('remap_ledger')
+    return list(ledger) if isinstance(ledger, list) else []
+
+
+def save_mark_layer_nodes_cache(
+    route_path, nodes, workspace=DEFAULT_WORKSPACE, remap_entries=None,
+):
+    """Persist the current parse plus an append-only remap ledger.
+
+    `model: remap-ledger` is the accepted identity story for suffix
+    drift: unique (kind, text) already has no `-{n}`; duplicates keep
+    the twin positional suffix; stored marks move through accounted
+    remaps rather than a fake stable-id claim.
+    """
     path = mark_layer_nodes_cache_path(route_path, workspace)
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    existing = load_mark_layer_nodes_payload(route_path, workspace) or {}
+    ledger = list(existing.get('remap_ledger') or [])
+    ledger.extend(remap_ledger_entries(remap_entries))
     payload = json.dumps(
-        {'version': 1, 'nodes': list(nodes or [])},
+        {
+            'version': 2,
+            'model': 'remap-ledger',
+            'nodes': list(nodes or []),
+            'remap_ledger': ledger,
+        },
         ensure_ascii=False, separators=(',', ':'),
     ).encode('utf-8')
     blockmap.atomic_write(path, payload)
@@ -1563,6 +1601,10 @@ function enterEditMode(el, body) {
     if (done) return;
     done = true;
     const after = ta.value;
+    // Skip #8 nit: restore is the default. A successful restamp must set
+    // skipRestore — do not early-return past the restore line. Forgetting
+    // that return used to wipe the newly applied later-block stamps.
+    let skipRestore = false;
     if (commit && after.trim() !== before.trim()) {
       try {
         const created = await postComment({
@@ -1578,7 +1620,7 @@ function enterEditMode(el, body) {
             later_html: created.later_html,
             mark_layer_nodes: created.mark_layer_nodes,
           });
-          return;
+          skipRestore = true;
         }
       } catch (err) {
         alert('Change refused — this text changed on disk since you started editing. Reload and try again.');
@@ -1586,7 +1628,9 @@ function enterEditMode(el, body) {
         return;
       }
     }
-    body.innerHTML = originalHtml;
+    if (!skipRestore) {
+      body.innerHTML = originalHtml;
+    }
   };
 
   ta.addEventListener('keydown', (e) => {
@@ -4454,7 +4498,9 @@ def _rerender_block(route_path, workspace, fs_path, new_src, block_id, old_block
             rebound = rebind_page_mark_layer_nodes(
                 route_path, workspace, prev_nodes, next_nodes,
             )
-            save_mark_layer_nodes_cache(route_path, next_nodes, workspace)
+            save_mark_layer_nodes_cache(
+                route_path, next_nodes, workspace, remap_entries=rebound,
+            )
     except Exception:  # noqa: BLE001 — stamp/rebind is additive; never fail a rerender
         stamper = None
         remap = {}
@@ -4891,11 +4937,14 @@ def render_page(route_path, workspace=DEFAULT_WORKSPACE, view='classic'):
         mark_layer_src = _mark_layer_source(src)
         mark_layer_nodes = to_mark_layer_nodes(mark_layer_src)
         prev_nodes = load_mark_layer_nodes_cache(route_path, workspace)
+        rebound = []
         if prev_nodes:
-            rebind_page_mark_layer_nodes(
+            rebound = rebind_page_mark_layer_nodes(
                 route_path, workspace, prev_nodes, mark_layer_nodes,
             )
-        save_mark_layer_nodes_cache(route_path, mark_layer_nodes, workspace)
+        save_mark_layer_nodes_cache(
+            route_path, mark_layer_nodes, workspace, remap_entries=rebound,
+        )
         mark_layer_nodes_json = json.dumps(mark_layer_nodes)
         mark_layer_stamper = MarkLayerDomStamper(mark_layer_nodes)
     except Exception as e:  # noqa: BLE001 — additive value, must never 500 a page

@@ -28,18 +28,24 @@ creates unless `SOMA_REVIEW_MARK_LAYER_DUAL_WRITE` is explicitly on
 (compat bridge, default off). Readers use the stored id when present
 and fall back to those fields only for legacy rows. 6a stays open
 until edit-rebind is proven against the item-15 view-diff / parity
-gate; named residuals remain (occurrence-suffix mint). Weak-neighbor
-pairing no longer position-pairs identical lone paragraphs; unpaired
-old ids miss. Later-block stamps are restamped on the same mid-doc
-edit that remaps sidecar ids (see `_rerender_block`).
+gate. Twin `-{n}` mint is the permanent Playmaker mint (unique
+(kind, text) already has no suffix); identity across duplicate-insert
+edits is the remap ledger. Weak-neighbor pairing no longer
+position-pairs identical lone paragraphs; unpaired old ids miss.
+Later-block stamps are restamped on the same mid-doc edit that remaps
+sidecar ids (see `_rerender_block`).
 
 Edit-rebind: `align_mark_layer_nodes` maps previous-parse ids onto the
 current parse by unique fingerprint, then neighborhood for duplicates,
 so an earlier inserted twin remaps the stored id instead of silently
 falling back to text. `rebind_mark_layer_node_ids` applies that map to
-sidecar rows. Occurrence-suffix minting in `_content_id` is unchanged
-(Playmaker twin); rebind accounts the remap rather than claiming the
-suffix is stable.
+sidecar rows. Occurrence-suffix minting in `_content_id` is the
+Playmaker twin and is the permanent mint — unique `(kind, text)` in
+one parse already has no `-{n}`; a parent-scope or neighbor-hash
+disambiguator would mint different ids than `fromProseMarkdown`.
+Cross-edit identity is the remap ledger (`remap_ledger_entries` +
+`.mark-layer-nodes.json`), not a claim that the minted suffix is
+stable.
 
 **Fixed 2026-09-05 (mission-1, same day as the module's first slice): node
 ids are now content-derived, not a call-scoped counter.** `_next_id` used to
@@ -89,11 +95,12 @@ is the same failure SHAPE Anchoring v2 exists to prevent (`blockmap.py`),
 one layer down: content-hash ids are stable, but the occurrence COUNTER
 layered on top to break ties is itself position-derived. Create now writes `mark_layer_node_id` as the sole required record
 (client stamp id that agrees with quote, else unique match). Cross-edit
-identity is `align_mark_layer_nodes` + sidecar rebind, not a change to
-`_content_id` minting — the suffix still shifts in the twin emitter;
-rebind accounts that remap so a stored id keeps querySelector-hitting
-the same sentence (or a named unpaired residual). Do not claim 6a
-closed while the suffix mint and item-15 gate remain.
+identity is the remap ledger (`align_mark_layer_nodes` + sidecar
+rebind + persisted `remap_ledger`), not a change to `_content_id`
+minting — the suffix still shifts in the twin emitter; the ledger
+accounts that remap so a stored id keeps querySelector-hitting the
+same sentence (or a named unpaired residual). Do not claim 6a closed
+while the item-15 view-diff / parity gate remains.
 
 **Known gap, still flagged rather than fixed:**
 
@@ -117,6 +124,72 @@ from typing import Any
 from mdblocks import norm, segment_sentences
 
 _HEADING_RE = re.compile(r'^#{1,6}\s+')
+
+# Twin mint (`fromProseMarkdown`) appends `-{n}` for the 2nd+ (prefix, text)
+# in one parse. Changing that suffix is a Playmaker-side change. Identity
+# across edits is the remap ledger, reason-tagged when the base hash is
+# unchanged and only the occurrence index moved.
+OCCURRENCE_SUFFIX_REASON = 'occurrence-suffix-shift'
+ALIGN_REASON = 'align'
+
+
+def content_id_base(node_id: str | None) -> str:
+    """The `{prefix}-{hash}` (or `{prefix}-{hash}-frag-{hash}`) stem.
+
+    A trailing `-{n}` occurrence suffix is stripped. Unique (kind, text)
+    already uses this stem with no suffix — see
+    `test_unique_kind_text_has_no_occurrence_suffix`.
+    """
+    if not node_id:
+        return ''
+    head, sep, tail = str(node_id).rpartition('-')
+    if sep and tail.isdigit():
+        return head
+    return str(node_id)
+
+
+def occurrence_suffix(node_id: str | None) -> int | None:
+    """`n` when the id ends with a positional `-{n}` suffix, else None."""
+    if not node_id:
+        return None
+    _head, sep, tail = str(node_id).rpartition('-')
+    if sep and tail.isdigit():
+        return int(tail)
+    return None
+
+
+def remap_reason(old_id: str | None, new_id: str | None) -> str:
+    """Tag a remap: suffix shift on the same content-hash, or other align."""
+    if (
+        old_id and new_id and old_id != new_id
+        and content_id_base(old_id) == content_id_base(new_id)
+    ):
+        return OCCURRENCE_SUFFIX_REASON
+    return ALIGN_REASON
+
+
+def remap_ledger_entries(applied: list[dict[str, Any]] | None) -> list[dict[str, str]]:
+    """Normalize applied remaps into durable ledger rows.
+
+    This is the permanent identity model for suffix drift: every real
+    change is `{from, to, record_id, reason}`. Identity remaps are
+    omitted. Twin minting is unchanged.
+    """
+    out: list[dict[str, str]] = []
+    for item in applied or []:
+        if not isinstance(item, dict):
+            continue
+        old = item.get('from')
+        new = item.get('to')
+        if not old or not new or old == new:
+            continue
+        out.append({
+            'from': str(old),
+            'to': str(new),
+            'record_id': str(item.get('record_id') or ''),
+            'reason': str(item.get('reason') or remap_reason(old, new)),
+        })
+    return out
 
 
 def _content_id(seen: dict[str, int], prefix: str, text: str) -> str:
@@ -561,7 +634,11 @@ def rebind_mark_layer_node_ids(
     Identity remaps are left untouched (no sidecar write). `only_ids`
     restricts to records whose current node id is in that set — used
     when only one block was restamped. Returns (records, applied) where
-    applied lists {record_id, from, to} for every real change.
+    applied lists {record_id, from, to, reason} for every real change.
+    `reason` is `occurrence-suffix-shift` when only the twin `-{n}`
+    moved, else `align`. Each hop is appended to
+    `mark_layer_node_rebind_history` so multi-edit remaps stay
+    accounted. This is the remap ledger, not a stable-id claim.
     """
     applied: list[dict[str, str]] = []
     if not remap:
@@ -577,14 +654,20 @@ def rebind_mark_layer_node_ids(
         new = remap[old]
         if not new or new == old:
             continue
+        reason = remap_reason(old, new)
         record['mark_layer_node_id'] = new
         ids = [str(item) for item in (record.get('mark_layer_node_ids') or []) if item]
         record['mark_layer_node_ids'] = [remap.get(item, item) for item in ids] or [new]
-        record['mark_layer_node_rebound'] = {'from': old, 'to': new}
+        hop = {'from': old, 'to': new, 'reason': reason}
+        record['mark_layer_node_rebound'] = hop
+        history = list(record.get('mark_layer_node_rebind_history') or [])
+        history.append(dict(hop))
+        record['mark_layer_node_rebind_history'] = history
         applied.append({
             'record_id': str(record.get('id') or ''),
             'from': old,
             'to': new,
+            'reason': reason,
         })
     return records, applied
 
@@ -655,9 +738,9 @@ class MarkLayerDomStamper:
     `next_sentence` stays inside the bound group — it does not search the
     rest of the document. A miss returns None (no stamp) rather than
     lining up a later twin by text; that was the mid-doc-edit drift.
-    Remaining residual: occurrence-suffix ids still come from `_content_id`;
-    edit-rebind remaps stored ids onto this parse. Later blocks after a
-    mid-doc edit are restamped by `_rerender_block`, not left stale.
+    Twin mint still uses `_content_id` occurrence suffixes; the remap
+    ledger accounts stored-id shifts. Later blocks after a mid-doc edit
+    are restamped by `_rerender_block`, not left stale.
     """
 
     def __init__(self, nodes: list[dict[str, Any]] | None = None):

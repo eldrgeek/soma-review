@@ -14,6 +14,8 @@ from mark_layer_adapter import (  # noqa: E402
     to_mark_layer_nodes, match_mark_layer_nodes, attach_mark_layer_node_ids,
     MarkLayerDomStamper, align_mark_layer_nodes, rebind_mark_layer_node_ids,
     block_for_mark_layer_node, find_mark_layer_node,
+    content_id_base, occurrence_suffix, remap_reason, remap_ledger_entries,
+    OCCURRENCE_SUFFIX_REASON, ALIGN_REASON,
 )
 from mdblocks import norm  # noqa: E402
 
@@ -141,17 +143,26 @@ class MarkLayerAdapterTests(unittest.TestCase):
         second = [n['id'] for n in to_mark_layer_nodes(text) if n['kind'] == 'paragraph']
         self.assertEqual(first, second)
 
+    def test_unique_kind_text_has_no_occurrence_suffix(self):
+        # Investigation (Slice B residual): unique (kind, text) in one parse
+        # already has no `-{n}`. A parent-scope or neighbor-hash
+        # disambiguator would mint different ids than Playmaker's
+        # fromProseMarkdown twin. Suffix is only for document-level
+        # duplicates; identity across those edits is the remap ledger.
+        text = 'Alpha is first. Beta is second.\n\nGamma is third.'
+        nodes = to_mark_layer_nodes(text)
+        fps = [(n['kind'], n['fragments'][0]['text']) for n in nodes]
+        self.assertEqual(len(fps), len(set(fps)))
+        for node in nodes:
+            self.assertIsNone(occurrence_suffix(node['id']), node['id'])
+            self.assertEqual(content_id_base(node['id']), node['id'])
+
     def test_named_gap_inserting_an_earlier_duplicate_reassigns_later_ids(self):
-        # Named, not fixed (Skip's adversarial pass, 2026-09-05): the
-        # occurrence-index disambiguation is positional AMONG a text's own
-        # duplicates, so inserting a new occurrence earlier in the document
-        # reassigns the suffix of every later occurrence of that same text —
-        # even though neither the later node's own text nor its position
-        # relative to the surrounding document changed. This is a real,
-        # named limitation (see the module docstring), pinned here so a
-        # future attempt to fix it has a red test to turn green, and so a
-        # regression that makes it WORSE (e.g. reordering unrelated ids too)
-        # is caught.
+        # Accepted Playmaker twin mint — not a future-fix target in this
+        # repo. Occurrence-index disambiguation is positional among a
+        # text's own duplicates. Identity is the remap ledger
+        # (AlignMarkLayerNodesTests), not a claim these ids are stable
+        # across edits. Do not flip this to assertEqual.
         before = 'Ready.\n\nOther.\n\nReady.'
         after = 'Ready.\n\nReady.\n\nOther.\n\nReady.'
         before_ids = [n['id'] for n in to_mark_layer_nodes(before) if n['kind'] == 'paragraph']
@@ -159,19 +170,20 @@ class MarkLayerAdapterTests(unittest.TestCase):
         # `before`: [Ready(occ0), Other, Ready(occ1)] — the trailing "Ready."
         # is the SAME unchanged text, same position relative to "Other.", as
         # the trailing "Ready." in `after`: [Ready(occ0), Ready(occ1), Other,
-        # Ready(occ2)]. Yet the id it gets SHIFTS (occ1 -> occ2), because a
-        # new earlier occurrence of "Ready." was inserted before it. This
-        # pins the current (limited) behavior; if a future fix makes ids
-        # stable under this kind of edit too, this assertion should flip to
-        # assertEqual and the module docstring's gap note should be removed.
+        # Ready(occ2)]. The minted id SHIFTS (occ1 -> occ2). Same content
+        # hash; remap_reason tags that as occurrence-suffix-shift.
         self.assertNotEqual(before_ids[2], after_ids[3])
+        self.assertEqual(content_id_base(before_ids[2]), content_id_base(after_ids[3]))
+        self.assertEqual(
+            OCCURRENCE_SUFFIX_REASON, remap_reason(before_ids[2], after_ids[3]),
+        )
 
 
 class AlignMarkLayerNodesTests(unittest.TestCase):
-    """Edit-rebind: unique-neighbor align accounts occurrence-suffix remaps.
+    """Remap ledger: unique-neighbor align accounts occurrence-suffix remaps.
 
     Identical lone paragraphs with no unique sibling stay unpaired (miss).
-    Occurrence-suffix mint is unchanged and still a named residual.
+    Twin `-{n}` mint is unchanged; the ledger is the identity model.
     """
 
     def test_unique_sentences_identity_map(self):
@@ -204,6 +216,10 @@ class AlignMarkLayerNodesTests(unittest.TestCase):
         remap = align_mark_layer_nodes(prev, nxt)
         self.assertEqual(next_ready[1], remap[prev_ready[0]])
         self.assertEqual(next_ready[2], remap[prev_ready[1]])
+        self.assertEqual(
+            OCCURRENCE_SUFFIX_REASON,
+            remap_reason(prev_ready[1], remap[prev_ready[1]]),
+        )
         first_ctx = next(
             n['id'] for n in prev if n['kind'] == 'sentence'
             and n['fragments'][0]['text'].strip() == 'Unique first context.'
@@ -282,11 +298,40 @@ class AlignMarkLayerNodesTests(unittest.TestCase):
         )
         self.assertEqual('new-a', updated[0]['mark_layer_node_id'])
         self.assertEqual(['new-a', 'new-p'], updated[0]['mark_layer_node_ids'])
-        self.assertEqual({'from': 'old-a', 'to': 'new-a'},
-                         updated[0]['mark_layer_node_rebound'])
-        self.assertEqual([{'record_id': 'm1', 'from': 'old-a', 'to': 'new-a'}], applied)
+        hop = {'from': 'old-a', 'to': 'new-a', 'reason': ALIGN_REASON}
+        self.assertEqual(hop, updated[0]['mark_layer_node_rebound'])
+        self.assertEqual([hop], updated[0]['mark_layer_node_rebind_history'])
+        self.assertEqual(
+            [{'record_id': 'm1', 'from': 'old-a', 'to': 'new-a',
+              'reason': ALIGN_REASON}],
+            applied,
+        )
         self.assertEqual('same', updated[1]['mark_layer_node_id'])
         self.assertNotIn('mark_layer_node_rebound', updated[1])
+
+    def test_rebind_history_accounts_a_second_suffix_shift(self):
+        records = [{'id': 'm1', 'mark_layer_node_id': 'pmsent-abc123def0-1'}]
+        _updated, applied = rebind_mark_layer_node_ids(
+            records, {'pmsent-abc123def0-1': 'pmsent-abc123def0-2'},
+        )
+        self.assertEqual(OCCURRENCE_SUFFIX_REASON, applied[0]['reason'])
+        _updated, applied2 = rebind_mark_layer_node_ids(
+            records, {'pmsent-abc123def0-2': 'pmsent-abc123def0-3'},
+        )
+        self.assertEqual(2, len(records[0]['mark_layer_node_rebind_history']))
+        self.assertEqual(
+            'pmsent-abc123def0-3', records[0]['mark_layer_node_id'],
+        )
+        ledger = remap_ledger_entries(applied + applied2)
+        self.assertEqual(
+            [
+                {'from': 'pmsent-abc123def0-1', 'to': 'pmsent-abc123def0-2',
+                 'record_id': 'm1', 'reason': OCCURRENCE_SUFFIX_REASON},
+                {'from': 'pmsent-abc123def0-2', 'to': 'pmsent-abc123def0-3',
+                 'record_id': 'm1', 'reason': OCCURRENCE_SUFFIX_REASON},
+            ],
+            ledger,
+        )
 
     def test_rebind_only_ids_leaves_other_marks(self):
         records = [
@@ -296,8 +341,25 @@ class AlignMarkLayerNodesTests(unittest.TestCase):
         _updated, applied = rebind_mark_layer_node_ids(
             records, {'old-a': 'new-a', 'old-b': 'new-b'}, only_ids={'old-a'},
         )
-        self.assertEqual([{'record_id': 'm1', 'from': 'old-a', 'to': 'new-a'}], applied)
+        self.assertEqual(
+            [{'record_id': 'm1', 'from': 'old-a', 'to': 'new-a',
+              'reason': ALIGN_REASON}],
+            applied,
+        )
         self.assertEqual('old-b', records[1]['mark_layer_node_id'])
+
+    def test_remap_ledger_entries_drop_identity_and_tag_suffix_shift(self):
+        self.assertEqual([], remap_ledger_entries([
+            {'record_id': 'm1', 'from': 'same', 'to': 'same'},
+        ]))
+        self.assertEqual(
+            [{'from': 'pmsent-aaaaaaaaaa', 'to': 'pmsent-aaaaaaaaaa-1',
+              'record_id': 'm2', 'reason': OCCURRENCE_SUFFIX_REASON}],
+            remap_ledger_entries([
+                {'record_id': 'm2', 'from': 'pmsent-aaaaaaaaaa',
+                 'to': 'pmsent-aaaaaaaaaa-1'},
+            ]),
+        )
 
 
 class MatchMarkLayerNodesTests(unittest.TestCase):

@@ -1248,10 +1248,12 @@ depends on it yet:
    flagged change clears the signal with no way to recover what changed.
 
 None of this is wired into the *live* block-parser response that `/page/*` and the existing
-comment system actually read — doing that is agreed-model item 6a's larger remaining step,
-correctly left unscoped (it changes a wire format multiple live consumers depend on) rather than
-attempted as a drive-by. The natural next decision, when someone takes it on: migrate the old wire
-format onto this shape, or keep this permanently parallel and debug-only.
+comment system actually read. The fork is closed (Rook program ruling 2026-09-06; agreed-model
+items 6a and 15): live marks migrate onto the shared `MarkLayerNode` shape — Playmaker's engine,
+soma-review supplying blocks and the mark record. The old block-parser mark path stays live and
+default until the new path proves itself with a view-diff / parity gate (zero diffs, or every
+diff accounted). The Python twin emitter is a **bridge during migration only**, then dies — not
+a permanent parallel or debug-only option.
 
 ## Authorship
 

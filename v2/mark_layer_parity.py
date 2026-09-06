@@ -8,12 +8,17 @@ accounted reasons fails the gate.
 Accounted reasons (named, not hidden):
   - occurrence-suffix-shift — remap ledger hop; landings still match
   - remap-ledger — other align remap; landings still match
-  - unpaired-miss — weak-neighbor / heading / unique-match miss
+  - unpaired-miss — weak-neighbor align omitted the old id
+  - unique-match-miss — attach missed (repeat without a narrowing snapshot)
+  - heading-no-sentence-node — heading kept whole, no sentence id
+  - edit-id-reattach — type=edit identity is the re-attached id; old
+    block_id+snapshot is not the live landing after apply
 
-6a stays open: this gate proves the id path against the old anchor for
-the fixture set. Dual-write remains off on location create; type=edit
-still writes block_id+snapshot; the Python twin emitter is still the
-live bridge. Residuals accepted here are listed on the report.
+Create/resolve live path is mark_layer_node_id. Twin quote-matching
+is fallback minting. type=edit no longer dual-writes block_id as
+identity (snapshot/proposed stay as the change record). Old
+block_id/quote resolve is off when an id is present. 6a stays open
+while the twin still stamps live DOM.
 
 Run:
   python3 v2/mark_layer_parity.py
@@ -45,7 +50,9 @@ ACCOUNTABLE_REASONS = frozenset({
     'remap-ledger',
     ALIGN_REASON,
     'unpaired-miss',
+    'unique-match-miss',
     'heading-no-sentence-node',
+    'edit-id-reattach',
 })
 
 FIXTURE_PATH = os.path.join(
@@ -315,7 +322,7 @@ def compare_page_view(page_id: str, source: str) -> dict[str, Any]:
             if not attached:
                 accounted.append(_diff_row(
                     page_id=page_id, mark_id=mark_id, old=old_hit, new=stamp_hit,
-                    reason='unpaired-miss',
+                    reason='unique-match-miss',
                     detail='unique-match attach missed (repeat without a narrowing snapshot)',
                 ))
                 continue
@@ -500,6 +507,159 @@ def compare_edit(case: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def compare_edit_cutover(case: dict[str, Any]) -> dict[str, Any]:
+    """type=edit identity cutover: persist id, re-attach after apply.
+
+    Old block_id+snapshot is not the live landing after the trunk write.
+    The remapped / re-attached mark_layer_node_id must stamp the proposed
+    sentence, and the sidecar must not keep block_id as identity.
+    """
+    page_id = case['id']
+    matches: list[dict[str, Any]] = []
+    accounted: list[dict[str, Any]] = []
+    unaccounted: list[dict[str, Any]] = []
+    proposed = case.get('proposed') or ''
+    with _PageWorkspace(case['before']) as ws:
+        html_before = ws.render()
+        blocks_before = ws.blocks()
+        stamps_before = extract_stamps(html_before)
+        target = _pick_stamp_for_edit(
+            stamps_before,
+            case.get('mark_quote') or '',
+            case.get('mark_snapshot'),
+            case.get('mark_occurrence'),
+        )
+        if target is None or not target.get('node_id'):
+            unaccounted.append(_diff_row(
+                page_id=page_id, mark_id=f'{page_id}:missing-before-stamp',
+                old={'status': 'unresolved'},
+                new={'status': 'unresolved', 'reason': 'stamp-not-found'},
+                reason=None,
+                detail='edit-cutover fixture has no stamped sentence on the before page',
+            ))
+            return {
+                'page_id': page_id,
+                'matches': matches,
+                'accounted': accounted,
+                'unaccounted': unaccounted,
+            }
+        snapshot = case.get('mark_snapshot') or target['quote']
+        mark = {
+            'id': f'mark-{page_id}',
+            'page': ws.route,
+            'type': 'edit',
+            'mark_kind': 'rewrite',
+            'block_id': target['block_id'],
+            'from': target['from'],
+            'to': target['to'],
+            'quote': target['quote'],
+            'snapshot': snapshot,
+            'proposed': proposed,
+            'mark_layer_node_id': target['node_id'],
+            'mark_layer_primary': 'mark_layer_node_id',
+            'deleted': False,
+        }
+        server.maybe_strip_legacy_anchor_fields(mark)
+        try:
+            change_result = server.apply_sentence_change(
+                ws.route, 'estate', mark, author_label='claude',
+            )
+        except Exception as exc:  # noqa: BLE001 — surface as unaccounted
+            unaccounted.append(_diff_row(
+                page_id=page_id, mark_id=mark['id'],
+                old={'status': 'bound', 'quote': snapshot},
+                new={'status': 'unresolved', 'reason': 'apply-failed'},
+                reason=None,
+                detail=f'apply_sentence_change failed: {exc}',
+            ))
+            return {
+                'page_id': page_id,
+                'matches': matches,
+                'accounted': accounted,
+                'unaccounted': unaccounted,
+            }
+        if proposed:
+            probe = {'quote': proposed, 'snapshot': proposed}
+            server.maybe_attach_mark_layer_nodes(probe, ws.route, 'estate')
+            if probe.get('mark_layer_node_id'):
+                mark['mark_layer_node_id'] = probe['mark_layer_node_id']
+                mark['mark_layer_node_ids'] = probe.get('mark_layer_node_ids')
+                mark['mark_layer_primary'] = 'mark_layer_node_id'
+        server.maybe_strip_legacy_anchor_fields(mark)
+        server.append_comment(ws.route, dict(mark))
+        if not change_result.get('html'):
+            unaccounted.append(_diff_row(
+                page_id=page_id, mark_id=mark['id'],
+                old={'status': 'bound', 'quote': snapshot},
+                new={'status': 'unresolved', 'reason': 'no-rerender'},
+                reason=None,
+                detail='apply_sentence_change returned no block html',
+            ))
+            return {
+                'page_id': page_id,
+                'matches': matches,
+                'accounted': accounted,
+                'unaccounted': unaccounted,
+            }
+        html_after = ws.render()
+        stamps_after = extract_stamps(html_after)
+        live_id = mark.get('mark_layer_node_id')
+        new_hit = resolve_stamp(live_id, stamps_after)
+        old_hit = resolve_old({
+            'block_id': target['block_id'],
+            'from': target['from'],
+            'to': target['to'],
+            'quote': snapshot,
+            'snapshot': snapshot,
+        }, ws.blocks())
+        persisted = server.read_comments(ws.route)
+        row = persisted[0] if persisted else mark
+        identity_ok = (
+            bool(row.get('mark_layer_node_id'))
+            and not row.get('block_id')
+            and (row.get('snapshot') or '') == snapshot
+        )
+        landed = (
+            new_hit.get('status') == 'bound'
+            and (new_hit.get('quote') or '').strip() == proposed.strip()
+        )
+        if identity_ok and landed:
+            accounted.append(_diff_row(
+                page_id=page_id, mark_id=mark['id'], old=old_hit, new=new_hit,
+                reason='edit-id-reattach',
+                detail=(
+                    f"id {live_id} stamps proposed; sidecar block_id="
+                    f"{row.get('block_id')!r}; snapshot kept as change record"
+                ),
+            ))
+        else:
+            unaccounted.append(_diff_row(
+                page_id=page_id, mark_id=mark['id'], old=old_hit, new=new_hit,
+                reason=None,
+                detail=(
+                    f'edit cutover failed: identity_ok={identity_ok} '
+                    f'landed={landed} block_id={row.get("block_id")!r} '
+                    f'snapshot={row.get("snapshot")!r} live_id={live_id!r}'
+                ),
+            ))
+        expected = set(case.get('expect_accounted') or [])
+        saw = {item['reason'] for item in accounted if item.get('reason')}
+        missing_expected = expected - saw
+        if missing_expected and not unaccounted:
+            unaccounted.append(_diff_row(
+                page_id=page_id, mark_id=f'{page_id}:expected-residual',
+                old=old_hit, new=new_hit,
+                reason=None,
+                detail=f'expected accounted reasons {sorted(missing_expected)} not observed; saw {sorted(saw)}',
+            ))
+    return {
+        'page_id': page_id,
+        'matches': matches,
+        'accounted': accounted,
+        'unaccounted': unaccounted,
+    }
+
+
 def run_gate(fixture: dict[str, Any] | None = None) -> dict[str, Any]:
     data = fixture if fixture is not None else load_fixture()
     pages = []
@@ -516,6 +676,13 @@ def run_gate(fixture: dict[str, Any] | None = None) -> dict[str, Any]:
 
     for case in data.get('edits') or []:
         result = compare_edit(case)
+        pages.append(result['page_id'])
+        matches.extend(result['matches'])
+        accounted.extend(result['accounted'])
+        unaccounted.extend(result['unaccounted'])
+
+    for case in data.get('edit_applies') or []:
+        result = compare_edit_cutover(case)
         pages.append(result['page_id'])
         matches.extend(result['matches'])
         accounted.extend(result['accounted'])
@@ -538,19 +705,22 @@ def run_gate(fixture: dict[str, Any] | None = None) -> dict[str, Any]:
         'accounted': accounted,
         'unaccounted': unaccounted,
         'residuals_accepted': [
-            'block_id identity dual-write off on location create',
+            'block_id identity dual-write off on location create and type=edit',
             'quote/from/to retained as the selected span',
-            'type=edit still writes block_id+snapshot',
+            'type=edit keeps snapshot/proposed as the MDP change record; identity is re-attached mark_layer_node_id',
             'remap ledger is append-only provenance; live jump uses remapped mark_layer_node_id',
             'twin -{n} mint stays (Playmaker fromProseMarkdown parity)',
             'unpaired weak-neighbor duplicates miss rather than guess',
             'heading sentences have no MarkLayerNode sentence id (heading kept whole)',
+            'twin emitter still stamps live DOM (not Playmaker fromProseMarkdown as the sole live path)',
         ],
         'six_a_status': 'open',
         'six_a_reason': (
-            'Item-15 gate is this report. 6a stays open: the Python twin '
-            'emitter is still the live bridge, dual-write/create/edit '
-            'residuals are accepted (named above), not closed as a cutover.'
+            'Item-15 gate is this report. Cutover proven for create/resolve '
+            '(id-first; old beside off when id present) and type=edit identity '
+            '(no block_id dual-write; id re-attached after apply). 6a stays '
+            'open: the Python twin emitter still stamps live DOM — not '
+            'Playmaker\'s engine as the sole live path.'
         ),
     }
 

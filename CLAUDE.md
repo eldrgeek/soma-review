@@ -1340,6 +1340,22 @@ identity dual-write is off on location create; quote/from/to stay as
 the selected span; type=edit still writes `block_id` + `snapshot`.
 The Python twin is still the live bridge — do not claim 6a closed.
 
+**6a cutover (2026-09-06), after the item-15 gate, still not closed:**
+live create/resolve is `mark_layer_node_id` (client DOM stamp, else
+unique-match fallback mint). `validated_binding` / `blockmap.resolve`
+is not consulted when the stamp exists. type=edit no longer persists
+`block_id` as identity — `snapshot`/`proposed` stay as the MDP change
+record; after apply the id is re-attached onto the new sentence.
+Old block_id/quote resolve is off when an id is present
+(`SOMA_REVIEW_MARK_LAYER_BESIDE`, default off; legacy rows with no
+id still use those fields). v3 mark jump is `jumpToMark` →
+`jumpToMarkLayerNode`, not `jumpToBlock`. Skip #10 nit: attach misses
+are `unique-match-miss`, not lumped into `unpaired-miss`.
+**6a stays open** because the Python twin emitter still stamps live
+DOM — not Playmaker's `fromProseMarkdown` as the sole live path.
+Do not claim 6a closed on twin-still-stamps. Out of scope unchanged:
+Playmaker Fountain `[[SCENE:]]` / P1 Doc export; unbounded ledger prune.
+
 ## Fold (SOMA agreed model item 10) — wired into the v3 panel (2026-09-06)
 
 Item 10: "an agreed extension may be folded out of the sentence into the node it

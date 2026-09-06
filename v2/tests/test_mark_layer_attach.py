@@ -8,9 +8,9 @@ Parity / success gate:
   (e) SOMA_REVIEW_MARK_LAYER_DUAL_WRITE=1 still writes the old fields
   (f) create with only mark_layer_node_id is enough
 
-Does not claim 6a closed — twin `-{n}` mint and the item-15 gate
-remain. Remap ledger is the identity model for suffix drift.
-block_id identity dual-write is off on location create.
+Does not claim 6a closed — twin still stamps live DOM. Remap ledger
+is the identity model for suffix drift. block_id identity dual-write
+is off on location create and type=edit.
 """
 import json
 import os
@@ -322,7 +322,8 @@ class MarkLayerAttachHTTPTests(unittest.TestCase):
         self.assertEqual(expected['id'], row['mark_layer_node_id'])
         self.assertEqual('mark_layer_node_id', row.get('mark_layer_primary'))
         self.assertIsNone(row.get('block_id'))
-        self.assertIsNone(row.get('quote'))
+        # Id-only create still records the node's text as the selected span.
+        self.assertEqual('Beta is second.', row.get('quote'))
         saved = [c for c in server.read_comments('docs/page.md') if c['id'] == row['id']]
         self.assertEqual(expected['id'], saved[0]['mark_layer_node_id'])
         self.assertIsNone(saved[0].get('block_id'))
@@ -356,6 +357,61 @@ class MarkLayerAttachHTTPTests(unittest.TestCase):
         self.assertEqual(beta['id'], row['mark_layer_node_id'])
         self.assertNotEqual(alpha['id'], row['mark_layer_node_id'])
 
+    def test_edit_persists_id_not_block_id_keeps_snapshot(self):
+        """type=edit identity is the re-attached id; snapshot is the change record."""
+        self.write_doc(SENTENCE_PAGE)
+        server.render_page('docs/page.md')
+        with open(self.doc, encoding='utf-8') as handle:
+            src = handle.read()
+        expected = next(
+            n for n in to_mark_layer_nodes(src)
+            if n['kind'] == 'sentence'
+            and n['fragments'][0]['text'].strip() == 'Beta is second.'
+        )
+        status, row = self._post({
+            'page': 'docs/page.md', 'type': 'edit',
+            'mark_layer_node_id': expected['id'],
+            'quote': 'Beta is second.',
+            'snapshot': 'Beta is second.',
+            'proposed': 'Beta is precise.',
+        })
+        self.assertEqual(201, status)
+        self.assertEqual('edit', row['type'])
+        self.assertEqual('mark_layer_node_id', row.get('mark_layer_primary'))
+        self.assertIsNone(row.get('block_id'))
+        self.assertEqual('Beta is second.', row.get('snapshot'))
+        self.assertEqual('Beta is precise.', row.get('proposed'))
+        self.assertTrue(row.get('mark_layer_node_id'))
+        self.assertNotEqual(expected['id'], row['mark_layer_node_id'])
+        saved = [c for c in server.read_comments('docs/page.md') if c['id'] == row['id']]
+        self.assertEqual(1, len(saved))
+        self.assertIsNone(saved[0].get('block_id'))
+        self.assertEqual(row['mark_layer_node_id'], saved[0]['mark_layer_node_id'])
+        self.assertEqual('Beta is second.', saved[0]['snapshot'])
+        with open(self.doc, encoding='utf-8') as handle:
+            self.assertIn('Beta is precise.', handle.read())
+
+    def test_valid_stamp_skips_stale_block_id_resolve(self):
+        """Id-first create: a live stamp is identity even if block_id is junk."""
+        self.write_doc(SENTENCE_PAGE)
+        server.render_page('docs/page.md')
+        with open(self.doc, encoding='utf-8') as handle:
+            src = handle.read()
+        expected = next(
+            n for n in to_mark_layer_nodes(src)
+            if n['kind'] == 'sentence'
+            and n['fragments'][0]['text'].strip() == 'Beta is second.'
+        )
+        status, row = self._post({
+            'page': 'docs/page.md', 'type': 'mark', 'mark_kind': 'ack',
+            'block_id': 'not-a-real-block-id',
+            'quote': 'Beta is second.',
+            'mark_layer_node_id': expected['id'],
+        })
+        self.assertEqual(201, status)
+        self.assertEqual(expected['id'], row['mark_layer_node_id'])
+        self.assertIsNone(row.get('block_id'))
+
     def test_dual_write_flag_still_persists_legacy_fields(self):
         self.write_doc(SENTENCE_PAGE)
         server.render_page('docs/page.md')
@@ -380,6 +436,30 @@ class MarkLayerAttachHTTPTests(unittest.TestCase):
         self.assertEqual(target['id'], row['block_id'])
         self.assertEqual('Beta is second.', row['quote'])
         self.assertEqual('Alpha is first. Beta is second. Gamma is third.', row['snapshot'])
+
+    def test_resolve_mark_block_does_not_fallthrough_when_id_present(self):
+        """Stop beside: a present (even stale) id does not use leftover block_id."""
+        self.write_doc(SENTENCE_PAGE)
+        server.render_page('docs/page.md')
+        mapping = blockmap.load_map(server.block_map_path('docs/page.md'))
+        target = next(row for row in mapping['blocks'] if 'Beta is second.' in row.get('text', ''))
+        mark = {
+            'mark_layer_node_id': 'does-not-exist',
+            'block_id': target['id'],
+        }
+        self.assertFalse(server.mark_layer_beside_enabled())
+        self.assertIsNone(server.resolve_mark_block('docs/page.md', 'estate', mark))
+        old = os.environ.get('SOMA_REVIEW_MARK_LAYER_BESIDE')
+        os.environ['SOMA_REVIEW_MARK_LAYER_BESIDE'] = '1'
+        try:
+            block = server.resolve_mark_block('docs/page.md', 'estate', mark)
+        finally:
+            if old is None:
+                os.environ.pop('SOMA_REVIEW_MARK_LAYER_BESIDE', None)
+            else:
+                os.environ['SOMA_REVIEW_MARK_LAYER_BESIDE'] = old
+        self.assertIsNotNone(block)
+        self.assertEqual(target['id'], block['id'])
 
 
 if __name__ == '__main__':

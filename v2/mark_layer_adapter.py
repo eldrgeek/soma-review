@@ -23,18 +23,22 @@ quote/snapshot match. Default jump/render is that stored id → DOM
 document order). Text-occurrence lookup remains the counted fallback
 when the id or stamp is missing.
 
-Old `block_id` / quote / snapshot are not written on unique-match
-creates unless `SOMA_REVIEW_MARK_LAYER_DUAL_WRITE` is explicitly on
-(compat bridge, default off). Readers use the stored id when present
-and fall back to those fields only for legacy rows. 6a stays open
+Old `block_id` is not written on unique-match creates or type=edit
+unless `SOMA_REVIEW_MARK_LAYER_DUAL_WRITE` is explicitly on
+(compat bridge, default off). type=edit keeps `snapshot`/`proposed`
+as the MDP change record (before/after), not as identity — after
+apply the id is re-attached onto the new sentence. Readers use the
+stored id when present and fall back to `block_id` only for legacy
+rows (no id) or when `SOMA_REVIEW_MARK_LAYER_BESIDE` is on.
 Item-15 view-diff / parity (`mark_layer_parity.py`) is the named
-gate; 6a stays open while the twin emitter is the live bridge.
-Twin `-{n}` mint is the permanent Playmaker mint (unique
+gate. Twin `-{n}` mint is the permanent Playmaker mint (unique
 (kind, text) already has no suffix); identity across duplicate-insert
 edits is the remap ledger. Weak-neighbor pairing no longer
 position-pairs identical lone paragraphs; unpaired old ids miss.
 Later-block stamps are restamped on the same mid-doc edit that remaps
-sidecar ids (see `_rerender_block`).
+sidecar ids (see `_rerender_block`). The twin emitter stamps DOM and
+mints fallback ids; it is not the live create/resolve path when a
+`mark_layer_node_id` is present.
 
 Edit-rebind: `align_mark_layer_nodes` maps previous-parse ids onto the
 current parse by unique fingerprint, then neighborhood for duplicates,
@@ -100,9 +104,13 @@ identity is the remap ledger (`align_mark_layer_nodes` + sidecar
 rebind + persisted `remap_ledger`), not a change to `_content_id`
 minting — the suffix still shifts in the twin emitter; the ledger
 accounts that remap so a stored id keeps querySelector-hitting the
-same sentence (or a named unpaired residual). Do not claim 6a closed:
-the item-15 gate is green; dual-write/create/edit residuals stay
-accepted, not a cutover.
+same sentence (or a named unpaired residual). Create/resolve live path is the stored or client-stamped
+`mark_layer_node_id`. Twin quote-matching is fallback minting
+when no id was sent. type=edit no longer dual-writes `block_id`
+as identity. Old block_id/quote resolve is off when an id is
+present (gated by `SOMA_REVIEW_MARK_LAYER_BESIDE`). 6a stays
+open while the twin still stamps live DOM (not Playmaker's
+engine as the sole live path).
 
 **Known gap, still flagged rather than fixed:**
 

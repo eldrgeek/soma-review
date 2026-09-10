@@ -4813,6 +4813,76 @@ _NEXT_H2_RE = re.compile(r'^## ', re.MULTILINE)
 _SAFE_TERM_RE = re.compile(r'^[^\n\]\)\(`]{1,80}$')
 
 
+def _already_folded_result(route_path, workspace, block_id, sentence_text, term):
+    """Called only after `_locate_change_span` has already failed to find the
+    expected sentence for a fold. Block ids in this app are content-derived
+    (`block_source_span`/`current_page_blocks` mint them from the block's own
+    text), so the ORIGINAL `block_id` a double-click's loser was sent with is
+    itself gone the instant the winner's write replaces the sentence with a
+    link — `_locate_change_span` fails at its very first check ("block ...
+    no longer exists"), before it ever gets to compare text. Looking this up
+    by the stale block_id therefore can't work; instead search the whole
+    page for the facts that together prove THIS fold already happened: the
+    Terms bullet for `term` quoting this exact `sentence_text`, the sentence
+    not sitting unfolded anywhere else on the page, and exactly one current
+    block carrying the resulting link. Returns a success-shaped result
+    (matching `_apply_sentence_fold_unlocked`'s return, with no new commit)
+    if all hold, else None so the original MergeConflict propagates — for
+    any other kind of drift, AND for the cases this function cannot safely
+    tell apart from a real conflict (see the two checks below).
+
+    Adversarial pass (Skip, 2026-09-10) found the first draft used a bare
+    substring test (`sentence in raw_text[:bullet_start]`) for "still
+    unfolded", which misfires on an unrelated sentence that merely CONTAINS
+    this text, or on a genuine duplicate clause elsewhere in the page (both
+    real shapes in a tool built to consolidate repeated language into
+    Terms) — replaced with an exact sentence/whole-block match via
+    `segment_sentences`, the same unit `_locate_change_span` itself uses.
+    It also picked `next(block containing link_text)` with no ambiguity
+    check, which silently rebinds to the WRONG block — repainting an
+    unrelated part of the page as if it were the click's target — the
+    moment `term` is reused for a second, different sentence elsewhere
+    (a case this file's own dedupe-bullet logic, just above, exists to
+    support). Now requires exactly one such block; more than one is
+    treated as unresolvable, not guessed."""
+    try:
+        fs_path = resolve_page(route_path, workspace)
+        with open(fs_path, 'r', encoding='utf-8') as f:
+            raw_text = f.read()
+        _src_bytes, blocks, _mapping, _report = current_page_blocks(route_path, workspace)
+    except Exception:  # noqa: BLE001 — any read failure here just falls back to the real error
+        return None
+    sentence = (sentence_text or '').strip()
+    if not sentence:
+        return None
+    bullet_re = re.compile(
+        r'^-\s+\*\*' + re.escape(term) + r'\*\*\s+—\s+' + re.escape(sentence) + r'\s*$',
+        re.MULTILINE,
+    )
+    if not bullet_re.search(raw_text):
+        return None
+    norm_sentence = norm(sentence)
+    for b in blocks:
+        try:
+            _normalized, _start, _end, exact_text = block_source_span(raw_text, b)
+        except Exception:  # noqa: BLE001 — an unparseable block can't be proof either way
+            continue
+        if norm(exact_text) == norm_sentence:
+            return None  # still sits unfolded as a whole block
+        if any(norm(sent_text) == norm_sentence for _s, _e, sent_text in segment_sentences(exact_text)):
+            return None  # still sits unfolded as one sentence of a block
+    link_text = f'[{term}](#terms)'
+    candidates = [b for b in blocks if link_text in (b.get('text') or '')]
+    if len(candidates) != 1:
+        return None
+    target_block = candidates[0]
+    normalized, _block_start, _block_end, _exact = block_source_span(raw_text, target_block)
+    result = _rerender_block(route_path, workspace, fs_path, normalized, target_block['id'], target_block)
+    result['commit'] = None
+    result['commit_error'] = None
+    return result
+
+
 def apply_sentence_fold(route_path, workspace, block_id, sentence_text, term):
     with _trunk_lock(resolve_page(route_path, workspace)):
         return _apply_sentence_fold_unlocked(route_path, workspace, block_id, sentence_text, term)
@@ -4839,9 +4909,27 @@ def _apply_sentence_fold_unlocked(route_path, workspace, block_id, sentence_text
     one from scratch is out of scope for this first cut."""
     if not _SAFE_TERM_RE.match(term or ''):
         raise MergeConflict('term must be 1-80 chars, one line, no ] ( ) `')
-    fs_path, normalized, start, end, block, sentence_index = _locate_change_span(
-        route_path, workspace, block_id, sentence_text
-    )
+    try:
+        fs_path, normalized, start, end, block, sentence_index = _locate_change_span(
+            route_path, workspace, block_id, sentence_text
+        )
+    except MergeConflict:
+        # Fold has no mark/status row to guard against a double-click the way
+        # settle/revert do (2026-09-10 fix) — it operates straight on sentence
+        # text, and it IS its own idempotency marker: the winner of two clicks
+        # close together already replaced `sentence_text` with `[term](#terms)`
+        # before the loser's `_locate_change_span` runs (both calls are inside
+        # `_trunk_lock`, so they can't interleave, but they can still queue one
+        # after the other on the same page). Without this, the loser's honest
+        # drift guard reads as the same confusing "text on disk no longer
+        # matches... refusing change" 409 the Revert fix retired for marks —
+        # here on a click with no mark status to have already flipped. If the
+        # block now holds exactly this fold's output, report the already-done
+        # state instead of a drift error; any other drift still raises.
+        already = _already_folded_result(route_path, workspace, block_id, sentence_text, term)
+        if already is not None:
+            return already
+        raise
     if sentence_index is None:
         # A whole-block match (_locate_change_span's fast path) proves nothing
         # about how many actual sentences the block holds — a caller passing a

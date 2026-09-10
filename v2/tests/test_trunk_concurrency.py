@@ -339,6 +339,152 @@ class TrunkWriteConcurrencyTests(unittest.TestCase):
         self.assertIn('Alpha edited sentence.', content)
         self.assertNotIn('Alpha original sentence.', content)
 
+    def test_double_click_fold_does_not_drift_conflict_the_loser(self):
+        """Regression for the Fold-side twin of the Revert/Settle double-click
+        race: `/api/fold` has no mark/status row to guard (it operates
+        straight on `sentence_text`), so before this fix two Fold clicks on
+        the same sentence produced one clean 200 and one confusing drift
+        `"...refusing change"` 409 — the winner's write replaced the sentence
+        with `[term](#terms)` before the loser's own `_locate_change_span`
+        ran, and the loser had no way to tell "someone already did this" from
+        "the block genuinely changed underneath me." Fires two real
+        concurrent HTTP `/api/fold` requests (both clicks named the exact
+        same sentence/term — the literal double-click shape) and asserts
+        both come back 200 `folded: true`, the trunk holds exactly one Terms
+        bullet, and exactly one of the two responses carries a real commit
+        (the other is the idempotent already-done report, no new commit)."""
+        self.write_doc(
+            '# Title\n\nAn agreed extension may be folded out of the sentence.\n\n'
+            '## Terms\n'
+        )
+        server.render_page('docs/page.md', workspace='estate', view='v3')
+        _src, blocks, _map, _report = server.current_page_blocks('docs/page.md', 'estate')
+        block = next(b for b in blocks
+                     if 'An agreed extension' in (b.get('text') or ''))
+
+        httpd = server.ThreadingHTTPServer(('127.0.0.1', 0), server.Handler)
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        results = {}
+
+        def post(name):
+            payload = json.dumps({
+                'page': 'docs/page.md', 'block_id': block['id'],
+                'sentence': 'An agreed extension may be folded out of the sentence.',
+                'term': 'fold',
+            }).encode('utf-8')
+            request = urllib.request.Request(
+                f'http://127.0.0.1:{httpd.server_port}/api/fold',
+                data=payload, headers={'Content-Type': 'application/json'}, method='POST',
+            )
+            try:
+                with urllib.request.urlopen(request) as response:
+                    results[name] = (response.status, json.load(response))
+            except urllib.error.HTTPError as exc:
+                results[name] = (exc.code, json.load(exc))
+
+        try:
+            threads = [threading.Thread(target=post, args=(n,), name=n)
+                       for n in ('r0', 'r1')]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=45)
+            still_running = [t.name for t in threads if t.is_alive()]
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join(timeout=2)
+
+        self.assertEqual(still_running, [], 'a fold request never returned — deadlock')
+        statuses = sorted(status for status, _ in results.values())
+        self.assertEqual(
+            [200, 200], statuses,
+            f'a double-click Fold must never surface the drift-conflict 409 to '
+            f'the loser, got: {results}')
+        for _name, (_status, body) in results.items():
+            self.assertTrue(body.get('ok'))
+            self.assertTrue(body.get('folded'))
+        commits = [body.get('commit') for _status, body in results.values()]
+        self.assertEqual(
+            sorted(c is None for c in commits), [False, True],
+            f'expected exactly one real commit (the winner) and one None '
+            f'(the idempotent already-folded report), got commits: {commits}')
+
+        with open(self.doc, encoding='utf-8') as f:
+            content = f.read()
+        self.assertEqual(
+            content.count('[fold](#terms)'), 1,
+            'the sentence must be folded exactly once, not duplicated or corrupted')
+        self.assertEqual(
+            content.count('**fold**'), 1,
+            'exactly one Terms bullet must exist for the folded term')
+        self.assertNotIn(
+            'An agreed extension may be folded out of the sentence.\n\n## Terms',
+            content, 'the original sentence must no longer sit in the body')
+
+    def test_already_folded_check_is_not_fooled_by_a_substring_elsewhere(self):
+        """Skip's adversarial pass on the Fold double-click fix (2026-09-10):
+        the first draft of `_already_folded_result` tested "is the sentence
+        still unfolded" with a bare `sentence in raw_text[...]` substring
+        check, which reads a positive on ANY sentence that merely CONTAINS
+        the folded text — a real shape in this tool, built to consolidate
+        repeated/near-duplicate language. That false positive would silently
+        re-surface the original confusing drift 409 for a page containing
+        exactly this pattern. Fixed to compare whole blocks/sentences via
+        `segment_sentences`, the same unit `_locate_change_span` itself uses.
+        This pins the fix directly, independent of any HTTP/threading
+        timing."""
+        self.write_doc(
+            '# Title\n\n[fold](#terms)\n\n'
+            'The full context: An agreed extension may be folded out of the '
+            'sentence, in a broader sense.\n\n'
+            '## Terms\n\n'
+            '- **fold** — An agreed extension may be folded out of the sentence.\n'
+        )
+        result = server._already_folded_result(
+            'docs/page.md', 'estate',
+            'stale-block-id',
+            'An agreed extension may be folded out of the sentence.',
+            'fold',
+        )
+        self.assertIsNotNone(
+            result,
+            'a longer sentence merely containing the folded text must not be '
+            'read as "still unfolded" — the fold already happened and the '
+            'loser must get the idempotent success report, not a drift 409')
+        self.assertTrue(result.get('ok', True))  # success-shaped: no 'ok' key set false
+        self.assertIsNone(result.get('commit'))
+
+    def test_already_folded_check_refuses_to_guess_when_the_term_is_ambiguous(self):
+        """Skip's other finding on the same pass: the first draft picked
+        `next(block containing link_text)` with no ambiguity check, so once
+        `term` names more than one already-folded sentence on the page (this
+        file's own dedupe-bullet logic, right above this function, exists
+        specifically to let one term serve several sentences), a double-click
+        on ANY of them would resolve to whichever matching block happened to
+        come first — silently reporting success for the wrong block, which a
+        client then repaints as if it were the block the user actually
+        clicked. Fixed to require exactly one candidate block; two or more
+        must fall through to the original (safe, if unhelpful) drift error
+        rather than guess."""
+        self.write_doc(
+            '# Title\n\n[dup](#terms)\n\n[dup](#terms)\n\n'
+            '## Terms\n\n'
+            '- **dup** — Second dup sentence.\n'
+        )
+        result = server._already_folded_result(
+            'docs/page.md', 'estate',
+            'stale-block-id',
+            'Second dup sentence.',
+            'dup',
+        )
+        self.assertIsNone(
+            result,
+            'two blocks both carry the "dup" link, so which one this click '
+            'was actually about is genuinely ambiguous from content alone — '
+            'must refuse rather than silently pick one')
+
     def test_lock_is_per_page_so_different_pages_still_write_in_parallel(self):
         one = os.path.join(self.docs_repo, 'page.md')
         two = os.path.join(self.docs_repo, 'other.md')

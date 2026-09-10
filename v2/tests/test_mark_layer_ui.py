@@ -19,6 +19,7 @@ import re
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.request
 
@@ -746,6 +747,120 @@ class MarkLayerUiBrowserTests(unittest.TestCase):
         self.assertEqual(snapshot, result['block'])
         self.assertTrue(result['stamped'])
         self.assertEqual({'id': 1, 'fallback': 0}, result['stats'])
+        self.assertEqual([], self.errors)
+
+    # --- Double-click disable-on-click guards on the v3 dialog (mission-1,
+    # 2026-09-10 night): three consecutive runs closed the SERVER-side race
+    # (trunk lock, then Revert's and Fold's own follow-on 409s) and each one
+    # named the same gap — the CLIENT-side `e.currentTarget.disabled = true`
+    # guards added alongside those fixes (data-v3-accept/-reject-edit/-fold)
+    # had no test coverage of their own, only code inspection. These three
+    # tests drive the real button through Playwright and assert the second
+    # click never reaches the network, closing that named gap directly.
+
+    def _post_edit_mark(self, snapshot, proposed):
+        """`snapshot`/`proposed` is a single sentence (the real shape a
+        sentence-level edit mark carries — Fold requires it, and it must
+        be an exact substring of the block for `_locate_change_span` to
+        find it). `quote` binds by the whole block, same as
+        `_post_sentence_mark` does elsewhere in this file."""
+        server.render_page('docs/page.md', view='v3')
+        mapping = blockmap.load_map(server.block_map_path('docs/page.md'))
+        block = next(b for b in mapping['blocks'] if snapshot in b['text'])
+        return self._post({
+            'page': 'docs/page.md', 'type': 'edit',
+            'block_id': block['id'], 'quote': block['text'],
+            'snapshot': snapshot, 'proposed': proposed,
+        })
+
+    def _open_dialog_for(self, mark_id):
+        # openDialog/fetchMarks are closed over the v3 view's own IIFE and
+        # not exposed on `window` (unlike jumpToMarkLayerNode/
+        # applyRerenderedBlocks, which PAGE_JS exports explicitly) — drive
+        # the dialog open the way a real reader does instead: open the marks
+        # panel (works for open AND already-resolved marks alike, unlike the
+        # inline-diff click path which disappears once a mark is settled)
+        # and click the row for this mark.
+        self.page.click('#v3-marks-btn')
+        row_selector = f'.v3-mark-row[data-mark-id="{mark_id}"]'
+        self.page.wait_for_selector(row_selector)
+        self.page.click(row_selector)
+        self.page.wait_for_selector('.v3-dialog-backdrop')
+
+    def _double_click_and_count_requests(self, selector, endpoint_fragment, delay_s=0.3):
+        """Fires two synchronous native .click()s on `selector` and returns
+        (disabled-immediately-after-both-clicks, number of requests that
+        reached `endpoint_fragment`). The endpoint is slowed down so a
+        same-tick second click, if the guard were absent, would still have
+        time to land before the first request resolves."""
+        hits = []
+        self.page.on('request', lambda req: hits.append(req) if endpoint_fragment in req.url else None)
+
+        def _slow_continue(route):
+            time.sleep(delay_s)
+            route.continue_()
+
+        self.page.route(f'**{endpoint_fragment}', _slow_continue)
+        disabled = self.page.evaluate(
+            """(sel) => {
+                const btn = document.querySelector(sel);
+                btn.click();
+                btn.click();
+                return btn.disabled;
+            }""",
+            selector,
+        )
+        self.page.wait_for_timeout(int(delay_s * 1000) + 300)
+        self.page.unroute(f'**{endpoint_fragment}')
+        return disabled, len(hits)
+
+    def test_double_click_settle_disables_before_second_click_reaches_server(self):
+        snapshot = ' Beta is second.'
+        status, edit = self._post_edit_mark(snapshot, ' Beta is second, revised.')
+        self.assertEqual(201, status)
+        self._goto_v3()
+        self._open_dialog_for(edit['id'])
+        self.assertTrue(self.page.query_selector('[data-v3-accept]'))
+        disabled, hits = self._double_click_and_count_requests('[data-v3-accept]', '/api/marks/merge')
+        self.assertTrue(disabled, 'Settle button must be disabled synchronously by the first click')
+        self.assertEqual(1, hits, 'a second native click on a disabled button must not reach the server')
+        self.assertEqual([], self.errors)
+
+    def test_double_click_revert_disables_before_second_click_reaches_server(self):
+        snapshot = ' Beta is second.'
+        status, edit = self._post_edit_mark(snapshot, ' Beta is second, revised.')
+        self.assertEqual(201, status)
+        self._goto_v3()
+        self._open_dialog_for(edit['id'])
+        self.assertTrue(self.page.query_selector('[data-v3-reject-edit]'))
+        disabled, hits = self._double_click_and_count_requests('[data-v3-reject-edit]', '/api/marks/merge')
+        self.assertTrue(disabled, 'Revert button must be disabled synchronously by the first click')
+        self.assertEqual(1, hits, 'a second native click on a disabled button must not reach the server')
+        self.assertEqual([], self.errors)
+
+    def test_double_click_fold_disables_before_second_click_reaches_server(self):
+        # Fold only appears on an already-resolved edit/replace mark that
+        # was Settled (not Reverted — see the code's own m.reverted gate),
+        # and only succeeds if the page already has a `## Terms` heading.
+        with open(self.doc, 'w', encoding='utf-8') as handle:
+            handle.write(SENTENCE_PAGE + '\n## Terms\n')
+        snapshot = ' Beta is second.'
+        status, edit = self._post_edit_mark(snapshot, ' Beta is second, revised.')
+        self.assertEqual(201, status)
+        merge_req = urllib.request.Request(
+            f'{self.base}/api/marks/merge',
+            data=json.dumps({'page': 'docs/page.md', 'id': edit['id'], 'action': 'settle', 'author': 'mike'}).encode('utf-8'),
+            headers={'Content-Type': 'application/json'}, method='POST',
+        )
+        with urllib.request.urlopen(merge_req) as response:
+            self.assertEqual(200, response.status)
+        self.page.on('dialog', lambda d: d.accept('mission-1-fold-term'))
+        self._goto_v3()
+        self._open_dialog_for(edit['id'])
+        self.assertTrue(self.page.query_selector('[data-v3-fold]'), 'Fold must be offered on a settled edit mark')
+        disabled, hits = self._double_click_and_count_requests('[data-v3-fold]', '/api/fold')
+        self.assertTrue(disabled, 'Fold button must be disabled synchronously by the first click')
+        self.assertEqual(1, hits, 'a second native click on a disabled button must not reach the server')
         self.assertEqual([], self.errors)
 
 

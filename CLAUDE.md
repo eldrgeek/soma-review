@@ -1356,6 +1356,29 @@ DOM — not Playmaker's `fromProseMarkdown` as the sole live path.
 Do not claim 6a closed on twin-still-stamps. Out of scope unchanged:
 Playmaker Fountain `[[SCENE:]]` / P1 Doc export; unbounded ledger prune.
 
+**`test_engine_parity.py`'s `setUpClass` `ERR_MODULE_NOT_FOUND` — real bug, fixed 2026-09-10
+22:43Z, in Playmaker not soma-review.** Two mission-1 runs tonight (21:41Z, 22:23Z) correctly
+named this test's `setUpClass` as failing with `ERR_MODULE_NOT_FOUND` against Playmaker's
+`src/mark-layer-engine/ids.ts` and flagged it as "a real, separate gap... worth a dedicated
+pass" — they were right, and a first pass here that assumed transient/concurrent-edit flakiness
+(no code check, just mtime correlation) was wrong and got caught by Skip's adversarial review
+before shipping. Root cause (Playmaker commit `9e55dad`, Mike, 2026-09-10 18:43 EDT /
+22:43Z — after both mission-1 reports, before this doc's re-check): `adapters/proseMarkdown.ts`
+imported `contentId` from the extensionless specifier `'../ids'`; `node
+--experimental-strip-types` (what `soma-review`'s cross-repo parity CLI, `scripts/
+sentence-parity-cli.mjs`, runs under) requires an explicit extension on relative ESM imports at
+runtime, so the import threw `ERR_MODULE_NOT_FOUND` and silently skipped all 4 of
+`EngineParityTests`'s cases — a real defect present since at least 2026-09-06 (Playmaker's own
+commit message), not a flake. Fixed by importing `'../ids.ts'` instead (`tsconfig.app.json`
+already sets `allowImportingTsExtensions`, so this is safe for `tsc`/Vite too). Verified after
+the fix: direct reproduction of the test's exact subprocess call exits 0 with correct output,
+and two independent full-suite runs (`python3 -m unittest discover -s tests -p "test_*.py"`
+from `soma-review/v2`) both came back 321/321 green. The standing lesson for line 1: this
+cross-repo test has zero version pinning against Playmaker's checkout state, so a soma-review
+mission-1 pass alone cannot fix or fully diagnose a failure whose root cause lives in the
+sibling repo — check Playmaker's own recent commits/branch before writing off (or explaining
+away) a cross-repo test failure as either "still broken" or "just flaky."
+
 ## Fold (SOMA agreed model item 10) — wired into the v3 panel (2026-09-06)
 
 Item 10: "an agreed extension may be folded out of the sentence into the node it

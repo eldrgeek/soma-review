@@ -618,7 +618,11 @@ class MarkLayerUiBrowserTests(unittest.TestCase):
         self.assertEqual(201, status)
         self.assertEqual(stamped, row['mark_layer_node_id'])
         self.assertIsNone(row.get('block_id'))
-        self.assertIsNone(row.get('quote'))
+        # No quote was supplied on create, so `bind_from_mark_layer_node`
+        # fills it with the node's own text (server.py's documented
+        # "otherwise quote is the node's text") — an audit convenience,
+        # not a second identity; id->DOM stays the jump path regardless.
+        self.assertEqual('Beta is second.', row.get('quote'))
         self.assertEqual('', row.get('snapshot') or '')
         saved = [c for c in server.read_comments('docs/page.md') if c['id'] == row['id']]
         self.assertIsNone(saved[0].get('block_id'))
@@ -700,9 +704,16 @@ class MarkLayerUiBrowserTests(unittest.TestCase):
         mapping = blockmap.load_map(server.block_map_path('docs/page.md'))
         first = [b for b in mapping['blocks']
                  if (b.get('text') or '').startswith('Ready.')][0]
+        # The real client's `blockPayload()` always sends `quote` — the
+        # selected span's text, or (with no selection, as here) the whole
+        # block's normalized text. Posting `block_id` with no `quote` at
+        # all is not a shape any real caller produces: `blockmap.resolve`'s
+        # block_id path only binds via an exact quote match (whole-block or
+        # offset), so an empty quote can never resolve and 409s regardless
+        # of whether the id is otherwise correct.
         status, edit = self._post({
             'page': 'docs/page.md', 'type': 'edit',
-            'block_id': first['id'],
+            'block_id': first['id'], 'quote': first['text'],
             'snapshot': 'Ready. Unique first context.',
             'proposed': 'Ready. Unique first context.\n\nReady. Inserted earlier.',
         })

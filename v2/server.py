@@ -4494,6 +4494,64 @@ def _git_commit_file(repo_root, fs_path, message):
         return None, str(exc)
 
 
+# --- Trunk-write serialization ---------------------------------------------
+#
+# The four `apply_sentence_*` functions below are read-modify-write cycles over
+# a real markdown file on disk: each reads the whole page, computes a new
+# whole-page string, and rewrites the file with a non-atomic
+# `open(fs_path, 'w')` + `write`. The server is a `ThreadingHTTPServer`, so two
+# clicks arriving close together (Mike double-clicking Settle, or two reviewers
+# marking the same page) run those cycles concurrently against the same file.
+#
+# Two things go wrong without a lock. Both were flagged by an adversarial pass
+# on the 2026-09-06 Fold-button change and left unfixed then, because they
+# predate Fold and are shared by Settle/Revert/change:
+#
+#   1. Lost update. Both requests read the same `normalized` source, each
+#      applies only its own edit to that snapshot, and the second write wins —
+#      the first edit is silently erased from the trunk even though its mark
+#      was resolved and its git commit exists. The hash guard in
+#      `_locate_change_span` does not catch this, because both requests passed
+#      that guard before either of them wrote.
+#   2. Torn read. `open(..., 'w')` truncates before it writes, so a concurrent
+#      reader (settle's re-render, or the other writer's own
+#      `_locate_change_span`) can read a truncated or half-written page.
+#
+# One lock per resolved trunk path, not one global lock, so edits to different
+# pages still proceed in parallel. The lock is held across the whole cycle
+# including `_git_commit_file`, because that runs `git add <file>` and would
+# otherwise stage whatever the other writer had just left on disk. Locks are
+# cached per realpath and never evicted; the population is bounded by the
+# number of reviewable pages.
+#
+# Scope, stated plainly because the name invites over-reading: this serializes
+# THIS SERVER PROCESS's own writers, and only the ones that take the lock. It
+# is a `threading.Lock`, so it does nothing about a separate process editing
+# the same file — a `cc-dispatch` worker following `dispatch-prompt-template.md`,
+# `scripts/nightly-estate-hygiene.sh`, or Mike in an editor. That gap is the
+# one CLAUDE.md already documents as "the trunk gap"; this lock does not close
+# it. The in-process writers that DO take it are the four `apply_sentence_*`
+# functions and `run_board_regenerate` (which rewrites BOARD.md/PORTFOLIO.md
+# wholesale from a subprocess — added after an adversarial pass found it was
+# the one in-process writer that could silently erase a just-committed
+# sentence edit on the estate workspace's own home page).
+_trunk_locks = {}
+_trunk_locks_guard = threading.Lock()
+
+
+def _trunk_lock(fs_path):
+    """Return the process-wide lock for one trunk file, creating it on first
+    use. Keyed by realpath so two routes resolving to the same file share a
+    lock."""
+    key = os.path.realpath(fs_path)
+    with _trunk_locks_guard:
+        lock = _trunk_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _trunk_locks[key] = lock
+        return lock
+
+
 def _locate_change_span(route_path, workspace, block_id, expected_text):
     """Locate the exact span in the real file that currently holds
     `expected_text` — either the WHOLE block (the common case: this doc's
@@ -4621,6 +4679,11 @@ def _rerender_block(route_path, workspace, fs_path, new_src, block_id, old_block
 
 
 def apply_sentence_change(route_path, workspace, mark, author_label='claude'):
+    with _trunk_lock(resolve_page(route_path, workspace)):
+        return _apply_sentence_change_unlocked(route_path, workspace, mark, author_label)
+
+
+def _apply_sentence_change_unlocked(route_path, workspace, mark, author_label='claude'):
     """The trunk write for a NEW open change (item B): called once, at the
     moment a type=='edit' mark is created (POST /api/comments — see do_POST),
     for every author alike. Writes `mark['proposed']` into the exact span
@@ -4660,6 +4723,11 @@ def apply_sentence_change(route_path, workspace, mark, author_label='claude'):
 
 
 def apply_sentence_settle(route_path, workspace, mark):
+    with _trunk_lock(resolve_page(route_path, workspace)):
+        return _apply_sentence_settle_unlocked(route_path, workspace, mark)
+
+
+def _apply_sentence_settle_unlocked(route_path, workspace, mark):
     """Settle: the trunk already holds the right text (it was written at
     change time) — no file write, no commit, only the mark is resolved. Still
     returns a fresh re-render of the block (cheap — no write involved) so the
@@ -4677,6 +4745,11 @@ def apply_sentence_settle(route_path, workspace, mark):
 
 
 def apply_sentence_revert(route_path, workspace, mark):
+    with _trunk_lock(resolve_page(route_path, workspace)):
+        return _apply_sentence_revert_unlocked(route_path, workspace, mark)
+
+
+def _apply_sentence_revert_unlocked(route_path, workspace, mark):
     """Revert: deterministically writes `mark['snapshot']` (before) back into
     the span that currently holds `mark['proposed']` (the open change),
     hash-guarded the same way as a change, commits `mdp: revert <id> on
@@ -4727,6 +4800,11 @@ _SAFE_TERM_RE = re.compile(r'^[^\n\]\)\(`]{1,80}$')
 
 
 def apply_sentence_fold(route_path, workspace, block_id, sentence_text, term):
+    with _trunk_lock(resolve_page(route_path, workspace)):
+        return _apply_sentence_fold_unlocked(route_path, workspace, block_id, sentence_text, term)
+
+
+def _apply_sentence_fold_unlocked(route_path, workspace, block_id, sentence_text, term):
     """Fold (MDP agreed model item 10 — "an agreed extension may be folded
     out of the sentence into the node it defines, leaving the link. The
     document gets shorter as agreement grows." — agreed 2026-09-03, flagged
@@ -7034,6 +7112,25 @@ def file_development_request(page, narrative, workspace=DEFAULT_WORKSPACE, app_o
         return {'error': str(e)}
 
 
+_REGENERATE_TARGET_ROUTES = {
+    'board': ('estate/BOARD.md', 'estate'),
+    'portfolio': ('estate/PORTFOLIO.md', 'estate'),
+}
+
+
+def _regenerate_target_lock(key):
+    """The trunk lock for the page a generator rewrites, or None if that page
+    is not resolvable under the current workspace config (a stripped-down test
+    fixture, say) — in which case there is no in-process reader to race."""
+    route = _REGENERATE_TARGET_ROUTES.get(key)
+    if not route:
+        return None
+    try:
+        return _trunk_lock(resolve_page(route[0], route[1]))
+    except Exception:  # noqa: BLE001 — an unresolvable target means nothing to guard
+        return None
+
+
 def run_board_regenerate():
     """Blocking (both generators run in well under a second — see their own
     module docstrings for the stream list). Runs board then portfolio; returns
@@ -7043,10 +7140,26 @@ def run_board_regenerate():
     py = sys.executable or '/opt/homebrew/bin/python3'
     results = {}
     for key, script in (('board', GENERATE_BOARD_SCRIPT), ('portfolio', GENERATE_PORTFOLIO_SCRIPT)):
-        proc = subprocess.run(
-            [py, script],
-            capture_output=True, text=True, timeout=60, cwd=PROJECTS_ROOT,
-        )
+        # Both generators end in a whole-file `open(OUT_PATH, 'w')`, and both
+        # targets are ordinary markable pages — `estate/BOARD.md` is the estate
+        # workspace's HOME page. Without this lock a regenerate landing between
+        # a sentence edit's read and its write erases the whole regeneration and
+        # git-commits the loss under `mdp: change <id> on estate/BOARD.md`, or,
+        # interleaved the other way, discards the reader's edit. Same failure the
+        # `apply_sentence_*` lock exists to prevent; this was the one in-process
+        # writer that bypassed it. Best-effort: if the page isn't resolvable in
+        # this workspace config, regenerate anyway rather than refuse.
+        lock = _regenerate_target_lock(key)
+        if lock is not None:
+            lock.acquire()
+        try:
+            proc = subprocess.run(
+                [py, script],
+                capture_output=True, text=True, timeout=60, cwd=PROJECTS_ROOT,
+            )
+        finally:
+            if lock is not None:
+                lock.release()
         results[key] = {
             'rc': proc.returncode,
             'stdout': proc.stdout,

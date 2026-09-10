@@ -3498,11 +3498,18 @@ V3_JS = r"""
       await setStatus(m, 'queued');
       backdrop.remove();
     });
-    backdrop.querySelector('[data-v3-fold]')?.addEventListener('click', async () => {
+    backdrop.querySelector('[data-v3-fold]')?.addEventListener('click', async (e) => {
       const term = (prompt('Fold this sentence into a Terms entry named:', '') || '').trim();
       if (!term) return;
+      // Disable on click, not just on response: the server-side lock (below)
+      // is what actually prevents corruption, but a second click landing
+      // while the first is still in flight would still show the reader a
+      // confusing "already resolved"/drift 409 for no benefit — a quiet
+      // client-side guard against the double-click itself is cheaper than
+      // explaining that error.
+      e.currentTarget.disabled = true;
       const ok = await foldMark(m, term);
-      if (ok) backdrop.remove();
+      if (ok) backdrop.remove(); else e.currentTarget.disabled = false;
     });
     backdrop.querySelectorAll('[data-v3-ratify]').forEach(btn => {
       btn.addEventListener('click', async () => {
@@ -3533,16 +3540,23 @@ V3_JS = r"""
       backdrop.remove();
       advanceAfterResolve(m);
     });
-    backdrop.querySelector('[data-v3-accept]')?.addEventListener('click', async () => {
+    backdrop.querySelector('[data-v3-accept]')?.addEventListener('click', async (e) => {
       // Settle (item B): trunk already holds the right text — resolves the
-      // mark and redraws the block without the del/ins overlay.
+      // mark and redraws the block without the del/ins overlay. Disabled
+      // on click for the same double-click reason as Fold/Revert below.
+      e.currentTarget.disabled = true;
       const ok = await settleOrRevertMark(m, 'settle');
       backdrop.remove();
       if (ok) advanceAfterResolve(m);
     });
-    backdrop.querySelector('[data-v3-reject-edit]')?.addEventListener('click', async () => {
+    backdrop.querySelector('[data-v3-reject-edit]')?.addEventListener('click', async (e) => {
       // Revert (item B): writes `before` back into the trunk file,
-      // committed — see apply_sentence_revert.
+      // committed — see apply_sentence_revert. The server now serializes
+      // guard->apply->status-write under the trunk lock (see
+      // /api/marks/merge), so a second click here at worst gets a clean
+      // "mark already resolved" 409 instead of a drift/"refusing change"
+      // one; disabling the button is belt-and-suspenders on top of that.
+      e.currentTarget.disabled = true;
       const ok = await settleOrRevertMark(m, 'revert');
       backdrop.remove();
       if (ok) advanceAfterResolve(m);
@@ -7847,62 +7861,74 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({'error': 'page and id required'}, status=400)
                 return
             try:
-                resolve_page(page, workspace)
+                fs_path = resolve_page(page, workspace)
             except NotFoundError:
                 self._send_json({'error': 'unknown page'}, status=404)
                 return
-            rows = [c for c in read_comments(page, workspace) if c.get('id') == mark_id]
-            if not rows:
-                self._send_json({'error': 'mark not found'}, status=404)
-                return
-            mark = rows[0]
-            if mark.get('type') not in ('edit',):
-                self._send_json({'error': 'only edit/replace marks can be settled or reverted'}, status=400)
-                return
-            if mark.get('status') == 'done':
-                self._send_json({'error': 'mark already resolved'}, status=409)
-                return
-            if action == 'settle':
-                result = apply_sentence_settle(page, workspace, mark)
-                # `resolved_by` is what lets the ringer list tell a revision the
-                # reader acted on from one his bracket swallowed silently. It is
-                # as trustworthy as any other client-asserted author on this
-                # surface, which is to say: a record, not an authentication.
-                update_comment(page, mark_id, {'status': 'done', 'settled': True,
-                                               'resolved_by': resolver_author}, workspace)
+            # The guard (`status == 'done'`), the apply, and the `update_comment`
+            # that sets `status` were three separate steps outside any lock, so
+            # two clicks close together on the same mark both passed the guard
+            # before either wrote it — the second Revert then hit its own
+            # already-mutated trunk text and 409'd as "refusing change" on a
+            # benign double-click, in Mike's face, on his most deliberate act.
+            # Holding the trunk lock across guard->apply->update_comment makes
+            # the second request re-check `status` against the first request's
+            # already-written outcome instead of a stale read. Calls the
+            # `_unlocked` bodies directly (not `apply_sentence_settle`/`_revert`)
+            # since this lock is non-reentrant.
+            with _trunk_lock(fs_path):
+                rows = [c for c in read_comments(page, workspace) if c.get('id') == mark_id]
+                if not rows:
+                    self._send_json({'error': 'mark not found'}, status=404)
+                    return
+                mark = rows[0]
+                if mark.get('type') not in ('edit',):
+                    self._send_json({'error': 'only edit/replace marks can be settled or reverted'}, status=400)
+                    return
+                if mark.get('status') == 'done':
+                    self._send_json({'error': 'mark already resolved'}, status=409)
+                    return
+                if action == 'settle':
+                    result = _apply_sentence_settle_unlocked(page, workspace, mark)
+                    # `resolved_by` is what lets the ringer list tell a revision the
+                    # reader acted on from one his bracket swallowed silently. It is
+                    # as trustworthy as any other client-asserted author on this
+                    # surface, which is to say: a record, not an authentication.
+                    update_comment(page, mark_id, {'status': 'done', 'settled': True,
+                                                   'resolved_by': resolver_author}, workspace)
+                    self._send_json({
+                        'ok': True, 'settled': True,
+                        'block_id': result['block_id'], 'html': result['html'],
+                        'later_html': result.get('later_html') or [],
+                        'mark_layer_nodes': result.get('mark_layer_nodes') or [],
+                        'commit': result['commit'],
+                    })
+                    return
+                try:
+                    result = _apply_sentence_revert_unlocked(page, workspace, mark)
+                except MergeConflict as exc:
+                    self._send_json({'error': str(exc)}, status=409)
+                    return
+                except NotFoundError:
+                    self._send_json({'error': 'unknown page'}, status=404)
+                    return
+                # The revert writes and commits. Without the sha on the row, the
+                # trunk witness sees a commit no row claims and rings the reader's
+                # own revert back at him as an unrecorded change.
+                revert_patch = {'status': 'done', 'reverted': True,
+                                'revert_commit': result.get('commit'),
+                                'resolved_by': resolver_author}
+                if result.get('commit_error'):
+                    revert_patch['commit_error'] = result['commit_error']
+                update_comment(page, mark_id, revert_patch, workspace)
                 self._send_json({
-                    'ok': True, 'settled': True,
+                    'ok': True, 'reverted': True,
                     'block_id': result['block_id'], 'html': result['html'],
                     'later_html': result.get('later_html') or [],
                     'mark_layer_nodes': result.get('mark_layer_nodes') or [],
                     'commit': result['commit'],
                 })
                 return
-            try:
-                result = apply_sentence_revert(page, workspace, mark)
-            except MergeConflict as exc:
-                self._send_json({'error': str(exc)}, status=409)
-                return
-            except NotFoundError:
-                self._send_json({'error': 'unknown page'}, status=404)
-                return
-            # The revert writes and commits. Without the sha on the row, the
-            # trunk witness sees a commit no row claims and rings the reader's
-            # own revert back at him as an unrecorded change.
-            revert_patch = {'status': 'done', 'reverted': True,
-                            'revert_commit': result.get('commit'),
-                            'resolved_by': resolver_author}
-            if result.get('commit_error'):
-                revert_patch['commit_error'] = result['commit_error']
-            update_comment(page, mark_id, revert_patch, workspace)
-            self._send_json({
-                'ok': True, 'reverted': True,
-                'block_id': result['block_id'], 'html': result['html'],
-                'later_html': result.get('later_html') or [],
-                'mark_layer_nodes': result.get('mark_layer_nodes') or [],
-                'commit': result['commit'],
-            })
-            return
 
         if path == '/api/fold':
             # Fold (MDP agreed model item 10): {page, block_id, sentence, term}.

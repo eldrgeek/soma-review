@@ -32,6 +32,8 @@ import sys
 import tempfile
 import threading
 import unittest
+import urllib.error
+import urllib.request
 
 V2_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, V2_DIR)
@@ -174,6 +176,168 @@ class TrunkWriteConcurrencyTests(unittest.TestCase):
         self.assertIn('Beta edited sentence.', content)
         self.assertNotIn('Alpha original sentence.', content)
         self.assertNotIn('Beta original sentence.', content)
+
+    def _fire_two_marks_merge_requests(self, action):
+        """Shared instrumentation for the double-click race tests below.
+        Sets up one open edit mark on a fresh doc, then fires two concurrent
+        HTTP `/api/marks/merge` requests with the given `action`
+        ('settle' or 'revert'), forcing real interleaving the same way
+        `test_concurrent_changes_on_one_page_do_not_lose_each_other` forces
+        it for `apply_sentence_change`: wrap `_trunk_lock` to record when
+        each thread reaches it, and block the winner (inside the lock, at
+        its first call to `read_comments`) until the loser has also reached
+        and blocked on the lock — proving the loser's own status re-check
+        happens strictly after the winner's guard->apply->update_comment,
+        not concurrently with it. Returns (results, both_arrived,
+        still_running) for the caller to assert on."""
+        self.write_doc('# Title\n\nAlpha original sentence.\n')
+        mark = self.edit_mark('c-a', 'Alpha original sentence.', 'Alpha edited sentence.')
+        server.apply_sentence_change('docs/page.md', 'estate', mark, author_label='claude')
+        server.append_comment('docs/page.md', mark, 'estate')
+
+        arrivals = []
+        both_arrived = threading.Event()
+        state = threading.Lock()
+        original_trunk_lock = server._trunk_lock
+
+        def recording_trunk_lock(fs_path):
+            # Called before the `with` blocks on acquiring it, so this
+            # records "reached the lock" for both the winner and the loser.
+            lock = original_trunk_lock(fs_path)
+            with state:
+                arrivals.append(threading.current_thread().name)
+                if len(arrivals) == 2:
+                    both_arrived.set()
+            return lock
+
+        original_read_comments = server.read_comments
+        first_read_done = threading.Event()
+
+        def blocking_read_comments(*args, **kwargs):
+            result = original_read_comments(*args, **kwargs)
+            # `read_comments` is the first call inside the locked block. The
+            # winner of the lock race parks here — still holding the trunk
+            # lock — until the loser has also reached (and blocked on) the
+            # lock, so the loser's own `read_comments` cannot run until
+            # AFTER this request's apply + update_comment have completed.
+            if not first_read_done.is_set():
+                first_read_done.set()
+                both_arrived.wait(timeout=15)
+            return result
+
+        httpd = server.ThreadingHTTPServer(('127.0.0.1', 0), server.Handler)
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        results = {}
+
+        def post(name):
+            payload = json.dumps({
+                'page': 'docs/page.md', 'id': 'c-a', 'action': action, 'author': 'mike',
+            }).encode('utf-8')
+            request = urllib.request.Request(
+                f'http://127.0.0.1:{httpd.server_port}/api/marks/merge',
+                data=payload, headers={'Content-Type': 'application/json'}, method='POST',
+            )
+            try:
+                with urllib.request.urlopen(request) as response:
+                    results[name] = (response.status, json.load(response))
+            except urllib.error.HTTPError as exc:
+                results[name] = (exc.code, json.load(exc))
+
+        server._trunk_lock = recording_trunk_lock
+        server.read_comments = blocking_read_comments
+        try:
+            threads = [threading.Thread(target=post, args=(n,), name=n)
+                       for n in ('r0', 'r1')]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=45)
+            still_running = [t.name for t in threads if t.is_alive()]
+        finally:
+            server._trunk_lock = original_trunk_lock
+            server.read_comments = original_read_comments
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join(timeout=2)
+
+        return results, both_arrived, still_running
+
+    def test_double_click_revert_does_not_race_the_status_guard(self):
+        """Regression for the race `/api/marks/merge` introduced when
+        `_trunk_lock` first shipped (2026-09-10, commit 41684e2): the
+        `status == 'done'` guard, the apply, and the `update_comment` that
+        sets status were three separate steps outside any lock, so two
+        Revert clicks close together both read `status != 'done'`, both
+        proceeded, and the second one's `_locate_change_span` hash guard
+        then found the FIRST request's already-reverted text instead of the
+        mark's `proposed` text it expected — a confusing drift/"refusing
+        change" 409 on a benign double-click, on Mike's most deliberate act.
+        Fixed by holding the trunk lock across guard -> apply ->
+        update_comment, so the loser re-reads a status that is already
+        'done' and gets the plain, correct "mark already resolved" 409
+        instead of a drift error, and the trunk ends up reverted exactly
+        once, not corrupted."""
+        results, both_arrived, still_running = self._fire_two_marks_merge_requests('revert')
+
+        self.assertEqual(still_running, [], 'a revert request never returned — deadlock')
+        self.assertTrue(
+            both_arrived.is_set(),
+            'both requests never reached _trunk_lock — /api/marks/merge is not '
+            'holding the trunk lock across guard->apply->update_comment')
+        statuses = sorted(status for status, _ in results.values())
+        self.assertEqual(
+            [200, 409], statuses,
+            f'expected exactly one clean revert (200) and one clean refusal (409), got: {results}')
+        ok_body = next(body for status, body in results.values() if status == 200)
+        err_body = next(body for status, body in results.values() if status == 409)
+        self.assertTrue(ok_body.get('ok'))
+        self.assertTrue(ok_body.get('reverted'))
+        self.assertEqual(
+            'mark already resolved', err_body.get('error'),
+            'the loser must see the plain status-already-done refusal, not a '
+            'drift/"refusing change" MergeConflict raised by racing the winner\'s '
+            'own write — that confusing 409 is the exact regression this pins')
+
+        with open(self.doc, encoding='utf-8') as f:
+            content = f.read()
+        self.assertIn('Alpha original sentence.', content)
+        self.assertNotIn('Alpha edited sentence.', content)
+
+    def test_double_click_settle_does_not_race_the_status_guard(self):
+        """Same race, Settle side (Skip's adversarial pass on the Revert fix,
+        2026-09-10: the fix is inside the same `with _trunk_lock` block for
+        both branches by construction, but nothing had exercised the Settle
+        branch's own apply path — `_apply_sentence_settle_unlocked` takes a
+        different route than Revert's: no file write, no
+        `_locate_change_span` hash guard, just a re-render of already-correct
+        trunk text — so a bug specific to that path would not be caught by
+        a Revert-only test). Two Settle clicks close together: the loser
+        must see the same clean "mark already resolved" 409, never a crash
+        or a duplicate resolution."""
+        results, both_arrived, still_running = self._fire_two_marks_merge_requests('settle')
+
+        self.assertEqual(still_running, [], 'a settle request never returned — deadlock')
+        self.assertTrue(
+            both_arrived.is_set(),
+            'both requests never reached _trunk_lock — /api/marks/merge is not '
+            'holding the trunk lock across guard->apply->update_comment')
+        statuses = sorted(status for status, _ in results.values())
+        self.assertEqual(
+            [200, 409], statuses,
+            f'expected exactly one clean settle (200) and one clean refusal (409), got: {results}')
+        ok_body = next(body for status, body in results.values() if status == 200)
+        err_body = next(body for status, body in results.values() if status == 409)
+        self.assertTrue(ok_body.get('ok'))
+        self.assertTrue(ok_body.get('settled'))
+        self.assertEqual('mark already resolved', err_body.get('error'))
+
+        # Settle never writes the file (the trunk already holds the right
+        # text) — the edited sentence must survive untouched either way.
+        with open(self.doc, encoding='utf-8') as f:
+            content = f.read()
+        self.assertIn('Alpha edited sentence.', content)
+        self.assertNotIn('Alpha original sentence.', content)
 
     def test_lock_is_per_page_so_different_pages_still_write_in_parallel(self):
         one = os.path.join(self.docs_repo, 'page.md')

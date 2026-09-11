@@ -7696,7 +7696,38 @@ class Handler(BaseHTTPRequestHandler):
                 return
             with open(fs_path, 'rb') as handle:
                 src = handle.read().decode('utf-8')
-            self._send_json({'page': page, 'nodes': to_mark_layer_nodes(src)})
+            # Second bridging-slice measurement (item 6a, 2026-09-11 mission-1):
+            # same flag/fallback pattern as render_mark_layer_preview, now on a
+            # second call site so the per-request latency question has more
+            # than one sample. Still loopback-only (absent from
+            # TUNNEL_ALLOWED_GET, unchanged) and still not linked from any
+            # production UI — this is instrumentation, not the cutover.
+            # latency_ms times only the call that actually produced `nodes` —
+            # a fresh timer for the twin fallback, not the bridge attempt it
+            # follows, so a fallback row's number is never bridge-attempt-time
+            # plus twin-time misreported as pure twin time (Skip, 2026-09-11).
+            engine_source = 'python-twin'
+            bridge_error = None
+            if mark_layer_http_bridge_enabled():
+                t0 = time.monotonic()
+                try:
+                    nodes = to_mark_layer_nodes_via_http_bridge(src)
+                    engine_source = 'playmaker-http-bridge'
+                    latency_ms = round((time.monotonic() - t0) * 1000, 2)
+                except Exception as exc:  # noqa: BLE001 - any bridge failure falls back
+                    bridge_error = str(exc)
+                    t0 = time.monotonic()
+                    nodes = to_mark_layer_nodes(src)
+                    latency_ms = round((time.monotonic() - t0) * 1000, 2)
+            else:
+                t0 = time.monotonic()
+                nodes = to_mark_layer_nodes(src)
+                latency_ms = round((time.monotonic() - t0) * 1000, 2)
+            response = {'page': page, 'nodes': nodes, 'engine': engine_source,
+                        'latency_ms': latency_ms}
+            if bridge_error:
+                response['bridge_error'] = bridge_error
+            self._send_json(response)
             return
 
         if path == '/healthz':

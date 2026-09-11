@@ -1401,6 +1401,26 @@ today it's env-only and that's what keeps this from being an SSRF shape. This do
 — the next slice is wiring a live (non-debug) call site behind the same flag pattern, then
 retiring the Python twin's use there once parity holds under real load.
 
+**Second bridging-slice sample + real latency measurement (2026-09-11, later mission-1 run).**
+The same flag/fallback pattern was wired into `GET /api/mark-layer` (still loopback-only —
+absent from `TUNNEL_ALLOWED_GET`/`TUNNEL_ALLOWED_GET_PREFIXES`, unchanged — and still not
+called by any client; `window.__MARK_LAYER_NODES__` is populated by a separate server-side
+embed at render time, not by fetching this endpoint), adding `engine`/`latency_ms`/optional
+`bridge_error` fields to the existing `{page, nodes}` response — additive only, confirmed no
+consumer parses a fixed key set. Live-measured on `estate/MORNING-REVIEW-2026-07-02.md` (119
+nodes): the in-process Python twin is consistently ~2-5ms; the Node HTTP bridge round-trip is
+~7-27ms warm, 123ms on a cold first call — a real, non-trivial latency cost the full cutover
+will need to budget for, not just a correctness question. Skip's adversarial pass caught a real
+bug before this shipped: the first version started one shared timer before the bridge-vs-twin
+branch, so a *fallback* row's `latency_ms` was bridge-attempt-time plus twin-time, misreported
+as pure twin time — a reader using this telemetry to judge "how fast is the twin" would have
+been systematically wrong on every fallback row. Fixed by starting a fresh timer for whichever
+call actually produces the returned nodes. Regression-tested (was previously unpinned, per
+Skip's second, non-blocking finding that neither bridge call site had test coverage):
+`v2/tests/test_mark_layer_api_bridge.py`, including a case that fails red on the original bug
+(a slow, failing bridge stub that would push `latency_ms` past its assertion threshold if the
+timer were shared again).
+
 **Parity check is now CI-gated in Playmaker, not just hand-run (2026-09-11).** The version-pinning
 gap named above is closed: Playmaker's `.github/workflows/ci.yml` has an `engine-parity` job that
 checks out this repo (`soma-review`, `v2-collab-pages`, public, no auth) as a sibling on every

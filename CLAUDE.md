@@ -1379,6 +1379,16 @@ mission-1 pass alone cannot fix or fully diagnose a failure whose root cause liv
 sibling repo — check Playmaker's own recent commits/branch before writing off (or explaining
 away) a cross-repo test failure as either "still broken" or "just flaky."
 
+**Parity check is now CI-gated in Playmaker, not just hand-run (2026-09-11).** The version-pinning
+gap named above is closed: Playmaker's `.github/workflows/ci.yml` has an `engine-parity` job that
+checks out this repo (`soma-review`, `v2-collab-pages`, public, no auth) as a sibling on every
+Playmaker PR/push, and runs `test_engine_parity.py` for real. It is a drift alarm, not a merge
+gate (`continue-on-error: true` — item 6a is still an accepted bridge, so an unrelated PR should
+not fail to merge because this repo is briefly unreachable), and it fails loud rather than
+green-by-skip if the fixture set comes back empty. See Playmaker PR #238
+(`https://github.com/eldrgeek/playmaker/pull/238`) for the job definition and the two CI-environment
+bugs (relative cwd, wrong default branch) fixed while landing it.
+
 ## Fold (SOMA agreed model item 10) — wired into the v3 panel (2026-09-06)
 
 Item 10: "an agreed extension may be folded out of the sentence into the node it

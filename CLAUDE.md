@@ -1563,6 +1563,38 @@ green-by-skip if the fixture set comes back empty. See Playmaker PR #238
 (`https://github.com/eldrgeek/playmaker/pull/238`) for the job definition and the two CI-environment
 bugs (relative cwd, wrong default branch) fixed while landing it.
 
+**Cross-request residual closed (2026-09-11, later mission-1 run) — this was the last named
+blocker before the flag can be flipped for real traffic.** The third slice's race (immediately
+above: create and resolve are separate HTTP requests, so a bridge flap between them could mint
+a twin-engine id on one and a bridge-engine id on the other for the same page content) is fixed
+by `_mark_layer_nodes_pinned_by_source()` (`v2/server.py`): a content-addressed (sha256 of the
+exact mark-layer source text) 256-entry LRU cache that pins the engine choice — bridge or twin
+fallback, whichever actually produced the nodes — per page *content*, not per route. Both halves
+of the create/resolve pair are wired through it: `load_page_mark_layer_nodes` (resolve) and
+`bind_from_mark_layer_node` (create); a create call and a later resolve call for identical
+content now always see the byte-identical node list, regardless of what the bridge does in
+between. An edit changes the source text, which is a fresh cache key — no explicit invalidation
+needed, and a real content change is exactly when node ids are expected to move (the remap
+ledger already handles that case). Skip's adversarial pass on the first draft found the real gap
+the fix's own name implied it closed: that draft only wired `load_page_mark_layer_nodes`,
+leaving `bind_from_mark_layer_node` — the create half the residual explicitly named — making its
+own independent, unpinned bridge/twin choice, so the exact race was still open for the pairing
+that motivated the fix. Closed by routing both functions through the same helper, plus a second,
+narrower finding (a concurrent double-miss on a brand-new cache key could still record two
+different engine choices if the bridge flapped inside that specific window) closed by
+serializing the whole check-compute-store sequence under one lock instead of two separate
+lock sections. Regression-tested: `v2/tests/test_mark_layer_nodes_pinned_by_source.py`,
+including `test_bind_from_mark_layer_node_shares_the_pin_with_load_page` — the case that fails
+red if either function goes back to computing independently. Full suite green: 347/347
+(`python3 -m unittest discover -s tests -p "test_*.py"` from `v2/`, ~223s). Live service
+(`com.mikewolf.soma-review`) restarted and `/healthz` confirmed OK. **This does not flip
+`SOMA_REVIEW_MARK_LAYER_HTTP_BRIDGE` on** — flag stays default off, so today's live behavior is
+unchanged — but every previously-named correctness blocker (same-request mixed-engine, the
+third slice's cross-request mixed-engine, and the concurrent double-miss variant of it) is now
+closed. The only remaining question before a flip-on decision is the product call of whether the
+bridge's few-millisecond-per-call cost (see the supervised-daemon latency numbers above) is
+worth paying for parity with Playmaker's engine — not an open correctness gap.
+
 ## Fold (SOMA agreed model item 10) — wired into the v3 panel (2026-09-06)
 
 Item 10: "an agreed extension may be folded out of the sentence into the node it

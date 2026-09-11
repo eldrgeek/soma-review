@@ -389,14 +389,24 @@ def mark_layer_beside_enabled():
 
 
 def mark_layer_http_bridge_enabled():
-    """First bridging slice toward item 6a's cutover (2026-09-11 mission-1):
+    """Bridging slices toward item 6a's cutover (2026-09-11, mission-1 runs):
     call Playmaker's real `fromProseMarkdown` over HTTP instead of running
     the Python twin (`to_mark_layer_nodes`), so the live-latency question
-    gets a real answer before any of the 7+ production call sites are
-    touched. Default off. Wired ONLY into `render_mark_layer_preview`, the
-    debug-only `/mark-layer-preview/*` route (not linked from any production
-    UI, zero blast radius) — every live create/edit/resolve call site still
-    uses the Python twin unconditionally. Run the bridge server first:
+    gets a real answer before the remaining production call sites are
+    touched. Default off — today's live behavior is unchanged regardless of
+    call-site count, because nothing here flips the flag on.
+
+    Wired into: `render_mark_layer_preview` (debug-only `/mark-layer-preview/*`
+    route, not linked from any production UI); `GET /api/mark-layer`
+    (loopback-only, unconsumed by any client); and `load_page_mark_layer_nodes`
+    (backs `resolve_mark_block`'s two callers and `present_comments` — REAL
+    create/edit/resolve/comment-presentation traffic, not a debug or unconsumed
+    route). This is no longer zero blast radius the moment the flag is flipped
+    on: `load_page_mark_layer_nodes`'s own docstring names an open residual
+    (create and resolve are separate requests, so a bridge flap between them
+    can mint a twin id on one call and a bridge id on the other — fails safe
+    via the legacy `block_id` fallback, but silently) that must be closed
+    before this flag goes on for real traffic. Run the bridge server first:
     `node --experimental-strip-types scripts/mark-layer-server.mjs` from
     `~/Projects/playmaker`.
     """
@@ -4353,12 +4363,46 @@ def bind_from_mark_layer_node(route_path, workspace, candidate):
 
 
 def load_page_mark_layer_nodes(route_path, workspace=DEFAULT_WORKSPACE):
-    """Current parse + adapter nodes for a page. Never raises; empty on miss."""
+    """Current parse + adapter nodes for a page. Never raises; empty on miss.
+
+    Third bridging slice toward item 6a's cutover (2026-09-11 mission-1):
+    the first real (non-debug) call site wired to the HTTP bridge. This
+    backs `resolve_mark_block()`'s two callers — actual mark create/resolve
+    traffic, not instrumentation. Same flag/fallback pattern as the first
+    two slices: `mark_layer_http_bridge_enabled()` is default off, and any
+    bridge failure falls back to the Python twin, logged to stderr so a
+    fallback storm is visible in the service log even though this call
+    site has no response body to carry an `engine` field.
+
+    Named residual (Skip, 2026-09-11): a mark's node id is re-derived fresh
+    on every call — create and resolve are separate requests, each an
+    independent chance for the bridge to be up or down. If the bridge flaps
+    between the two, one call can mint a twin id and the other a bridge id;
+    parity between the engines is verified on a fixture corpus, not proven
+    as a live invariant, and the duplicate-occurrence-suffix mint is
+    documented elsewhere as order-dependent. A mismatch here fails safe
+    (`resolve_mark_block` returns `None`, the caller's existing legacy
+    fallback takes over) but is silent — no log, no signal. Do not flip
+    `SOMA_REVIEW_MARK_LAYER_HTTP_BRIDGE` on for real traffic until this is
+    closed (e.g. pin the engine per page-version, or verify id-parity as an
+    invariant rather than a corpus sample).
+    """
     try:
         fs_path = resolve_page(route_path, workspace)
         with open(fs_path, 'rb') as handle:
             src = handle.read().decode('utf-8')
-        nodes = to_mark_layer_nodes(_mark_layer_source(src))
+        mark_layer_src = _mark_layer_source(src)
+        if mark_layer_http_bridge_enabled():
+            try:
+                nodes = to_mark_layer_nodes_via_http_bridge(mark_layer_src)
+            except Exception as exc:  # noqa: BLE001 - any bridge failure falls back
+                sys.stderr.write(
+                    f'[mark-layer] http bridge failed for {route_path}, '
+                    f'falling back to python twin: {exc}\n'
+                )
+                nodes = to_mark_layer_nodes(mark_layer_src)
+        else:
+            nodes = to_mark_layer_nodes(mark_layer_src)
         _src, blocks, _mapping, _report = current_page_blocks(route_path, workspace)
         return blocks, nodes
     except Exception:  # noqa: BLE001 — readers must fall back to legacy fields

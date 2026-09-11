@@ -621,9 +621,16 @@ def write_all_comments(route_path, comments, workspace=DEFAULT_WORKSPACE):
         _write_all_comments_unlocked(path, comments)
 
 
-def append_comment(route_path, comment, workspace=DEFAULT_WORKSPACE):
+def append_comment(route_path, comment, workspace=DEFAULT_WORKSPACE, precondition=None):
+    """precondition, if given, is called with the existing comment list under
+    the SAME lock the write happens under — a check performed before
+    acquiring this lock (or in a separate acquisition) leaves a TOCTOU window
+    for a concurrent request to write between the check and the append. It
+    must raise to block the write; a normal return allows it."""
     path = sidecar_path(route_path, workspace)
     with blockmap.file_lock(path):
+        if precondition is not None:
+            precondition(_read_comments_unlocked(path))
         os.makedirs(os.path.dirname(path), exist_ok=True)
         needs_guard = False
         if os.path.isfile(path) and os.path.getsize(path):
@@ -4321,6 +4328,15 @@ def current_page_blocks(route_path, workspace=DEFAULT_WORKSPACE):
 
 class BindingConflict(Exception):
     pass
+
+
+class ToggleTerminalError(Exception):
+    """Raised by append_comment's precondition when a toggle mark's widget is
+    already at its terminal `kept-both` state. Carries the JSON error payload
+    the HTTP layer sends verbatim."""
+    def __init__(self, payload):
+        super().__init__(payload.get('error', 'toggle terminal'))
+        self.payload = payload
 
 
 def maybe_attach_mark_layer_nodes(comment, page, workspace):
@@ -8025,6 +8041,13 @@ class Handler(BaseHTTPRequestHandler):
                 if not page:
                     self._send_json({'error': 'page required for mark'}, status=400)
                     return
+                toggle_widget_id = None
+                toggle_reopen = False
+                if mark_kind == 'toggle':
+                    toggle_meta = data.get('meta')
+                    toggle_widget_id = toggle_meta.get('widget') if isinstance(toggle_meta, dict) else None
+                    toggle_reopen = bool(data.get('reopen')) or bool(
+                        isinstance(toggle_meta, dict) and toggle_meta.get('reopen'))
                 if mark_kind == 'reader-signal':
                     reader_signal = data.get('signal')
                     if reader_signal not in ('gave-up', 'done'):
@@ -8175,6 +8198,11 @@ class Handler(BaseHTTPRequestHandler):
                 # decision marks — see V3_JS `KIND_META.decision` handling).
                 if isinstance(data.get('meta'), dict):
                     comment['meta'] = data.get('meta')
+                if mark_kind == 'toggle' and toggle_reopen:
+                    # Audit trail for the kept-both override (Skip, 2026-09-11):
+                    # otherwise a reopen write is indistinguishable from a normal
+                    # toggle once it's on disk.
+                    comment['toggle_reopened'] = True
                 if data.get('scope') in ('section', 'page'):
                     comment['scope'] = data.get('scope')
                 if data.get('reason'):
@@ -8203,7 +8231,40 @@ class Handler(BaseHTTPRequestHandler):
             if ctype == 'verdict':
                 comment['verdict'] = data.get('verdict')
                 comment['row_id'] = row_id
-            append_comment(page, comment, workspace)
+            toggle_precondition = None
+            if ctype == 'mark' and mark_kind == 'toggle' and toggle_widget_id and not toggle_reopen:
+                # kept-both is documented (design-alt-widget-demo.md) as the widget's
+                # permanent terminal state. Checked against the row set read under the
+                # SAME lock the append below happens under (see append_comment's
+                # `precondition` param) — a check-then-write across two lock
+                # acquisitions left a real TOCTOU window for a concurrent request to
+                # slip a non-terminal toggle in between (Skip, 2026-09-11, second
+                # adversarial pass). "Latest" (not "any-ever") toggle for this widget
+                # is what's terminal, so a successful `reopen:true` toggle — which
+                # itself becomes the new latest row — is not blocked again by the
+                # old kept-both row on the next normal toggle.
+                def toggle_precondition(existing, _widget=toggle_widget_id):
+                    latest = None
+                    for row in existing:
+                        if row.get('type') != 'mark' or row.get('mark_kind') != 'toggle':
+                            continue
+                        if row.get('deleted'):
+                            continue
+                        row_meta = row.get('meta')
+                        if isinstance(row_meta, dict) and row_meta.get('widget') == _widget:
+                            latest = row
+                    if latest is not None and isinstance(latest.get('meta'), dict) \
+                            and latest['meta'].get('state') == 'kept-both':
+                        raise ToggleTerminalError({
+                            'error': 'kept-both is terminal for this widget; pass reopen:true '
+                                     '(or meta.reopen:true) to override',
+                            'kept_both': True,
+                        })
+            try:
+                append_comment(page, comment, workspace, precondition=toggle_precondition)
+            except ToggleTerminalError as exc:
+                self._send_json(exc.payload, status=409)
+                return
             if ctype == 'verdict' and data.get('verdict') == 'agree':
                 if get_dispatch_config(page, workspace)['target'] == 'cursor':
                     cursor_intake.refresh_staged_manifest(

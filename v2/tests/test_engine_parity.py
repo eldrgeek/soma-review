@@ -33,7 +33,10 @@ import mdblocks  # noqa: E402
 import server  # noqa: E402
 
 CORPUS_PATH = os.path.join(V2_DIR, 'tests', 'fixtures', 'sentence_parity_corpus.json')
-PLAYMAKER_ROOT = os.path.expanduser('~/Projects/playmaker')
+# CI (playmaker's own workflow) checks out soma-review as a sibling directory
+# rather than at ~/Projects/playmaker, so it points this at the checkout via
+# an env var instead of relying on the hardcoded dev-machine path.
+PLAYMAKER_ROOT = os.environ.get('PLAYMAKER_ROOT_OVERRIDE') or os.path.expanduser('~/Projects/playmaker')
 PARITY_CLI = os.path.join(PLAYMAKER_ROOT, 'scripts', 'sentence-parity-cli.mjs')
 
 

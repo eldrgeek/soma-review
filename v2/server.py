@@ -402,8 +402,14 @@ def mark_layer_http_bridge_enabled():
     (backs `resolve_mark_block`'s two callers and `present_comments` — REAL
     create/edit/resolve/comment-presentation traffic, not a debug or unconsumed
     route); `compute_ringer_list` (runs on every classic-view page load via
-    `render_page`); and `bind_from_mark_layer_node` (the live id-first
-    create-binding path for a client-sent DOM stamp). This is no longer zero
+    `render_page`); `bind_from_mark_layer_node` (the live id-first
+    create-binding path for a client-sent DOM stamp); `render_page` itself
+    (the node build that backs the in-page embed/stamper on every classic-view
+    load); and `_rerender_block` (both the new-src and prev-src parses on
+    every edit). Every `to_mark_layer_nodes` call site in this file is now
+    bridge-capable — the next real decision is productionizing
+    `mark-layer-server.mjs`, not finding another site to wire (see
+    soma-review/CLAUDE.md's scoping note). This is no longer zero
     blast radius the moment the flag is flipped on: `load_page_mark_layer_nodes`'s
     own docstring names an open residual
     (create and resolve are separate requests, so a bridge flap between them
@@ -4746,14 +4752,56 @@ def _rerender_block(route_path, workspace, fs_path, new_src, block_id, old_block
     later_html = []
     next_nodes = []
     try:
-        next_nodes = to_mark_layer_nodes(_mark_layer_source(new_src))
+        # Sixth bridging slice toward item 6a's cutover (2026-09-11,
+        # mission-1): same flag/fallback pattern as `render_page`,
+        # `compute_ringer_list`, `bind_from_mark_layer_node`. `_rerender_block`
+        # is reached from every edit — the last of the two call sites named
+        # in soma-review/CLAUDE.md's scoping note. Flag stays default off
+        # (no behavior change); flipping it on here has the same warm-latency
+        # gate as the other hot-path slices.
+        #
+        # Named residual (Skip's adversarial pass on this slice): the two
+        # calls below (next_src, prev_src) each independently try the bridge
+        # and fall back to the twin on failure, so a flaky bridge can hand
+        # `align_mark_layer_nodes` one engine's nodes for `next_nodes` and
+        # the other engine's for `prev_nodes` within a single request — a
+        # sharper version of the cross-request flap `load_page_mark_layer_nodes`'s
+        # docstring already names, now possible even when both calls happen
+        # in the same rerender. Fails safe today only because the flag is
+        # off; before flipping it on, pin both calls to the same engine for
+        # one request (e.g. resolve the bridge/twin choice once and reuse it
+        # for both, or verify id-parity as an invariant) rather than letting
+        # them race independently.
+        next_src = _mark_layer_source(new_src)
+        if mark_layer_http_bridge_enabled():
+            try:
+                next_nodes = to_mark_layer_nodes_via_http_bridge(next_src)
+            except Exception as exc:  # noqa: BLE001 - any bridge failure falls back
+                sys.stderr.write(
+                    f'[mark-layer] http bridge failed for {route_path} '
+                    f'(rerender next), falling back to python twin: {exc}\n'
+                )
+                next_nodes = to_mark_layer_nodes(next_src)
+        else:
+            next_nodes = to_mark_layer_nodes(next_src)
         stamper = MarkLayerDomStamper(next_nodes)
         for prior in new_blocks:
             if prior is new_block:
                 break
             stamper.skip_block(prior.get('text') or '')
         if prev_src is not None:
-            prev_nodes = to_mark_layer_nodes(_mark_layer_source(prev_src))
+            prev_src_norm = _mark_layer_source(prev_src)
+            if mark_layer_http_bridge_enabled():
+                try:
+                    prev_nodes = to_mark_layer_nodes_via_http_bridge(prev_src_norm)
+                except Exception as exc:  # noqa: BLE001 - any bridge failure falls back
+                    sys.stderr.write(
+                        f'[mark-layer] http bridge failed for {route_path} '
+                        f'(rerender prev), falling back to python twin: {exc}\n'
+                    )
+                    prev_nodes = to_mark_layer_nodes(prev_src_norm)
+            else:
+                prev_nodes = to_mark_layer_nodes(prev_src_norm)
             remap = align_mark_layer_nodes(prev_nodes, next_nodes)
             rebound = rebind_page_mark_layer_nodes(
                 route_path, workspace, prev_nodes, next_nodes,
@@ -5302,8 +5350,25 @@ def render_page(route_path, workspace=DEFAULT_WORKSPACE, view='classic'):
     mark_layer_stamper = None
     mark_layer_nodes_json = 'null'
     try:
+        # Sixth bridging slice toward item 6a's cutover (2026-09-11,
+        # mission-1): same flag/fallback pattern as `compute_ringer_list`,
+        # `bind_from_mark_layer_node`. `render_page` runs on every
+        # classic-view page load — the first of the two remaining call sites
+        # named in soma-review/CLAUDE.md's scoping note. Flag stays default
+        # off (no behavior change); flipping it on here is gated on the same
+        # warm-latency work as the other hot-path slices.
         mark_layer_src = _mark_layer_source(src)
-        mark_layer_nodes = to_mark_layer_nodes(mark_layer_src)
+        if mark_layer_http_bridge_enabled():
+            try:
+                mark_layer_nodes = to_mark_layer_nodes_via_http_bridge(mark_layer_src)
+            except Exception as exc:  # noqa: BLE001 - any bridge failure falls back
+                sys.stderr.write(
+                    f'[mark-layer] http bridge failed for {route_path} '
+                    f'(render page), falling back to python twin: {exc}\n'
+                )
+                mark_layer_nodes = to_mark_layer_nodes(mark_layer_src)
+        else:
+            mark_layer_nodes = to_mark_layer_nodes(mark_layer_src)
         prev_nodes = load_mark_layer_nodes_cache(route_path, workspace)
         rebound = []
         if prev_nodes:

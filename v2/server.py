@@ -6355,7 +6355,26 @@ def compute_ringer_list(route_path, workspace=DEFAULT_WORKSPACE, reader=RINGER_R
     try:
         fs_path = resolve_page(route_path, workspace)
         with open(fs_path, 'rb') as handle:
-            nodes = to_mark_layer_nodes(_mark_layer_source(handle.read().decode('utf-8')))
+            mark_layer_src = _mark_layer_source(handle.read().decode('utf-8'))
+        # Fourth bridging slice toward item 6a's cutover (2026-09-11
+        # mission-1): same flag/fallback pattern as
+        # `load_page_mark_layer_nodes`. `compute_ringer_list` runs on every
+        # classic-view page load, so this is on the hot path named in
+        # soma-review/CLAUDE.md's scoping note — wiring it behind the flag
+        # (default off) is safe (no behavior change); flipping the flag on
+        # here is NOT, until `mark-layer-server.mjs` has a real supervisor
+        # entry and warm latency is re-measured.
+        if mark_layer_http_bridge_enabled():
+            try:
+                nodes = to_mark_layer_nodes_via_http_bridge(mark_layer_src)
+            except Exception as exc:  # noqa: BLE001 - any bridge failure falls back
+                sys.stderr.write(
+                    f'[mark-layer] http bridge failed for {route_path} '
+                    f'(ringer list), falling back to python twin: {exc}\n'
+                )
+                nodes = to_mark_layer_nodes(mark_layer_src)
+        else:
+            nodes = to_mark_layer_nodes(mark_layer_src)
     except Exception:  # noqa: BLE001 — ringer falls back to legacy block_id
         nodes = []
     node_block_cache = {}

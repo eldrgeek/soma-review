@@ -1440,16 +1440,29 @@ Regression-tested: `v2/tests/test_load_page_mark_layer_nodes_bridge.py` (flag of
 on-failure). Full suite green: 327/327 (`python3 -m unittest discover -s tests -p "test_*.py"`
 from `v2/`).
 
+**Fourth bridging slice (2026-09-11, later mission-1 run): `compute_ringer_list` wired.**
+Same flag/fallback pattern as the third slice: flag stays default off (no behavior change
+today), any bridge failure falls back to the Python twin with a stderr log line
+(`[mark-layer] http bridge failed for <page> (ringer list), falling back to python twin: ...`).
+This is the first of the four hot-path call sites named below to get the wiring —
+`compute_ringer_list` runs on every classic-view page load via `render_page`, so it is a real
+sample of the latency question the scoping note raises, not a debug or one-shot path. Flag
+stays off; flipping it on here is still gated on productionizing `mark-layer-server.mjs` (see
+below, unchanged). Regression-tested: `v2/tests/test_compute_ringer_list_bridge.py` (flag
+off / on-success / on-failure, mirroring the third slice's test shape). Remaining unwired:
+`render_page`, `_rerender_block`, `bind_from_mark_layer_node`.
+
 **Scoping note for the next slice (2026-09-11):** all remaining unwired call sites
-(`render_page`, `_rerender_block`, `bind_from_mark_layer_node`, `compute_ringer_list`) sit on
-the interactive page-render/edit hot path, not a background or one-shot path — `compute_ringer_list`
-alone is invoked from `render_page` on every classic-view page load. The measured latency gap
-(twin ~2-5ms in-process vs. bridge ~7-27ms warm, 123ms cold) means wiring any of these behind the
-flag is safe to ship (flag off, no behavior change) but flipping the flag on for these paths
-without first productionizing the bridge process — a supervised, always-warm launchd job instead
-of a manually-started `node ... &`, removing the cold-start case — would add real, user-visible
-latency to every page view. Recommendation for whoever picks this up next: (1) wire one more of
-the four remaining call sites behind the same flag/fallback pattern (cheap, safe, flag stays off),
+(`render_page`, `_rerender_block`, `bind_from_mark_layer_node`) sit on
+the interactive page-render/edit hot path, not a background or one-shot path — `render_page`
+itself runs on every classic-view page load and each of these three is reached from it or from
+an edit. The measured latency gap (twin ~2-5ms in-process vs. bridge ~7-27ms warm, 123ms cold)
+means wiring any of these behind the flag is safe to ship (flag off, no behavior change) but
+flipping the flag on for these paths without first productionizing the bridge process — a
+supervised, always-warm launchd job instead of a manually-started `node ... &`, removing the
+cold-start case — would add real, user-visible latency to every page view. Recommendation for
+whoever picks this up next: (1) wire one more of the three remaining call sites behind the same
+flag/fallback pattern (cheap, safe, flag stays off),
 (2) before ever flipping the flag on in a hot path, give `mark-layer-server.mjs` a real supervisor
 entry and re-measure warm latency: if it doesn't come down materially, the honest conclusion may
 be that the Python twin stays authoritative for hot paths permanently and item 6a's win is

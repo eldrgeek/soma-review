@@ -8019,7 +8019,7 @@ class Handler(BaseHTTPRequestHandler):
                 # `mark_kind == 'reader-signal'` + a required `signal` field.
                 if mark_kind not in ('agree', 'clarify', 'rewrite', 'strike',
                                      'note', 'ack', 'ruling', 'reader-signal',
-                                     'decision'):
+                                     'decision', 'toggle'):
                     self._send_json({'error': 'invalid mark_kind'}, status=400)
                     return
                 if not page:

@@ -17,6 +17,8 @@ Each parsed block gets:
   - anchor: stable-ish id derived from heading_path + index
 """
 
+import hashlib
+import json
 import re
 import html as _html
 import hashlib
@@ -118,18 +120,17 @@ def parse_widget_attrs(lang_rest):
 _WIDGET_CAPABILITY_LABEL = {
     'passive': 'passive — graphics only, no reads, no writes, no network',
     'demo': 'demo — interactive, local only, nothing leaves the widget',
+    'active': 'active — may propose marks (comment / edit / toggle) via proposeMark(); cannot write directly',
 }
 
 
-def render_widget_block(raw_html, kind='passive', name='inline-html'):
-    """Render a ```widget fenced block. This build implements the PASSIVE and
-    DEMO kinds (Mike's spec, 2026-09-03, item 6: "completely passive and only
-    graphical" / "just demo a capability"). `active` (reads the document
-    model, emits `proposeMark`) is specified in the design doc referenced
-    above but not built here — the `proposeMark` contract, capability token,
-    and same-origin execution it needs are real, separate work; a widget
-    declaring it renders a clearly-labeled not-yet-supported placeholder
-    instead of silently misbehaving or crashing page render.
+def render_widget_block(raw_html, kind='passive', name='inline-html', block_index=None):
+    """Render a ```widget fenced block. This build implements the PASSIVE,
+    DEMO, and ACTIVE kinds (Mike's spec, 2026-09-03, item 6: "completely
+    passive and only graphical" / "just demo a capability" / "act on the
+    rest of the document"). See
+    `SOMA/shared-cognition/marked-document-widgets.md` for the full
+    three-kind contract.
 
     Passive and demo share the same rendering and the same sandbox — per
     §3 of the spec both kinds "run in a sandboxed iframe with no network
@@ -144,16 +145,42 @@ def render_widget_block(raw_html, kind='passive', name='inline-html'):
     anything. Height defaults to a reasonable card size and can be
     overridden with a first line `<!-- height: 320 -->` in the fence body.
 
+    Active widgets run same-origin (F2, per Mike's standing ruling that
+    Playmaker's mic/TTS need same-origin, no iframe/artifact packaging) —
+    this is the first slice of that contract, built 2026-09-11 (mission-1):
+    the fence body for `kind=active name=inline-html` is JAVASCRIPT (not
+    HTML — a deliberate divergence from passive/demo's raw-HTML-in-srcdoc
+    convention, named here so a future reader isn't surprised), executed via
+    `new Function('mount', 'proposeMark', <body>)(mount, proposeMark)` —
+    `new Function` rather than splicing into a literal `<script>` tag so a
+    body containing the literal text `</script>` cannot break out of its
+    container; the code still runs with full same-origin page access,
+    exactly as F2 specifies, `new Function` only avoids an HTML-escaping
+    footgun, it grants no additional sandboxing. `mount` is the widget's own
+    empty container div. `proposeMark(kind, payload)` is the contract call
+    from spec §2: `kind` is `"comment"`, `"edit"`, or `"toggle"`; it always
+    POSTs to the existing `/api/comments` endpoint (comment/edit types
+    as-is, toggle as `type:"mark", mark_kind:"toggle"`) — the widget cannot
+    reach any other endpoint through this call, and nothing stops the
+    widget's own code from doing whatever same-origin JS can do beyond that
+    (F2's real control is "no writes except through a mark", not a browser
+    sandbox — see §3). No document-model read is threaded in yet (spec §2's
+    "claim-graph subgraph the host chooses to expose") — this slice ships
+    the write half of the contract only; a widget wanting to read page state
+    reads it from the live DOM the same as any same-origin script could,
+    which is consistent with F2 but not yet the scoped read API the spec
+    describes as future work.
+
     Per §3 "Shown in the panel": every widget carries a one-line capability
     declaration so the reader sees the ceiling before opening it. There is
     no marks panel entry for a widget block (it isn't a mark), so the
     declaration renders as a label above the frame instead.
     """
-    if kind not in ('passive', 'demo'):
+    if kind not in ('passive', 'demo', 'active'):
         return (
             f'<div class="widget-unsupported">Widget kind &ldquo;{_esc(kind)}&rdquo; '
             f'(name: {_esc(name)}) is not yet supported — this build ships the '
-            f'passive and demo kinds only. See '
+            f'passive, demo, and active kinds only. See '
             f'<code>SOMA/shared-cognition/marked-document-widgets.md</code>.</div>'
         )
     if name != 'inline-html':
@@ -162,6 +189,48 @@ def render_widget_block(raw_html, kind='passive', name='inline-html'):
             f'(name=&ldquo;{_esc(name)}&rdquo;) are not yet supported — only '
             f'name=inline-html renders in this build.</div>'
         )
+    label = _WIDGET_CAPABILITY_LABEL[kind]
+    if kind == 'active':
+        # `block_index` (the block's own 0-based document index, when the
+        # caller has it) disambiguates two active widgets with byte-identical
+        # fence bodies on the same page — the content hash alone would mint
+        # the same `id`, and `document.getElementById` silently resolves a
+        # duplicate id to the FIRST match, so the second widget's `mount`
+        # would point at the first widget's container instead of its own.
+        uid_seed = raw_html if block_index is None else f'{block_index}:{raw_html}'
+        widget_uid = 'w-active-' + hashlib.sha1(uid_seed.encode('utf-8')).hexdigest()[:10]
+        # json.dumps does not escape "</script" — a literal occurrence inside
+        # the widget's own JS source (e.g. a string it builds) would close
+        # the real <script> tag early to the HTML parser, which parses tag
+        # boundaries before any JS runs inside them. `\/` is a valid JSON/JS
+        # escape for a literal `/`, so this cannot change what the code
+        # means at runtime, only how the HTML parser sees the surrounding
+        # markup. The HTML5 script-data-end-tag-name state matches the tag
+        # name case-insensitively, so `</SCRIPT>`/`</ScRiPt>` must be caught
+        # too, not just lowercase `</script` (Skip, 2026-09-11 ship-check:
+        # a plain case-sensitive `.replace()` left this open).
+        code_json = re.sub(r'(?i)</script', '<\\/script', json.dumps(raw_html))
+        return (
+            f'<div class="widget-block-frame widget-active-frame">'
+            f'<div class="widget-capability-label">{_esc(label)}</div>'
+            f'<div class="widget-active-mount" id="{widget_uid}"></div>'
+            f'<script>(function(){{'
+            f'var mount = document.getElementById({json.dumps(widget_uid)});'
+            f'function proposeMark(kind, payload) {{'
+            f'  var apiBase = window.__API_BASE__ || "";'
+            f'  var body = Object.assign({{}}, payload || {{}}, {{page: window.__ROUTE__, author: "widget"}});'
+            f'  if (kind === "toggle") {{ body.type = "mark"; body.mark_kind = "toggle"; }}'
+            f'  else if (kind === "edit") {{ body.type = "edit"; }}'
+            f'  else {{ body.type = "comment"; }}'
+            f'  return fetch(apiBase + "/api/comments", {{method: "POST", '
+            f'headers: {{"Content-Type": "application/json"}}, body: JSON.stringify(body)}})'
+            f'    .then(function(r) {{ return r.json(); }});'
+            f'}}'
+            f'try {{ (new Function("mount", "proposeMark", {code_json}))(mount, proposeMark); }} '
+            f'catch (e) {{ mount.textContent = "widget error: " + e.message; console.error("active widget error", e); }}'
+            f'}})();</script>'
+            f'</div>'
+        )
     height = 220
     body = raw_html
     m = re.match(r'\s*<!--\s*height:\s*(\d+)\s*-->\s*\n?', raw_html)
@@ -169,7 +238,6 @@ def render_widget_block(raw_html, kind='passive', name='inline-html'):
         height = max(60, min(2000, int(m.group(1))))
         body = raw_html[m.end():]
     srcdoc = _esc_attr(body)
-    label = _WIDGET_CAPABILITY_LABEL[kind]
     return (
         f'<div class="widget-block-frame">'
         f'<div class="widget-capability-label">{_esc(label)}</div>'
@@ -1004,7 +1072,8 @@ def parse_markdown(src, link_resolver=None, terms_out=None, lexicon=None):
                 kind = 'film'
             elif lang == 'widget' or lang.startswith('widget '):
                 w_attrs = parse_widget_attrs(lang[len('widget'):])
-                html_body = render_widget_block(raw, kind=w_attrs['kind'], name=w_attrs['name'])
+                html_body = render_widget_block(raw, kind=w_attrs['kind'], name=w_attrs['name'],
+                                                 block_index=idx)
                 kind = 'widget'
             else:
                 html_body = f'<pre><code class="lang-{_esc(lang)}">{_esc(raw)}</code></pre>'

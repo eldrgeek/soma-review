@@ -140,13 +140,88 @@ class WidgetBlockTests(unittest.TestCase):
         self.assertIn('widget-capability-label', widget['html'])
         self.assertIn('demo', widget['html'])
 
-    def test_widget_kind_active_is_a_placeholder_not_a_crash(self):
+    def test_widget_kind_active_renders_same_origin_script_not_iframe(self):
         _title, blocks = mdblocks.parse_markdown(
-            '# T\n\n```widget kind=active name=inline-html\n<b>x</b>\n```\n'
+            '# T\n\n```widget kind=active name=inline-html\n'
+            'mount.textContent = "hi";\n```\n'
         )
         widget = next(b for b in blocks if b['kind'] == 'widget')
-        self.assertIn('not yet supported', widget['html'])
         self.assertNotIn('<iframe', widget['html'])
+        self.assertIn('widget-active-mount', widget['html'])
+        self.assertIn('new Function(', widget['html'])
+        self.assertIn('widget-capability-label', widget['html'])
+        self.assertIn('proposeMark', widget['html'])
+        self.assertIn('mount.textContent = \\"hi\\";', widget['html'])
+
+    def test_widget_kind_active_escapes_a_closing_script_tag_in_body(self):
+        _title, blocks = mdblocks.parse_markdown(
+            '# T\n\n```widget kind=active name=inline-html\n'
+            'mount.textContent = "</script><script>evil()</script>";\n```\n'
+        )
+        widget = next(b for b in blocks if b['kind'] == 'widget')
+        # The body is JSON-encoded into a string literal, never spliced as raw
+        # markup, so a literal "</script>" inside it must not survive as the
+        # 3-byte sequence "</script" (the HTML tokenizer's raw-text-state end
+        # marker) anywhere in the output — only the real closing tag may.
+        self.assertEqual(widget['html'].count('</script'), 1)
+        self.assertTrue(widget['html'].rstrip().endswith('</script></div>'))
+
+    def test_widget_kind_active_escapes_a_closing_script_tag_case_insensitively(self):
+        # Skip's adversarial pass (2026-09-11, ship-check): HTML5's
+        # script-data-end-tag-name state matches the tag name
+        # case-insensitively, so a body containing "</SCRIPT>" or "</ScRiPt>"
+        # must be caught too, not just lowercase "</script" — a plain
+        # case-sensitive .replace() left this open in the first draft.
+        import re as _re
+        _title, blocks = mdblocks.parse_markdown(
+            '# T\n\n```widget kind=active name=inline-html\n'
+            'mount.textContent = "</SCRIPT><ScRiPt>evil()</Script>";\n```\n'
+        )
+        widget = next(b for b in blocks if b['kind'] == 'widget')
+        self.assertEqual(len(_re.findall(r'(?i)</script', widget['html'])), 1)
+        self.assertTrue(widget['html'].rstrip().endswith('</script></div>'))
+
+    def test_widget_kind_active_proposemark_maps_kinds_to_the_comments_api(self):
+        _title, blocks = mdblocks.parse_markdown(
+            '# T\n\n```widget kind=active name=inline-html\nx\n```\n'
+        )
+        widget = next(b for b in blocks if b['kind'] == 'widget')
+        html = widget['html']
+        self.assertIn('body.type = "mark"; body.mark_kind = "toggle";', html)
+        self.assertIn('body.type = "edit";', html)
+        self.assertIn('body.type = "comment";', html)
+        self.assertIn('/api/comments', html)
+
+    def test_widget_kind_active_payload_cannot_override_author_or_page(self):
+        # Skip's adversarial pass (2026-09-11): Object.assign(target, source)
+        # lets `source` clobber `target`, so the pinned author/page fields
+        # must come LAST in the assign call, or a widget's own payload
+        # (proposeMark('comment', {author: 'mike'})) can spoof provenance on
+        # an unattributed, load-time write.
+        _title, blocks = mdblocks.parse_markdown(
+            '# T\n\n```widget kind=active name=inline-html\nx\n```\n'
+        )
+        widget = next(b for b in blocks if b['kind'] == 'widget')
+        self.assertIn(
+            'Object.assign({}, payload || {}, {page: window.__ROUTE__, author: "widget"})',
+            widget['html'],
+        )
+
+    def test_widget_kind_active_uid_disambiguated_by_block_index(self):
+        # Two active widgets with byte-identical fence bodies on one page
+        # used to mint the same `id`; `getElementById` resolves a duplicate
+        # id to the FIRST match, so the second widget's `mount` pointed at
+        # the first widget's container. block_index must be folded into the
+        # hash so identical bodies still get distinct DOM ids.
+        _title, blocks = mdblocks.parse_markdown(
+            '# T\n\n```widget kind=active name=inline-html\nsame\n```\n\n'
+            '```widget kind=active name=inline-html\nsame\n```\n'
+        )
+        widgets = [b for b in blocks if b['kind'] == 'widget']
+        self.assertEqual(len(widgets), 2)
+        import re
+        ids = [re.search(r'widget-active-mount" id="([^"]+)"', w['html']).group(1) for w in widgets]
+        self.assertEqual(len(set(ids)), 2, f'expected distinct mount ids, got {ids}')
 
     def test_widget_kind_passive_carries_capability_label(self):
         _title, blocks = mdblocks.parse_markdown(

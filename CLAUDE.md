@@ -1059,12 +1059,71 @@ renders the not-yet-supported placeholder. Tests: `v2/tests/test_v3_view.py::Wid
 (demo renders + label, passive carries a label, active stays a placeholder — 30/30 in that
 module, full suite unaffected).
 
-**Not built (documented as next-step):** the `active` widget kind (`proposeMark` contract,
-same-origin execution, capability token) — see the parallel design spec above for the full
-three-kind contract both hosts (soma-review, Playmaker) are meant to share once built. This is
-real, separate work: a widget needs a scoped read of the document model at its own level, a
-`proposeMark(kind, payload)` call that always produces a visible undoable mark, and the panel
-wiring to show it — none of which the demo kind needed.
+**`active` kind built 2026-09-11 (later mission-1 run):** `render_widget_block(kind='active')`
+no longer renders a placeholder. Per F2 (the design spec's fork, above) active widgets run
+same-origin, not sandboxed — the fence body is JavaScript (not HTML, a deliberate divergence
+from passive/demo's raw-HTML-in-`srcdoc` convention), executed via
+`new Function('mount', 'proposeMark', body)(mount, proposeMark)`. `new Function` rather than
+splicing the body into a literal `<script>` tag: a body containing the literal text
+`</script>` would otherwise close the real tag early to the HTML parser (which tokenizes the
+page before any JS inside a `<script>` runs) — a real bug in the first draft, caught by an
+adversarial test (`test_widget_kind_active_escapes_a_closing_script_tag_in_body`) before it
+shipped, fixed by escaping `</script` to `<\/script` inside the JSON-encoded body (`\/` is a
+valid JSON/JS escape for a literal `/`, so this changes nothing about what the code means at
+runtime). `proposeMark(kind, payload)` is the widget's only privileged call — `kind` is
+`"comment"`, `"edit"`, or `"toggle"`, and it always `fetch`es the existing `POST /api/comments`
+(comment/edit types pass through as-is; `toggle` posts `type: "mark", mark_kind: "toggle"` —
+`"toggle"` is a new addition to the server's `mark_kind` enum, made for this). This is the
+*write* half of spec §2's contract only: an active widget gets no scoped read of the document
+model (the "claim-graph subgraph the host chooses to expose") — it can read the live DOM
+directly instead, which is consistent with F2 (same-origin script has DOM access by
+construction) but not the scoped read API the spec describes as future work. The full §4
+design-alternative widget (three-state toggle, harvest expiry) is also not built — this ships
+the underlying contract plus a minimal demo (`_estate/active-widget-demo.md`: a button that
+calls `proposeMark('comment', ...)` and shows the created comment's id), not the flagship
+widget. Verified live: `curl http://localhost:8090/page/estate/active-widget-demo.md` renders
+the widget's mount div and script (no iframe, unlike passive/demo); a POST to `/api/comments`
+carrying the exact body `proposeMark` sends landed a real row in
+`_estate/review-feedback/estate_active-widget-demo.md.jsonl`. Tests:
+`v2/tests/test_v3_view.py::WidgetBlockTests` (same-origin script not iframe, the
+`</script>`-escaping regression, and the three `proposeMark` kind→API-type mappings).
+
+**Adversarial review (Skip, 2026-09-11): "ship with fixes," both closed same session.**
+(1) `Object.assign({page:..., author:"widget"}, payload || {})` let `payload` — the widget's
+own argument — clobber the pinned `author`/`page` fields, so any active widget could call
+`proposeMark('comment', {author: 'mike'})` and the persisted row would claim Mike wrote it;
+worse, nothing gates `new Function(...)` on a user gesture, so a widget that calls
+`proposeMark` from its own top-level code (not a click handler) fires an unattributed,
+spoofable write the instant the page renders — silent in exactly the way the widget-kind
+system exists to prevent ("loud and undoable, not silent corruption"). Fixed by reversing the
+`Object.assign` argument order (pinned fields last, so they always win). (2) `widget_uid` was
+`sha1(raw_html)[:10]` alone, so two active widgets with byte-identical fence bodies on one page
+minted the same DOM id; `document.getElementById` resolves a duplicate id to the *first* match,
+so the second widget's `mount` silently pointed at the first widget's container. Fixed by
+folding the block's own parse-time index into the hash input (`render_widget_block(...,
+block_index=idx)`, threaded from the `mdblocks.py` call site). Both fixes are
+regression-tested (`test_widget_kind_active_payload_cannot_override_author_or_page`,
+`test_widget_kind_active_uid_disambiguated_by_block_index`). Skip's remaining note — no test
+drives the emitted JS in a real browser (a throwing widget body's `catch` path, or the
+author-override behavior, end to end) — is accepted as a named gap, consistent with this
+repo's stated limitation that the v3 panel/widget JS has no client-side test harness. Whether
+`proposeMark` should require an explicit user gesture before executing at all (vs. today's
+page-load execution) is a product call Skip flagged as worth naming rather than silently
+deciding — not resolved here, left for whoever builds the flagship §4 widget next.
+
+**Independent adversarial re-check before ship (Skip, 2026-09-11, separate session from the
+one that wrote the paragraph above): "cracked, not broken," one real gap closed.** This work
+was found uncommitted on disk (a prior mission-1 run had built and self-reviewed it but never
+committed). Before trusting the self-reported review above, a fresh Skip pass read the diff
+directly rather than this file's prose, and independently confirmed both claimed fixes (pinned
+`Object.assign` order at `mdblocks.py:218`, `block_index`-folded uid at `mdblocks.py:200-201`)
+are real and match their tests. It found one the first pass missed: **the `</script` escape was
+case-sensitive** (`str.replace('</script', ...)`), but the HTML5 script-data-end-tag-name state
+matches case-insensitively, so a widget body containing `</SCRIPT>` or `</ScRiPt>` was not
+caught and could still close the real `<script>` tag early. Fixed by switching to
+`re.sub(r'(?i)</script', ...)`. Regression-tested:
+`test_widget_kind_active_escapes_a_closing_script_tag_case_insensitively`. The unconditional
+page-load-execution question above is unchanged — still an open, named product call, not a bug.
 
 ## v3 sentence marks (2026-09-04)
 

@@ -138,12 +138,17 @@ class RerenderBlockBridgeTests(_BridgeTestBase):
         fs_path = server.resolve_page('docs/page.md', 'estate')
         new_src = PAGE.replace('Beta is second.', 'Beta is revised.')
         # Must not raise -- the outer try/except in _rerender_block still
-        # produces usable html even if both bridge attempts fail.
+        # produces usable html even if the bridge attempt fails.
         result = server._rerender_block(
             'docs/page.md', 'estate', fs_path, new_src, block['id'], block,
             prev_src=PAGE,
         )
-        self.assertEqual(len(calls), 2)
+        # Pinned-engine fix (2026-09-11): the first bridge failure aborts
+        # the whole call and both sides fall back to the twin together --
+        # it does NOT independently retry the bridge for the second source
+        # (that per-source-independent retry was exactly the mixed-engine
+        # risk this fix closed), so only one bridge call happens.
+        self.assertEqual(len(calls), 1)
         self.assertIsNotNone(result['html'])
 
 

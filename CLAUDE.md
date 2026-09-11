@@ -1486,6 +1486,30 @@ continuous parity verification (already CI-gated, see below), not a live per-req
 slice — it drifted stale twice already (after slice 3's own fix, then again after slice 4);
 update it in the same commit as the wiring, not as an afterthought.
 
+**Residual closed 2026-09-11 (later mission-1 run): `_rerender_block`'s mixed-engine race is
+gone.** The sixth slice's named blocker — `next_nodes` and `prev_nodes` each independently
+trying the bridge and falling back to the twin, so a bridge that answered one call and failed
+the other could hand `align_mark_layer_nodes` one engine's nodes for one side and the twin's
+for the other within a single rerender — is fixed by `_mark_layer_nodes_pinned_engine()`
+(`v2/server.py`): every source needed by one call is computed from a single engine choice, the
+bridge for all of them or, the instant any bridge call fails, the twin for all of them
+(including sources the bridge had already answered). `render_page`'s own single bridge call
+was never at risk (only one source); the fix applies where `_rerender_block` needs both a
+next-src and a prev-src parse in the same request. Regression-tested:
+`v2/tests/test_rerender_block_pinned_engine.py` (3 cases, including the mixed-engine case that
+fails red against the pre-fix per-source-independent shape), plus
+`v2/tests/test_render_page_rerender_block_bridge.py`'s failure-case updated to assert the new
+fail-fast call count (1 bridge call, not 2, before falling back). Adversarially reviewed by
+Skip, who caught a real overclaim in this note's first draft before it shipped: **this closes
+the single-request, two-source mixing named in the sixth slice, but it is NOT the last named
+blocker.** The third slice's residual (above, "Third bridging slice: the first REAL call
+site") is still open and still says so explicitly: `load_page_mark_layer_nodes()`'s create and
+resolve are separate HTTP requests, so a bridge flap between the two can still mint a
+twin-engine id on one and a bridge-engine id on the other — a cross-request race this
+same-call fix cannot touch. **Do not flip `SOMA_REVIEW_MARK_LAYER_HTTP_BRIDGE` on for real
+traffic until that residual is also closed** (pin the engine per page-version, or verify
+id-parity as an invariant, per the third slice's own note).
+
 **Recommendation (1) done: `mark-layer-server.mjs` is now a supervised launchd job (2026-09-11,
 later mission-1 run).** `~/Library/LaunchAgents/com.soma.mark-layer-server.plist` (`KeepAlive`,
 `RunAtLoad`, working dir `~/Projects/playmaker`, runs
@@ -1506,9 +1530,13 @@ render is not the user-visible cost the scoping note was worried about — that 
 specifically the 123ms cold-start case, which a supervised always-warm process removes by
 construction. **This does not flip `SOMA_REVIEW_MARK_LAYER_HTTP_BRIDGE` on** — recommendation
 (2)'s other named blocker, `_rerender_block`'s mixed-engine residual (Skip's finding, sixth
-slice above: two independent bridge-vs-twin calls in one request can hand `align_mark_layer_nodes`
-mixed-engine input), is still open. With productionizing done and latency now favorable, that
-residual is the last real blocker before cutover — not another latency question.
+slice above: two independent bridge-vs-twin calls in one request could hand
+`align_mark_layer_nodes` mixed-engine input), is now closed (see "Residual closed 2026-09-11"
+below). **A second, separate residual is still open and still blocks the flag flip**: the
+third slice's cross-request race in `load_page_mark_layer_nodes()` (create and resolve are two
+separate HTTP requests, so a bridge flap between them can still mint mixed-engine ids across
+calls even though no single call can anymore). Productionizing and latency are no longer
+concerns; the mixed-engine question is not yet fully closed.
 
 **Adversarial review (Skip, 2026-09-11) on the launchd job — verdict "ship with fixes," both
 closed same session:** (1) `com.soma.mark-layer-server` was unmonitored — added to

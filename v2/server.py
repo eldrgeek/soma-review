@@ -4719,6 +4719,30 @@ def _render_one_block_html(block, route_path, workspace, resolver, terms_out,
     )
 
 
+def _mark_layer_nodes_pinned_engine(srcs, route_path, context):
+    """Compute mark-layer nodes for every source in `srcs` using ONE engine
+    choice for the whole call, so a flaky bridge can never hand
+    `align_mark_layer_nodes` one engine's nodes for one source and the
+    other engine's for another within a single request (the residual named
+    in `_rerender_block`'s docstring below, from the sixth bridging slice's
+    adversarial pass). Tries the bridge for every source; on the FIRST
+    failure, re-derives every source (including ones already computed via
+    the bridge) with the twin instead of mixing partial results."""
+    if not mark_layer_http_bridge_enabled():
+        return [to_mark_layer_nodes(s) for s in srcs]
+    out = []
+    for s in srcs:
+        try:
+            out.append(to_mark_layer_nodes_via_http_bridge(s))
+        except Exception as exc:  # noqa: BLE001 - any bridge failure falls back
+            sys.stderr.write(
+                f'[mark-layer] http bridge failed for {route_path} '
+                f'({context}), falling back to python twin: {exc}\n'
+            )
+            return [to_mark_layer_nodes(s) for s in srcs]
+    return out
+
+
 def _rerender_block(route_path, workspace, fs_path, new_src, block_id, old_block,
                     prev_src=None):
     """Re-render one block fresh from `new_src` (the file content just
@@ -4760,48 +4784,28 @@ def _rerender_block(route_path, workspace, fs_path, new_src, block_id, old_block
         # (no behavior change); flipping it on here has the same warm-latency
         # gate as the other hot-path slices.
         #
-        # Named residual (Skip's adversarial pass on this slice): the two
-        # calls below (next_src, prev_src) each independently try the bridge
-        # and fall back to the twin on failure, so a flaky bridge can hand
-        # `align_mark_layer_nodes` one engine's nodes for `next_nodes` and
-        # the other engine's for `prev_nodes` within a single request — a
-        # sharper version of the cross-request flap `load_page_mark_layer_nodes`'s
-        # docstring already names, now possible even when both calls happen
-        # in the same rerender. Fails safe today only because the flag is
-        # off; before flipping it on, pin both calls to the same engine for
-        # one request (e.g. resolve the bridge/twin choice once and reuse it
-        # for both, or verify id-parity as an invariant) rather than letting
-        # them race independently.
+        # Residual closed 2026-09-11 (mission-1): `next_nodes` and
+        # `prev_nodes` used to try the bridge independently, so a flaky
+        # bridge could hand `align_mark_layer_nodes` one engine's nodes for
+        # one side and the other engine's for the other within a single
+        # rerender. `_mark_layer_nodes_pinned_engine` now computes both from
+        # ONE engine choice per call — the bridge for every source, or the
+        # twin for every source the moment any bridge call fails — so the
+        # two sides of an alignment can never be mixed-engine.
         next_src = _mark_layer_source(new_src)
-        if mark_layer_http_bridge_enabled():
-            try:
-                next_nodes = to_mark_layer_nodes_via_http_bridge(next_src)
-            except Exception as exc:  # noqa: BLE001 - any bridge failure falls back
-                sys.stderr.write(
-                    f'[mark-layer] http bridge failed for {route_path} '
-                    f'(rerender next), falling back to python twin: {exc}\n'
-                )
-                next_nodes = to_mark_layer_nodes(next_src)
+        if prev_src is not None:
+            prev_src_norm = _mark_layer_source(prev_src)
+            next_nodes, prev_nodes = _mark_layer_nodes_pinned_engine(
+                [next_src, prev_src_norm], route_path, 'rerender')
         else:
-            next_nodes = to_mark_layer_nodes(next_src)
+            next_nodes, = _mark_layer_nodes_pinned_engine(
+                [next_src], route_path, 'rerender next')
         stamper = MarkLayerDomStamper(next_nodes)
         for prior in new_blocks:
             if prior is new_block:
                 break
             stamper.skip_block(prior.get('text') or '')
         if prev_src is not None:
-            prev_src_norm = _mark_layer_source(prev_src)
-            if mark_layer_http_bridge_enabled():
-                try:
-                    prev_nodes = to_mark_layer_nodes_via_http_bridge(prev_src_norm)
-                except Exception as exc:  # noqa: BLE001 - any bridge failure falls back
-                    sys.stderr.write(
-                        f'[mark-layer] http bridge failed for {route_path} '
-                        f'(rerender prev), falling back to python twin: {exc}\n'
-                    )
-                    prev_nodes = to_mark_layer_nodes(prev_src_norm)
-            else:
-                prev_nodes = to_mark_layer_nodes(prev_src_norm)
             remap = align_mark_layer_nodes(prev_nodes, next_nodes)
             rebound = rebind_page_mark_layer_nodes(
                 route_path, workspace, prev_nodes, next_nodes,

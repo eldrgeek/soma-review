@@ -1379,6 +1379,28 @@ mission-1 pass alone cannot fix or fully diagnose a failure whose root cause liv
 sibling repo — check Playmaker's own recent commits/branch before writing off (or explaining
 away) a cross-repo test failure as either "still broken" or "just flaky."
 
+**First bridging slice toward the actual cutover (2026-09-11, mission-1) — not the cutover,
+proof of the mechanism.** All 7+ live call sites still call the Python twin unconditionally;
+this touches none of them. New: `playmaker/scripts/mark-layer-server.mjs` is a small persistent
+Node HTTP server (`node --experimental-strip-types scripts/mark-layer-server.mjs`, default port
+8791) exposing `POST /parse {text}` -> `fromProseMarkdown(text)`'s real `{nodes}` output — a live
+call, not the parity test's one-shot subprocess. `render_mark_layer_preview` (the debug-only
+`/mark-layer-preview/*` route, unreachable over the tunnel — confirmed absent from
+`TUNNEL_ALLOWED_GET`/`TUNNEL_ALLOWED_GET_PREFIXES`, `_tunnel_gate` runs before dispatch) is the
+only call site wired to it, behind `SOMA_REVIEW_MARK_LAYER_HTTP_BRIDGE` (default off): on, it
+calls the bridge and falls back to the Python twin on any failure (timeout, connection refused,
+bad response), surfacing which engine actually rendered and any fallback reason in a visible
+`engine: <source>` line rather than silently degrading. Verified live: byte-identical node
+counts/ids/text between the two engines on `estate/MORNING-REVIEW-2026-07-02.md` (119 nodes),
+and killing the bridge server correctly falls back with the connection error shown, not a crash
+or stale data. Reviewed by Skip (adversarial) — no blockers; two non-blocking hardening notes
+(bridge server needed a `req.on('error')` handler and a body-size cap before it's anything more
+than a debug-only, single-caller tool — both added same pass) and a named tripwire for the next
+slice: never let a request-controlled field (route_path, workspace) reach the bridge URL, since
+today it's env-only and that's what keeps this from being an SSRF shape. This does not close 6a
+— the next slice is wiring a live (non-debug) call site behind the same flag pattern, then
+retiring the Python twin's use there once parity holds under real load.
+
 **Parity check is now CI-gated in Playmaker, not just hand-run (2026-09-11).** The version-pinning
 gap named above is closed: Playmaker's `.github/workflows/ci.yml` has an `engine-parity` job that
 checks out this repo (`soma-review`, `v2-collab-pages`, public, no auth) as a sibling on every

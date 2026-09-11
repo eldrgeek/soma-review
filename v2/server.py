@@ -388,6 +388,42 @@ def mark_layer_beside_enabled():
     return _env_flag_on('SOMA_REVIEW_MARK_LAYER_BESIDE')
 
 
+def mark_layer_http_bridge_enabled():
+    """First bridging slice toward item 6a's cutover (2026-09-11 mission-1):
+    call Playmaker's real `fromProseMarkdown` over HTTP instead of running
+    the Python twin (`to_mark_layer_nodes`), so the live-latency question
+    gets a real answer before any of the 7+ production call sites are
+    touched. Default off. Wired ONLY into `render_mark_layer_preview`, the
+    debug-only `/mark-layer-preview/*` route (not linked from any production
+    UI, zero blast radius) — every live create/edit/resolve call site still
+    uses the Python twin unconditionally. Run the bridge server first:
+    `node --experimental-strip-types scripts/mark-layer-server.mjs` from
+    `~/Projects/playmaker`.
+    """
+    return _env_flag_on('SOMA_REVIEW_MARK_LAYER_HTTP_BRIDGE')
+
+
+def mark_layer_http_bridge_url():
+    return os.environ.get('SOMA_REVIEW_MARK_LAYER_HTTP_BRIDGE_URL', 'http://127.0.0.1:8791/parse')
+
+
+def to_mark_layer_nodes_via_http_bridge(src, timeout=2.0):
+    """Calls the Playmaker bridge server's `fromProseMarkdown` over HTTP.
+    Raises on any failure (connection refused, timeout, bad JSON) — callers
+    must catch and fall back to the local Python twin; this function never
+    silently returns a degraded result."""
+    import urllib.request
+    req = urllib.request.Request(
+        mark_layer_http_bridge_url(),
+        data=json.dumps({'text': src}).encode('utf-8'),
+        headers={'content-type': 'application/json'},
+        method='POST',
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        payload = json.loads(resp.read().decode('utf-8'))
+    return payload['nodes']
+
+
 # Default-off snapshot of the flag at import time. Live checks use
 # mark_layer_dual_write_enabled() so tests can toggle the env var.
 MARK_LAYER_DUAL_WRITE = mark_layer_dual_write_enabled()
@@ -6036,7 +6072,17 @@ def render_mark_layer_preview(route_path, workspace=DEFAULT_WORKSPACE):
     fs_path = resolve_page(route_path, workspace)
     with open(fs_path, 'rb') as handle:
         src = handle.read().decode('utf-8')
-    nodes = to_mark_layer_nodes(src)
+    engine_source = 'python-twin'
+    bridge_error = None
+    if mark_layer_http_bridge_enabled():
+        try:
+            nodes = to_mark_layer_nodes_via_http_bridge(src)
+            engine_source = 'playmaker-http-bridge'
+        except Exception as exc:  # noqa: BLE001 - any bridge failure falls back
+            bridge_error = str(exc)
+            nodes = to_mark_layer_nodes(src)
+    else:
+        nodes = to_mark_layer_nodes(src)
 
     def node_html(node):
         kind = node['kind']
@@ -6053,6 +6099,9 @@ def render_mark_layer_preview(route_path, workspace=DEFAULT_WORKSPACE):
     for n in nodes:
         counts[n['kind']] = counts.get(n['kind'], 0) + 1
     summary = ' · '.join(f'{v} {k}' for k, v in sorted(counts.items()))
+    engine_note = f'engine: {engine_source}'
+    if bridge_error:
+        engine_note += f' (bridge failed, fell back: {_html.escape(bridge_error)})'
     return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>Mark-layer preview — {_html.escape(route_path)}</title>
 <style>{PAGE_CSS}
@@ -6076,7 +6125,7 @@ def render_mark_layer_preview(route_path, workspace=DEFAULT_WORKSPACE):
     <h1>Mark-layer preview</h1>
     <p class="waiting-sub">Live consumer of <code>GET {url_prefix}/api/mark-layer?page={_html.escape(route_path)}</code>
     &mdash; the node/fragment shape SOMA agreed-model item 6a defines, rendered node-by-node so it
-    can be eyeballed against the real page. {len(nodes)} nodes ({summary}).</p>
+    can be eyeballed against the real page. {len(nodes)} nodes ({summary}). {engine_note}</p>
     {''.join(node_html(n) for n in nodes)}
   </div>
 </main>

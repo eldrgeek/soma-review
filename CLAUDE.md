@@ -1486,6 +1486,45 @@ continuous parity verification (already CI-gated, see below), not a live per-req
 slice — it drifted stale twice already (after slice 3's own fix, then again after slice 4);
 update it in the same commit as the wiring, not as an afterthought.
 
+**Recommendation (1) done: `mark-layer-server.mjs` is now a supervised launchd job (2026-09-11,
+later mission-1 run).** `~/Library/LaunchAgents/com.soma.mark-layer-server.plist` (`KeepAlive`,
+`RunAtLoad`, working dir `~/Projects/playmaker`, runs
+`node --experimental-strip-types scripts/mark-layer-server.mjs 8791`) replaces the manual
+`node ... &` the scoping note above warned about. Verified: `launchctl bootstrap gui/501 …`
+loaded it clean (exit 0), `kill -9` on its pid was respawned by `KeepAlive` within 2s and kept
+answering `POST /parse`, and it survives independent of any review-server or Playmaker dev
+process. Cold start is gone for any request after the daemon's own boot.
+
+**Re-measured warm latency with the daemon (was the recommendation's other half): the gap
+closed.** Prior number in this note (twin ~2-5ms in-process vs. bridge ~7-27ms warm, 123ms
+cold) was measured against a manually-started, non-supervised process. Against the supervised
+daemon, from inside `server.py`'s own `to_mark_layer_nodes_via_http_bridge` (not a bare `curl`),
+30 warm calls on a realistic multi-paragraph fixture: twin avg 0.09ms in-process; bridge
+min 0.67ms / p50 0.92ms / p90 2.85ms / max 3.33ms. The bridge is still ~10-30x slower than the
+in-process twin in relative terms, but in absolute terms a few milliseconds added to a page
+render is not the user-visible cost the scoping note was worried about — that concern was
+specifically the 123ms cold-start case, which a supervised always-warm process removes by
+construction. **This does not flip `SOMA_REVIEW_MARK_LAYER_HTTP_BRIDGE` on** — recommendation
+(2)'s other named blocker, `_rerender_block`'s mixed-engine residual (Skip's finding, sixth
+slice above: two independent bridge-vs-twin calls in one request can hand `align_mark_layer_nodes`
+mixed-engine input), is still open. With productionizing done and latency now favorable, that
+residual is the last real blocker before cutover — not another latency question.
+
+**Adversarial review (Skip, 2026-09-11) on the launchd job — verdict "ship with fixes," both
+closed same session:** (1) `com.soma.mark-layer-server` was unmonitored — added to
+`_estate/job-liveness.json` as `kind: daemon` with `proof: null` and an explicit
+`no_proof_reason` (unmonitorable today by design because the flag is off and a crash has zero
+user-visible effect; the row exists now so it isn't forgotten the day the flag flips on). (2) the
+plist's `node` binary is `/Users/mikewolf/.local/bin/node` → `~/.hermes/node/bin/node`,
+**v22.22.3** — Hermes-managed, not nvm's `PATH`-default, so it won't silently drift on an nvm
+`default` alias change; recorded here so a future Node upgrade that breaks
+`--experimental-strip-types` shows up as an explicit version mismatch to check, not a mystery
+"the bridge always falls back" report. Two lower-severity Skip notes not acted on (both assessed
+low-risk, standard launchd pattern): double-spawn on a repeat `bootstrap` wasn't independently
+re-tested beyond the initial clean load; port 8791 collision with some other local dev tool is
+possible and would crash-loop silently today given (1) — now visible via job-liveness once
+`proof` graduates past null.
+
 **Parity check is now CI-gated in Playmaker, not just hand-run (2026-09-11).** The version-pinning
 gap named above is closed: Playmaker's `.github/workflows/ci.yml` has an `engine-parity` job that
 checks out this repo (`soma-review`, `v2-collab-pages`, public, no auth) as a sibling on every

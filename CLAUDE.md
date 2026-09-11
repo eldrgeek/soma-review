@@ -1595,6 +1595,66 @@ closed. The only remaining question before a flip-on decision is the product cal
 bridge's few-millisecond-per-call cost (see the supervised-daemon latency numbers above) is
 worth paying for parity with Playmaker's engine — not an open correctness gap.
 
+**Flag flipped on for live traffic (2026-09-11, mission-1 run).** Every correctness residual
+above is closed and the CI parity gate (Playmaker PR #238) already runs independent of this
+flag, so the only open question was the product call this note flagged: is a few milliseconds
+per page render worth paying for real parity with Playmaker's engine, or should the twin stay
+authoritative forever with CI-only verification? Decided: pay it. The cost is small in absolute
+terms (supervised-daemon warm latency measured above: bridge p50 ~0.9ms / p90 ~2.9ms vs. twin
+~0.09ms in-process — a few ms added to a page render, not a user-visible stall) and every call
+site already fails safe (`except Exception` catches any bridge failure — connection refused,
+timeout, bad JSON — and falls back to the twin with a logged warning; nothing here can turn a
+bridge outage into a broken page). Not a code change: `mark_layer_http_bridge_enabled()` stays
+default-off in `v2/server.py` (the safe baseline for local runs, tests, and CI), and the flip is
+instead `SOMA_REVIEW_MARK_LAYER_HTTP_BRIDGE=1` added to
+`~/Library/LaunchAgents/com.mikewolf.soma-review.plist`'s `EnvironmentVariables`, scoped to the
+one live service. Verified live: `launchctl bootout` + `bootstrap` (a bare `kickstart -k` does
+not reload `EnvironmentVariables` — confirmed the hard way, first attempt silently kept the old
+env) reloaded the job with the new var present in `launchctl print`'s `environment` block;
+`GET /api/mark-layer?page=estate/PORTFOLIO.md` against the restarted live service now returns
+`"engine": "playmaker-http-bridge"` (was `"python-twin"` before the reload), confirming real
+production traffic is on the bridge, not just the flag being set. `/healthz` stayed green through
+both reload attempts. Full test suite (`python3 -m unittest discover -s tests -p "test_*.py"`,
+347 tests, code default still off) reconfirmed green after the plist change, since the change
+touches the live service's environment, not the code's own default. If `mark-layer-server.mjs`
+(`com.soma.mark-layer-server`, port 8791) ever goes down, every call site's fallback silently
+serves the twin and logs to `com.mikewolf.soma-review.err.log` — check that log first if node
+output ever looks like it reverted to twin shape unexpectedly. Item 6a's "Playmaker and
+soma-review are to share the same engine" is now true for live traffic on every wired call site,
+not just in CI.
+
+**Adversarial review (Skip, 2026-09-11) on the flip: "SHIP WITH FIXES," three closed same
+session, one intentionally left as a follow-up.** (1) `mark_layer_http_bridge_enabled()`'s own
+docstring said "Default off — today's live behavior is unchanged," which was true of the code
+default but false of the running service after the flip — the exact stale-docstring defect class
+this file has hit before (the "Wired into" list drifting stale twice, named above). Fixed:
+docstring now says the code default is a safe baseline, not a description of production, and
+points at the plist and `/healthz`. (2) The only verification at flip time was the debug
+`GET /api/mark-layer` endpoint returning `engine: playmaker-http-bridge` — real evidence (same
+`mark_layer_http_bridge_enabled()` check feeds every call site) but not proof the actual hot path
+(`render_page`, every classic-view page load) exercises the bridge. Closed: fetched a real page
+(`GET /page/estate/PORTFOLIO.md?view=v3`) against the restarted live service and watched a new
+`mark_layer_bridge` counter in `/healthz` (see next point) jump from 0 to 3 successful bridge
+calls on that single render — `render_page` and `compute_ringer_list` both confirmed live on the
+bridge, not just the debug route. (3) `job-liveness.json`'s `proof: null` for
+`com.soma.mark-layer-server` carried a rationale ("a crash has zero user-visible effect") that
+was true before the flip and false after — a bridge outage after the flip degrades silently
+(every call site's `except Exception` swallows it and falls back) rather than breaking a page,
+which is correct behavior for a single request but means a real outage looks identical to a
+healthy service from outside the process. Closed with a real signal, not just an updated note:
+`to_mark_layer_nodes_via_http_bridge` now records success/failure counts and the last
+success/failure timestamp+error in a lock-guarded module dict
+(`_MARK_LAYER_BRIDGE_STATS`/`mark_layer_bridge_stats()`, `v2/server.py`), exposed at
+`GET /healthz` under `mark_layer_bridge` (`enabled`, `success_count`, `failure_count`,
+`last_success_ts`, `last_failure_ts`, `last_failure_error`). `job-liveness.json`'s
+`no_proof_reason` for the daemon updated to point at this instead of asserting zero impact.
+**Left open, by design:** Skip's finding didn't ask for automated alerting on the new counter (a
+job-liveness watcher polling `/healthz` and flagging a rising `failure_count` or a stale
+`last_success_ts`) — that is real follow-on work, not done in this pass; today the counter is
+observable on request but nothing pages on it. Full suite reconfirmed green (347/347) after these
+three fixes, and a fresh live-service restart reconfirmed `/healthz`'s new field renders and a
+real page render increments it, before calling this durably shipped.
+
 ## Fold (SOMA agreed model item 10) — wired into the v3 panel (2026-09-06)
 
 Item 10: "an agreed extension may be folded out of the sentence into the node it

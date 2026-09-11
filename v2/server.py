@@ -394,8 +394,16 @@ def mark_layer_http_bridge_enabled():
     call Playmaker's real `fromProseMarkdown` over HTTP instead of running
     the Python twin (`to_mark_layer_nodes`), so the live-latency question
     gets a real answer before the remaining production call sites are
-    touched. Default off — today's live behavior is unchanged regardless of
-    call-site count, because nothing here flips the flag on.
+    touched. Default off in THIS FUNCTION — that default is the safe
+    baseline for local runs, tests, and CI. It is NOT the state of the live
+    `com.mikewolf.soma-review` service: as of 2026-09-11 (later mission-1
+    run), `SOMA_REVIEW_MARK_LAYER_HTTP_BRIDGE=1` is set in
+    `~/Library/LaunchAgents/com.mikewolf.soma-review.plist`'s
+    `EnvironmentVariables`, so live production traffic runs the bridge, not
+    the twin, on every wired call site below. Check that plist (or
+    `GET /healthz`'s `mark_layer_bridge` block) before assuming this
+    function's own default describes what's actually running. See
+    soma-review/CLAUDE.md, "Flag flipped on for live traffic", for why.
 
     Wired into: `render_mark_layer_preview` (debug-only `/mark-layer-preview/*`
     route, not linked from any production UI); `GET /api/mark-layer`
@@ -431,11 +439,33 @@ def mark_layer_http_bridge_url():
     return os.environ.get('SOMA_REVIEW_MARK_LAYER_HTTP_BRIDGE_URL', 'http://127.0.0.1:8791/parse')
 
 
+_MARK_LAYER_BRIDGE_STATS_LOCK = threading.Lock()
+_MARK_LAYER_BRIDGE_STATS = {
+    'success_count': 0, 'failure_count': 0,
+    'last_success_ts': None, 'last_failure_ts': None, 'last_failure_error': None,
+}
+
+
+def mark_layer_bridge_stats():
+    """Snapshot for /healthz. Since every call site falls back to the twin on
+    any bridge failure (see to_mark_layer_nodes_via_http_bridge's docstring),
+    a dead or crash-looping bridge daemon produces no user-visible error —
+    this counter is the only place that degrade becomes visible from outside
+    the process (Skip's adversarial finding, 2026-09-11, on the flag-flip
+    run: proof:null in job-liveness was no longer honest once the flag went
+    live, because a silent fallback storm would otherwise look identical to
+    a healthy service)."""
+    with _MARK_LAYER_BRIDGE_STATS_LOCK:
+        return dict(_MARK_LAYER_BRIDGE_STATS)
+
+
 def to_mark_layer_nodes_via_http_bridge(src, timeout=2.0):
     """Calls the Playmaker bridge server's `fromProseMarkdown` over HTTP.
     Raises on any failure (connection refused, timeout, bad JSON) — callers
     must catch and fall back to the local Python twin; this function never
-    silently returns a degraded result."""
+    silently returns a degraded result. Records success/failure in
+    _MARK_LAYER_BRIDGE_STATS regardless of outcome, so a caller's fallback
+    doesn't erase the fact that the bridge just failed."""
     import urllib.request
     req = urllib.request.Request(
         mark_layer_http_bridge_url(),
@@ -443,8 +473,18 @@ def to_mark_layer_nodes_via_http_bridge(src, timeout=2.0):
         headers={'content-type': 'application/json'},
         method='POST',
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        payload = json.loads(resp.read().decode('utf-8'))
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            payload = json.loads(resp.read().decode('utf-8'))
+    except Exception as exc:
+        with _MARK_LAYER_BRIDGE_STATS_LOCK:
+            _MARK_LAYER_BRIDGE_STATS['failure_count'] += 1
+            _MARK_LAYER_BRIDGE_STATS['last_failure_ts'] = time.time()
+            _MARK_LAYER_BRIDGE_STATS['last_failure_error'] = str(exc)
+        raise
+    with _MARK_LAYER_BRIDGE_STATS_LOCK:
+        _MARK_LAYER_BRIDGE_STATS['success_count'] += 1
+        _MARK_LAYER_BRIDGE_STATS['last_success_ts'] = time.time()
     return payload['nodes']
 
 
@@ -7945,7 +7985,11 @@ class Handler(BaseHTTPRequestHandler):
             # still passing.
             self._send_json({'ok': True, 'ts': time.time(),
                              'tunnel': {'is_tunnel': is_tunnel, 'login': login,
-                                        'socket': self.on_tunnel_socket}})
+                                        'socket': self.on_tunnel_socket},
+                             'mark_layer_bridge': {
+                                 'enabled': mark_layer_http_bridge_enabled(),
+                                 **mark_layer_bridge_stats(),
+                             }})
             return
 
         self._send_html('<h1>404</h1>', status=404)

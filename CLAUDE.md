@@ -1452,21 +1452,39 @@ below, unchanged). Regression-tested: `v2/tests/test_compute_ringer_list_bridge.
 off / on-success / on-failure, mirroring the third slice's test shape). Remaining unwired:
 `render_page`, `_rerender_block`, `bind_from_mark_layer_node`.
 
-**Scoping note for the next slice (2026-09-11):** all remaining unwired call sites
-(`render_page`, `_rerender_block`, `bind_from_mark_layer_node`) sit on
+**Fifth bridging slice (2026-09-11, later mission-1 run): `bind_from_mark_layer_node` wired.**
+Same flag/fallback pattern as the third/fourth slices: flag stays default off (no behavior
+change today), any bridge failure falls back to the Python twin with a stderr log line
+(`[mark-layer] http bridge failed for <page> (bind from node), falling back to python twin: ...`).
+This is the live id-first create-binding path — a client-sent DOM stamp resolving to a
+mark-layer node id, reached from every mark/edit create that carries a `mark_layer_node_id`.
+Regression-tested: `v2/tests/test_bind_from_mark_layer_node_bridge.py` (flag off / on-success /
+on-failure, same call-counting shape as the fourth slice's test — proves the bridge function was
+actually invoked, not just that output happens to match the twin). `mark_layer_http_bridge_enabled()`'s
+docstring updated to name all five wired call sites (was drifting stale after slice 4 — the same
+defect class the third slice had already fixed once). Remaining unwired: `render_page`,
+`_rerender_block`.
+
+**Scoping note for the next slice (2026-09-11):** the two remaining unwired call sites
+(`render_page`, `_rerender_block`) sit on
 the interactive page-render/edit hot path, not a background or one-shot path — `render_page`
-itself runs on every classic-view page load and each of these three is reached from it or from
-an edit. The measured latency gap (twin ~2-5ms in-process vs. bridge ~7-27ms warm, 123ms cold)
-means wiring any of these behind the flag is safe to ship (flag off, no behavior change) but
+itself runs on every classic-view page load and `_rerender_block` is reached from an edit. The
+measured latency gap (twin ~2-5ms in-process vs. bridge ~7-27ms warm, 123ms cold)
+means wiring either of these behind the flag is safe to ship (flag off, no behavior change) but
 flipping the flag on for these paths without first productionizing the bridge process — a
 supervised, always-warm launchd job instead of a manually-started `node ... &`, removing the
 cold-start case — would add real, user-visible latency to every page view. Recommendation for
-whoever picks this up next: (1) wire one more of the three remaining call sites behind the same
-flag/fallback pattern (cheap, safe, flag stays off),
+whoever picks this up next: (1) wire the remaining two call sites behind the same
+flag/fallback pattern (cheap, safe, flag stays off) — after that, every to_mark_layer_nodes
+call site is bridge-capable and the next real decision is productionizing the bridge process,
+not finding another site to wire,
 (2) before ever flipping the flag on in a hot path, give `mark-layer-server.mjs` a real supervisor
 entry and re-measure warm latency: if it doesn't come down materially, the honest conclusion may
 be that the Python twin stays authoritative for hot paths permanently and item 6a's win is
 continuous parity verification (already CI-gated, see below), not a live per-request swap.
+(3) Keep `mark_layer_http_bridge_enabled()`'s "Wired into" docstring list current with each new
+slice — it drifted stale twice already (after slice 3's own fix, then again after slice 4);
+update it in the same commit as the wiring, not as an afterthought.
 
 **Parity check is now CI-gated in Playmaker, not just hand-run (2026-09-11).** The version-pinning
 gap named above is closed: Playmaker's `.github/workflows/ci.yml` has an `engine-parity` job that

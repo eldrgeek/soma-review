@@ -398,11 +398,14 @@ def mark_layer_http_bridge_enabled():
 
     Wired into: `render_mark_layer_preview` (debug-only `/mark-layer-preview/*`
     route, not linked from any production UI); `GET /api/mark-layer`
-    (loopback-only, unconsumed by any client); and `load_page_mark_layer_nodes`
+    (loopback-only, unconsumed by any client); `load_page_mark_layer_nodes`
     (backs `resolve_mark_block`'s two callers and `present_comments` — REAL
     create/edit/resolve/comment-presentation traffic, not a debug or unconsumed
-    route). This is no longer zero blast radius the moment the flag is flipped
-    on: `load_page_mark_layer_nodes`'s own docstring names an open residual
+    route); `compute_ringer_list` (runs on every classic-view page load via
+    `render_page`); and `bind_from_mark_layer_node` (the live id-first
+    create-binding path for a client-sent DOM stamp). This is no longer zero
+    blast radius the moment the flag is flipped on: `load_page_mark_layer_nodes`'s
+    own docstring names an open residual
     (create and resolve are separate requests, so a bridge flap between them
     can mint a twin id on one call and a bridge id on the other — fails safe
     via the legacy `block_id` fallback, but silently) that must be closed
@@ -4333,7 +4336,27 @@ def bind_from_mark_layer_node(route_path, workspace, candidate):
         if report.get('blocked'):
             return None
         src = src_bytes.decode('utf-8')
-        nodes = to_mark_layer_nodes(_mark_layer_source(src))
+        mark_layer_src = _mark_layer_source(src)
+        # Fifth bridging slice toward item 6a's cutover (2026-09-11 mission-1):
+        # same flag/fallback pattern as `compute_ringer_list`/
+        # `load_page_mark_layer_nodes`. This is the live create-binding path
+        # (a client-sent DOM stamp resolving to a mark-layer node id), reached
+        # from every id-first mark create — the last of the three hot-path
+        # call sites named in soma-review/CLAUDE.md's scoping note. Flag
+        # stays default off (no behavior change); flipping it on here is
+        # gated on the same unproductionized bridge process as the other
+        # slices (see CLAUDE.md).
+        if mark_layer_http_bridge_enabled():
+            try:
+                nodes = to_mark_layer_nodes_via_http_bridge(mark_layer_src)
+            except Exception as exc:  # noqa: BLE001 - any bridge failure falls back
+                sys.stderr.write(
+                    f'[mark-layer] http bridge failed for {route_path} '
+                    f'(bind from node), falling back to python twin: {exc}\n'
+                )
+                nodes = to_mark_layer_nodes(mark_layer_src)
+        else:
+            nodes = to_mark_layer_nodes(mark_layer_src)
     except Exception:  # noqa: BLE001 — fall through to legacy binding
         return None
     node = find_mark_layer_node(nodes, node_id)

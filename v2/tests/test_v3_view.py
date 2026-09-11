@@ -3,8 +3,8 @@
 Covers: the view flag defaults off and classic content is unaffected by its
 presence, a sidecar edit-mark round trip (the same mechanism v3's inline
 contenteditable blocks use), stale detection (block_text_sha drift), and
-```widget fenced-block rendering (passive kind now, demo/active placeholders
-for the two kinds documented as next-step work).
+```widget fenced-block rendering (passive and demo kinds now, active
+placeholder for the one kind still documented as next-step work).
 """
 import json
 import os
@@ -129,14 +129,32 @@ class WidgetBlockTests(unittest.TestCase):
         widget = next(b for b in blocks if b['kind'] == 'widget')
         self.assertIn('iframe class="widget-block"', widget['html'])
 
-    def test_widget_kind_demo_and_active_are_placeholders_not_crashes(self):
-        for kind in ('demo', 'active'):
-            _title, blocks = mdblocks.parse_markdown(
-                f'# T\n\n```widget kind={kind} name=inline-html\n<b>x</b>\n```\n'
-            )
-            widget = next(b for b in blocks if b['kind'] == 'widget')
-            self.assertIn('not yet supported', widget['html'])
-            self.assertNotIn('<iframe', widget['html'])
+    def test_widget_kind_demo_renders_sandboxed_iframe_with_capability_label(self):
+        _title, blocks = mdblocks.parse_markdown(
+            '# T\n\n```widget kind=demo name=inline-html\n<b>x</b>\n```\n'
+        )
+        widget = next(b for b in blocks if b['kind'] == 'widget')
+        self.assertIn('iframe class="widget-block"', widget['html'])
+        self.assertIn('sandbox="allow-scripts"', widget['html'])
+        self.assertNotIn('allow-same-origin', widget['html'])
+        self.assertIn('widget-capability-label', widget['html'])
+        self.assertIn('demo', widget['html'])
+
+    def test_widget_kind_active_is_a_placeholder_not_a_crash(self):
+        _title, blocks = mdblocks.parse_markdown(
+            '# T\n\n```widget kind=active name=inline-html\n<b>x</b>\n```\n'
+        )
+        widget = next(b for b in blocks if b['kind'] == 'widget')
+        self.assertIn('not yet supported', widget['html'])
+        self.assertNotIn('<iframe', widget['html'])
+
+    def test_widget_kind_passive_carries_capability_label(self):
+        _title, blocks = mdblocks.parse_markdown(
+            '# T\n\n```widget kind=passive name=inline-html\n<b>x</b>\n```\n'
+        )
+        widget = next(b for b in blocks if b['kind'] == 'widget')
+        self.assertIn('widget-capability-label', widget['html'])
+        self.assertIn('passive', widget['html'])
 
     def test_widget_excluded_from_edit_eligible(self):
         html = mdblocks.render_widget_block  # sanity import

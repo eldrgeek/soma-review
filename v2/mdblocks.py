@@ -115,27 +115,45 @@ def parse_widget_attrs(lang_rest):
     }
 
 
-def render_widget_block(raw_html, kind='passive', name='inline-html'):
-    """Render a ```widget fenced block. This build implements the PASSIVE kind
-    only (Mike's spec, 2026-09-03, item 6): "completely passive and only
-    graphical" — no reads, no writes, no network. `demo` and `active` are
-    specified (see the design doc referenced above) but not built here; a
-    widget declaring either renders a clearly-labeled not-yet-supported
-    placeholder instead of silently misbehaving or crashing page render.
+_WIDGET_CAPABILITY_LABEL = {
+    'passive': 'passive — graphics only, no reads, no writes, no network',
+    'demo': 'demo — interactive, local only, nothing leaves the widget',
+}
 
-    A passive/inline-html widget's fence body is raw HTML, sandboxed in an
-    iframe via `srcdoc` with `sandbox="allow-scripts"` only — no
-    allow-same-origin, no allow-forms, no allow-popups, no network egress —
-    so it can animate or compute for display but cannot read the parent
-    document, phone home, or navigate anything. Height defaults to a
-    reasonable card size and can be overridden with a first line
-    `<!-- height: 320 -->` in the fence body.
+
+def render_widget_block(raw_html, kind='passive', name='inline-html'):
+    """Render a ```widget fenced block. This build implements the PASSIVE and
+    DEMO kinds (Mike's spec, 2026-09-03, item 6: "completely passive and only
+    graphical" / "just demo a capability"). `active` (reads the document
+    model, emits `proposeMark`) is specified in the design doc referenced
+    above but not built here — the `proposeMark` contract, capability token,
+    and same-origin execution it needs are real, separate work; a widget
+    declaring it renders a clearly-labeled not-yet-supported placeholder
+    instead of silently misbehaving or crashing page render.
+
+    Passive and demo share the same rendering and the same sandbox — per
+    §3 of the spec both kinds "run in a sandboxed iframe with no network
+    egress"; the difference between them is the capability ceiling the spec
+    declares, not the mechanism, since a demo widget's fence body is already
+    self-contained HTML/JS with no document access to restrict beyond what
+    the sandbox already denies. A passive/demo inline-html widget's fence
+    body is raw HTML, sandboxed in an iframe via `srcdoc` with
+    `sandbox="allow-scripts"` only — no allow-same-origin, no allow-forms,
+    no allow-popups, no network egress — so it can animate or compute for
+    display but cannot read the parent document, phone home, or navigate
+    anything. Height defaults to a reasonable card size and can be
+    overridden with a first line `<!-- height: 320 -->` in the fence body.
+
+    Per §3 "Shown in the panel": every widget carries a one-line capability
+    declaration so the reader sees the ceiling before opening it. There is
+    no marks panel entry for a widget block (it isn't a mark), so the
+    declaration renders as a label above the frame instead.
     """
-    if kind != 'passive':
+    if kind not in ('passive', 'demo'):
         return (
             f'<div class="widget-unsupported">Widget kind &ldquo;{_esc(kind)}&rdquo; '
             f'(name: {_esc(name)}) is not yet supported — this build ships the '
-            f'passive kind only. See '
+            f'passive and demo kinds only. See '
             f'<code>SOMA/shared-cognition/marked-document-widgets.md</code>.</div>'
         )
     if name != 'inline-html':
@@ -151,8 +169,10 @@ def render_widget_block(raw_html, kind='passive', name='inline-html'):
         height = max(60, min(2000, int(m.group(1))))
         body = raw_html[m.end():]
     srcdoc = _esc_attr(body)
+    label = _WIDGET_CAPABILITY_LABEL[kind]
     return (
         f'<div class="widget-block-frame">'
+        f'<div class="widget-capability-label">{_esc(label)}</div>'
         f'<iframe class="widget-block" sandbox="allow-scripts" '
         f'referrerpolicy="no-referrer" loading="lazy" '
         f'style="width:100%;height:{height}px;border:0;display:block;" '

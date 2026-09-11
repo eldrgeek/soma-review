@@ -863,6 +863,7 @@ a.term-link:hover, a.term-link:focus { color: #cfe3ff; }
                                      font-size: 12px; text-transform: uppercase; letter-spacing: .03em; }
 .term-popover a.term-link { color: #cfe3ff; }
 .widget-block-frame{margin:12px 0;border:1px solid #2a2d34;border-radius:8px;overflow:hidden;background:#0f1115;}
+.widget-capability-label{padding:4px 10px;font-size:11px;letter-spacing:.02em;color:#8a93a6;background:#161920;border-bottom:1px solid #2a2d34;}
 .widget-unsupported{margin:12px 0;padding:10px 14px;border:1px dashed #5a4626;border-radius:8px;background:#211b12;color:#e0b463;font-size:13px;}
 """
 

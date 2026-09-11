@@ -1044,10 +1044,27 @@ globals, and the widget CSS rules (needed regardless of view). Every block, comm
 existing dwell mark layer are byte-identical otherwise. `v2/tests/test_v3_view.py` pins this
 scope plus the edit-mark/stale/widget mechanics; 38/38 tests pass (24 pre-existing + 14 new).
 
-**Not built (documented as next-step):** the `demo` and `active` widget kinds (`proposeMark`
-contract, same-origin execution, capability declaration in the panel) — see the parallel design
-spec above for the full three-kind contract both hosts (soma-review, Playmaker) are meant to
-share once built.
+**`demo` kind built 2026-09-11 (mission-1):** `render_widget_block` renders `kind=demo` in the
+same sandboxed iframe as passive — per spec §3 both kinds "run in a sandboxed iframe with no
+network egress"; a demo widget's inline-html fence body is already self-contained HTML/JS with
+no document access to restrict beyond what the sandbox (`sandbox="allow-scripts"` only, no
+allow-same-origin) already denies, so passive and demo share rendering and differ only in the
+capability ceiling the spec declares. Every widget block (passive and demo alike) now carries
+the §3 "shown in the panel" capability-declaration line (`.widget-capability-label`, rendered
+above the iframe, since a widget block has no marks-panel entry to carry it) — "passive —
+graphics only, no reads, no writes, no network" / "demo — interactive, local only, nothing
+leaves the widget". Verified live: `curl http://localhost:8090/page/estate/widget-demo-scratch.md`
+renders two real `<iframe class="widget-block">`s with the correct labels; `active` still
+renders the not-yet-supported placeholder. Tests: `v2/tests/test_v3_view.py::WidgetBlockTests`
+(demo renders + label, passive carries a label, active stays a placeholder — 30/30 in that
+module, full suite unaffected).
+
+**Not built (documented as next-step):** the `active` widget kind (`proposeMark` contract,
+same-origin execution, capability token) — see the parallel design spec above for the full
+three-kind contract both hosts (soma-review, Playmaker) are meant to share once built. This is
+real, separate work: a widget needs a scoped read of the document model at its own level, a
+`proposeMark(kind, payload)` call that always produces a visible undoable mark, and the panel
+wiring to show it — none of which the demo kind needed.
 
 ## v3 sentence marks (2026-09-04)
 

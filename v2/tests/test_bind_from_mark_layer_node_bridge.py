@@ -44,6 +44,11 @@ class BindFromMarkLayerNodeBridgeTests(unittest.TestCase):
         server.WORKSPACES_CONFIG = self.config
         self.old_env = os.environ.get('SOMA_REVIEW_MARK_LAYER_HTTP_BRIDGE')
         self.old_bridge_fn = server.to_mark_layer_nodes_via_http_bridge
+        # bind_from_mark_layer_node now routes through the pinned engine
+        # cache (2026-09-11, Skip finding #1) -- clear it so these three
+        # methods, which share identical PAGE text, don't see each other's
+        # cached engine choice.
+        server._MARK_LAYER_NODES_CACHE.clear()
         # Resolve a real node id from the twin so the candidate is one the
         # binder can actually find (a miss returns None before the bridge
         # branch is even reached).

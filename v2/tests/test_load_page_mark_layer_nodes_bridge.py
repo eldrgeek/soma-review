@@ -43,6 +43,10 @@ class LoadPageMarkLayerNodesBridgeTests(unittest.TestCase):
         server.WORKSPACES_CONFIG = self.config
         self.old_env = os.environ.get('SOMA_REVIEW_MARK_LAYER_HTTP_BRIDGE')
         self.old_bridge_fn = server.to_mark_layer_nodes_via_http_bridge
+        # The engine-pinning cache (2026-09-11, closes the cross-request
+        # residual) is content-addressed, so identical PAGE text across these
+        # three test methods would otherwise share one cached engine choice.
+        server._MARK_LAYER_NODES_CACHE.clear()
 
     def tearDown(self):
         server.PROJECTS_ROOT = self.old_root

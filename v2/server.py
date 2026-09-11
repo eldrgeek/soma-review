@@ -7,6 +7,7 @@ persistent comments. Stdlib only (http.server + json), no external deps.
 
 See soma-review/CLAUDE.md and README.md for the API and sidecar format.
 """
+import collections
 import copy
 import html as _html
 import json
@@ -407,17 +408,21 @@ def mark_layer_http_bridge_enabled():
     (the node build that backs the in-page embed/stamper on every classic-view
     load); and `_rerender_block` (both the new-src and prev-src parses on
     every edit). Every `to_mark_layer_nodes` call site in this file is now
-    bridge-capable — the next real decision is productionizing
-    `mark-layer-server.mjs`, not finding another site to wire (see
-    soma-review/CLAUDE.md's scoping note). This is no longer zero
-    blast radius the moment the flag is flipped on: `load_page_mark_layer_nodes`'s
-    own docstring names an open residual
-    (create and resolve are separate requests, so a bridge flap between them
-    can mint a twin id on one call and a bridge id on the other — fails safe
-    via the legacy `block_id` fallback, but silently) that must be closed
-    before this flag goes on for real traffic. Run the bridge server first:
+    bridge-capable and, as of the 2026-09-11 mission-1 run that added
+    `_mark_layer_nodes_pinned_by_source`, engine-pinned per exact source text
+    (a content-addressed cache), so neither a same-request mixed-engine pair
+    (the sixth bridging slice's residual, closed) nor a cross-request one
+    (`load_page_mark_layer_nodes`'s create-vs-resolve residual, closed the
+    same run) can happen anymore for identical page content. The only
+    remaining question before flipping this flag on for real traffic is
+    whether `mark-layer-server.mjs`'s supervised warm latency (p50 ~0.9ms,
+    p90 ~2.9ms measured 2026-09-11, see soma-review/CLAUDE.md) is worth
+    paying on every page render for parity with Playmaker's engine — that is
+    a product decision, not an open correctness residual. Run the bridge
+    server first if testing manually:
     `node --experimental-strip-types scripts/mark-layer-server.mjs` from
-    `~/Projects/playmaker`.
+    `~/Projects/playmaker` (or rely on the supervised
+    `com.soma.mark-layer-server` launchd job).
     """
     return _env_flag_on('SOMA_REVIEW_MARK_LAYER_HTTP_BRIDGE')
 
@@ -4352,17 +4357,18 @@ def bind_from_mark_layer_node(route_path, workspace, candidate):
         # stays default off (no behavior change); flipping it on here is
         # gated on the same unproductionized bridge process as the other
         # slices (see CLAUDE.md).
-        if mark_layer_http_bridge_enabled():
-            try:
-                nodes = to_mark_layer_nodes_via_http_bridge(mark_layer_src)
-            except Exception as exc:  # noqa: BLE001 - any bridge failure falls back
-                sys.stderr.write(
-                    f'[mark-layer] http bridge failed for {route_path} '
-                    f'(bind from node), falling back to python twin: {exc}\n'
-                )
-                nodes = to_mark_layer_nodes(mark_layer_src)
-        else:
-            nodes = to_mark_layer_nodes(mark_layer_src)
+        #
+        # Routed through `_mark_layer_nodes_pinned_by_source` (2026-09-11,
+        # same mission-1 run, Skip finding #1): this is the create half of
+        # the create/resolve pair `load_page_mark_layer_nodes`'s docstring
+        # names as the residual — a create through this function and a later
+        # resolve through `load_page_mark_layer_nodes` for the SAME page
+        # content must see the same pinned engine choice, or the residual
+        # isn't actually closed for the pairing that named it. Calling the
+        # inline bridge/twin choice here instead (the first draft of this
+        # fix did exactly that) would have made `load_page_mark_layer_nodes`'s
+        # "cross-request residual is now closed" claim false for this path.
+        nodes = _mark_layer_nodes_pinned_by_source(mark_layer_src, route_path)
     except Exception:  # noqa: BLE001 — fall through to legacy binding
         return None
     node = find_mark_layer_node(nodes, node_id)
@@ -4391,6 +4397,61 @@ def bind_from_mark_layer_node(route_path, workspace, candidate):
     }
 
 
+_MARK_LAYER_NODES_CACHE = collections.OrderedDict()
+_MARK_LAYER_NODES_CACHE_MAX = 256
+_MARK_LAYER_NODES_CACHE_LOCK = threading.Lock()
+
+
+def _mark_layer_nodes_pinned_by_source(mark_layer_src, route_path):
+    """Nodes for one exact source text, engine pinned per content (closes the
+    third bridging slice's cross-request residual, 2026-09-11 mission-1).
+
+    Create and resolve are two separate HTTP requests, each an independent
+    chance for the bridge to be up or down; without this, a flap between the
+    two could mint a twin-engine id on one and a bridge-engine id on the
+    other for the SAME page content. Caching by a hash of the exact source
+    text (not by route/workspace, which can change content underneath the
+    same route) means every request that sees identical content gets the
+    byte-identical node list and engine choice, regardless of what the
+    bridge does in between — the "pin the engine per page-version" option
+    the residual's own note named. Bounded LRU (not unbounded growth); an
+    edit changes the source text, which is a fresh cache key, so this never
+    needs explicit invalidation on content change.
+
+    The whole check-compute-store sequence runs under one lock (Skip,
+    2026-09-11, second finding): a version with a lock around only the read
+    and only the write left a window where two threads could both miss a
+    brand-new key, both compute, and race to store — if the bridge flapped
+    inside that exact window, the loser's return value could differ from
+    what ends up cached. Serializing the whole thing makes two concurrent
+    requests for the same brand-new content compute once and share the
+    result, and costs one bridge/twin call's latency (single-digit ms) of
+    lock hold, not a request-wide stall.
+    """
+    key = hashlib.sha256(mark_layer_src.encode('utf-8')).hexdigest()
+    with _MARK_LAYER_NODES_CACHE_LOCK:
+        cached = _MARK_LAYER_NODES_CACHE.get(key)
+        if cached is not None:
+            _MARK_LAYER_NODES_CACHE.move_to_end(key)
+            return cached
+        if mark_layer_http_bridge_enabled():
+            try:
+                nodes = to_mark_layer_nodes_via_http_bridge(mark_layer_src)
+            except Exception as exc:  # noqa: BLE001 - any bridge failure falls back
+                sys.stderr.write(
+                    f'[mark-layer] http bridge failed for {route_path}, '
+                    f'falling back to python twin: {exc}\n'
+                )
+                nodes = to_mark_layer_nodes(mark_layer_src)
+        else:
+            nodes = to_mark_layer_nodes(mark_layer_src)
+        _MARK_LAYER_NODES_CACHE[key] = nodes
+        _MARK_LAYER_NODES_CACHE.move_to_end(key)
+        while len(_MARK_LAYER_NODES_CACHE) > _MARK_LAYER_NODES_CACHE_MAX:
+            _MARK_LAYER_NODES_CACHE.popitem(last=False)
+    return nodes
+
+
 def load_page_mark_layer_nodes(route_path, workspace=DEFAULT_WORKSPACE):
     """Current parse + adapter nodes for a page. Never raises; empty on miss.
 
@@ -4403,35 +4464,26 @@ def load_page_mark_layer_nodes(route_path, workspace=DEFAULT_WORKSPACE):
     fallback storm is visible in the service log even though this call
     site has no response body to carry an `engine` field.
 
-    Named residual (Skip, 2026-09-11): a mark's node id is re-derived fresh
-    on every call — create and resolve are separate requests, each an
-    independent chance for the bridge to be up or down. If the bridge flaps
-    between the two, one call can mint a twin id and the other a bridge id;
-    parity between the engines is verified on a fixture corpus, not proven
-    as a live invariant, and the duplicate-occurrence-suffix mint is
-    documented elsewhere as order-dependent. A mismatch here fails safe
-    (`resolve_mark_block` returns `None`, the caller's existing legacy
-    fallback takes over) but is silent — no log, no signal. Do not flip
-    `SOMA_REVIEW_MARK_LAYER_HTTP_BRIDGE` on for real traffic until this is
-    closed (e.g. pin the engine per page-version, or verify id-parity as an
-    invariant rather than a corpus sample).
+    Cross-request residual (Skip, 2026-09-11) is now closed: nodes are
+    computed by `_mark_layer_nodes_pinned_by_source`, which pins the engine
+    choice to the exact source text via a content-addressed cache shared
+    with `bind_from_mark_layer_node` — the create half of the pair the
+    residual named. A create call through `bind_from_mark_layer_node` and a
+    later resolve call through this function, for the SAME page content,
+    always get the byte-identical node list even if the bridge flaps
+    between the two calls (proof: `tests/test_mark_layer_nodes_pinned_by_source.py::
+    test_bind_from_mark_layer_node_shares_the_pin_with_load_page`, which
+    fails red if either function is changed to compute independently
+    again). A mismatch can now only happen across a real content edit,
+    which is exactly when node ids are expected to change and
+    `align_mark_layer_nodes`/the remap ledger already handle it.
     """
     try:
         fs_path = resolve_page(route_path, workspace)
         with open(fs_path, 'rb') as handle:
             src = handle.read().decode('utf-8')
         mark_layer_src = _mark_layer_source(src)
-        if mark_layer_http_bridge_enabled():
-            try:
-                nodes = to_mark_layer_nodes_via_http_bridge(mark_layer_src)
-            except Exception as exc:  # noqa: BLE001 - any bridge failure falls back
-                sys.stderr.write(
-                    f'[mark-layer] http bridge failed for {route_path}, '
-                    f'falling back to python twin: {exc}\n'
-                )
-                nodes = to_mark_layer_nodes(mark_layer_src)
-        else:
-            nodes = to_mark_layer_nodes(mark_layer_src)
+        nodes = _mark_layer_nodes_pinned_by_source(mark_layer_src, route_path)
         _src, blocks, _mapping, _report = current_page_blocks(route_path, workspace)
         return blocks, nodes
     except Exception:  # noqa: BLE001 — readers must fall back to legacy fields

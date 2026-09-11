@@ -1421,6 +1421,40 @@ Skip's second, non-blocking finding that neither bridge call site had test cover
 (a slow, failing bridge stub that would push `latency_ms` past its assertion threshold if the
 timer were shared again).
 
+**Third bridging slice: the first REAL call site (2026-09-11, later mission-1 run).**
+The same flag/fallback pattern was wired into `load_page_mark_layer_nodes()` — this backs
+`resolve_mark_block()`'s two callers and `present_comments()`, i.e. actual mark
+create/resolve/comment-presentation traffic, not a debug route or an unconsumed loopback
+endpoint. Flag stays default off, so today's live behavior is unchanged. Named residual, not
+closed: create and resolve are separate HTTP requests, so a bridge flap between the two is an
+independent chance for the bridge to be up on one and down on the other, which could mint a
+twin-engine id on one call and a bridge-engine id on the other; a mismatch fails safe (falls
+through to the caller's legacy `block_id` path, returns `None` rather than crashing) but is
+silent today — no log, no signal. **Do not flip `SOMA_REVIEW_MARK_LAYER_HTTP_BRIDGE` on for real
+traffic until this is closed** (e.g. pin the engine per page-version, or verify id-parity as an
+invariant rather than a corpus sample). Skip's adversarial pass (required) found one real defect
+before shipping: `mark_layer_http_bridge_enabled()`'s own docstring still claimed "zero blast
+radius, every live call site still uses the twin," which this slice makes false the moment the
+flag is flipped on — corrected to name all three wired call sites and the now-real blast radius.
+Regression-tested: `v2/tests/test_load_page_mark_layer_nodes_bridge.py` (flag off/on-success/
+on-failure). Full suite green: 327/327 (`python3 -m unittest discover -s tests -p "test_*.py"`
+from `v2/`).
+
+**Scoping note for the next slice (2026-09-11):** all remaining unwired call sites
+(`render_page`, `_rerender_block`, `bind_from_mark_layer_node`, `compute_ringer_list`) sit on
+the interactive page-render/edit hot path, not a background or one-shot path — `compute_ringer_list`
+alone is invoked from `render_page` on every classic-view page load. The measured latency gap
+(twin ~2-5ms in-process vs. bridge ~7-27ms warm, 123ms cold) means wiring any of these behind the
+flag is safe to ship (flag off, no behavior change) but flipping the flag on for these paths
+without first productionizing the bridge process — a supervised, always-warm launchd job instead
+of a manually-started `node ... &`, removing the cold-start case — would add real, user-visible
+latency to every page view. Recommendation for whoever picks this up next: (1) wire one more of
+the four remaining call sites behind the same flag/fallback pattern (cheap, safe, flag stays off),
+(2) before ever flipping the flag on in a hot path, give `mark-layer-server.mjs` a real supervisor
+entry and re-measure warm latency: if it doesn't come down materially, the honest conclusion may
+be that the Python twin stays authoritative for hot paths permanently and item 6a's win is
+continuous parity verification (already CI-gated, see below), not a live per-request swap.
+
 **Parity check is now CI-gated in Playmaker, not just hand-run (2026-09-11).** The version-pinning
 gap named above is closed: Playmaker's `.github/workflows/ci.yml` has an `engine-parity` job that
 checks out this repo (`soma-review`, `v2-collab-pages`, public, no auth) as a sibling on every
